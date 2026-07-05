@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 
 import 'chat_models.dart';
 import 'chat_repository.dart';
+import 'profile_page.dart';
 
 class ChatHomePage extends StatefulWidget {
   const ChatHomePage({super.key, required this.repository, this.onSignOut});
@@ -22,13 +23,17 @@ class _ChatHomePageState extends State<ChatHomePage>
   final _messageController = TextEditingController();
   final _searchController = TextEditingController();
   final List<ChatThread> _startedThreads = [];
+  final List<ChatThread> _refreshedThreads = [];
   final List<ChatMessage> _localMessages = [];
+  final Map<String, ChatUser> _profileOverridesByUser = {};
   final Map<String, UserPresence> _presenceByUser = {};
   final Map<String, TypingState> _typingByConversation = {};
   final Map<String, StreamSubscription<TypingState>> _typingSubscriptions = {};
+  final Set<String> _profileRefreshesInFlight = {};
   StreamSubscription<Map<String, UserPresence>>? _presenceSubscription;
   Timer? _typingStopTimer;
   String? _activeTypingConversationId;
+  String? _activeConversationId;
   String _query = '';
   bool _isSending = false;
   bool _isCompactConversationOpen = false;
@@ -53,6 +58,10 @@ class _ChatHomePageState extends State<ChatHomePage>
       _threadsStream = widget.repository.watchThreads();
       _selectedThread = null;
       _startedThreads.clear();
+      _refreshedThreads.clear();
+      _profileOverridesByUser.clear();
+      _profileRefreshesInFlight.clear();
+      _activeConversationId = null;
       _subscribePresence();
     }
   }
@@ -133,29 +142,50 @@ class _ChatHomePageState extends State<ChatHomePage>
 
   List<ChatThread> _threadsWithActivity(List<ChatThread> threads) {
     return threads.map((thread) {
-      final presence = thread.peerUserId == null
+      final profiledThread = _threadWithProfileOverride(thread);
+      final presence = profiledThread.peerUserId == null
           ? null
-          : _presenceByUser[thread.peerUserId];
-      final typing = _typingByConversation[thread.id];
-      final isTyping = typing?.isTyping ?? thread.isTyping;
-      final isOnline = presence?.isOnline ?? thread.isOnline;
-      final lastSeenAt = presence?.lastSeenAt ?? thread.peerLastSeenAt;
+          : _presenceByUser[profiledThread.peerUserId];
+      final typing = _typingByConversation[profiledThread.id];
+      final isTyping = typing?.isTyping ?? profiledThread.isTyping;
+      final isOnline = presence?.isOnline ?? profiledThread.isOnline;
+      final lastSeenAt = presence?.lastSeenAt ?? profiledThread.peerLastSeenAt;
       final activityLabel = isTyping
           ? 'Typing...'
           : isOnline
           ? 'Online'
           : activityLabelFor(isOnline: false, lastSeenAt: lastSeenAt);
 
-      return thread.copyWith(
+      return profiledThread.copyWith(
         isOnline: isOnline,
         peerLastSeenAt: lastSeenAt,
         activityLabel: activityLabel == 'Offline'
-            ? thread.activityLabel
+            ? profiledThread.activityLabel
             : activityLabel,
         isTyping: isTyping,
         typingUserName: typing?.displayName,
       );
     }).toList();
+  }
+
+  ChatThread _threadWithProfileOverride(ChatThread thread) {
+    final peerUserId = thread.peerUserId;
+    final profile = peerUserId == null
+        ? null
+        : _profileOverridesByUser[peerUserId];
+    if (profile == null) {
+      return thread;
+    }
+
+    return thread.copyWith(
+      title: profile.displayName,
+      avatarLabel: profile.avatarLabel,
+      peerLastSeenAt: profile.lastSeenAt,
+      activityLabel: activityLabelFor(
+        isOnline: false,
+        lastSeenAt: profile.lastSeenAt,
+      ),
+    );
   }
 
   @override
@@ -175,6 +205,9 @@ class _ChatHomePageState extends State<ChatHomePage>
         return LayoutBuilder(
           builder: (context, constraints) {
             final isWide = constraints.maxWidth >= 840;
+            if (isWide || _isCompactConversationOpen) {
+              _scheduleConversationEntryRefresh(selectedThread);
+            }
 
             return Scaffold(
               body: SafeArea(
@@ -205,6 +238,8 @@ class _ChatHomePageState extends State<ChatHomePage>
             onSearchChanged: _setQuery,
             onThreadSelected: _selectThread,
             onNewChat: _openNewChat,
+            onOpenProfile: _openProfile,
+            onRefresh: _refreshConversations,
             onSignOut: _requestSignOut,
           ),
         ),
@@ -234,6 +269,8 @@ class _ChatHomePageState extends State<ChatHomePage>
         onSearchChanged: _setQuery,
         onThreadSelected: _selectCompactThread,
         onNewChat: _openNewChat,
+        onOpenProfile: _openProfile,
+        onRefresh: _refreshConversations,
         onSignOut: _requestSignOut,
       );
     }
@@ -260,6 +297,7 @@ class _ChatHomePageState extends State<ChatHomePage>
       onBackToInbox: _showCompactInbox,
       onSend: () => _sendMessage(thread),
       onComposerChanged: (value) => _handleComposerChanged(thread, value),
+      onOpenProfile: _openProfile,
       onSignOut: _requestSignOut,
     );
   }
@@ -278,6 +316,10 @@ class _ChatHomePageState extends State<ChatHomePage>
 
   List<ChatThread> _mergeThreads(List<ChatThread> threads) {
     final merged = {for (final thread in threads) thread.id: thread};
+
+    for (final thread in _refreshedThreads) {
+      merged[thread.id] = thread;
+    }
 
     for (final thread in _startedThreads) {
       merged.putIfAbsent(thread.id, () => thread);
@@ -361,11 +403,88 @@ class _ChatHomePageState extends State<ChatHomePage>
   void _showCompactInbox() {
     setState(() {
       _isCompactConversationOpen = false;
+      _activeConversationId = null;
     });
   }
 
   void _requestSignOut() {
     _signOut();
+  }
+
+  void _scheduleConversationEntryRefresh(ChatThread? thread) {
+    final peerUserId = thread?.peerUserId;
+    if (thread == null || peerUserId == null || peerUserId.isEmpty) {
+      return;
+    }
+
+    if (_activeConversationId == thread.id) {
+      return;
+    }
+
+    _activeConversationId = thread.id;
+    scheduleMicrotask(() => _refreshPeerProfile(thread));
+  }
+
+  Future<void> _refreshPeerProfile(ChatThread thread) async {
+    final peerUserId = thread.peerUserId;
+    if (peerUserId == null ||
+        peerUserId.isEmpty ||
+        _profileRefreshesInFlight.contains(peerUserId)) {
+      return;
+    }
+
+    _profileRefreshesInFlight.add(peerUserId);
+    try {
+      final profile = await widget.repository.profileForUser(peerUserId);
+      if (!mounted || profile == null) {
+        return;
+      }
+
+      setState(() {
+        _profileOverridesByUser[peerUserId] = profile;
+      });
+    } catch (_) {
+      // Profile refresh is opportunistic; stale labels are better than a broken chat.
+    } finally {
+      _profileRefreshesInFlight.remove(peerUserId);
+    }
+  }
+
+  Future<void> _refreshConversations() async {
+    try {
+      final threads = await widget.repository.fetchThreads();
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _refreshedThreads
+          ..clear()
+          ..addAll(threads);
+        _threadsStream = widget.repository.watchThreads();
+      });
+
+      final selectedThread = _selectedThread;
+      if (selectedThread != null) {
+        await _refreshPeerProfile(selectedThread);
+      }
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not refresh conversations.')),
+      );
+    }
+  }
+
+  Future<void> _openProfile() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => ProfilePage(repository: widget.repository),
+      ),
+    );
   }
 
   Future<void> _signOut() async {
@@ -688,6 +807,8 @@ class _ThreadList extends StatelessWidget {
     required this.onSearchChanged,
     required this.onThreadSelected,
     required this.onNewChat,
+    required this.onOpenProfile,
+    required this.onRefresh,
     required this.onSignOut,
   });
 
@@ -698,6 +819,8 @@ class _ThreadList extends StatelessWidget {
   final ValueChanged<String> onSearchChanged;
   final ValueChanged<ChatThread> onThreadSelected;
   final VoidCallback onNewChat;
+  final VoidCallback onOpenProfile;
+  final Future<void> Function() onRefresh;
   final VoidCallback onSignOut;
 
   @override
@@ -727,6 +850,11 @@ class _ThreadList extends StatelessWidget {
                   icon: const Icon(Icons.edit_square),
                 ),
                 IconButton(
+                  tooltip: 'Profile',
+                  onPressed: onOpenProfile,
+                  icon: const Icon(Icons.account_circle_outlined),
+                ),
+                IconButton(
                   tooltip: 'Sign out',
                   onPressed: onSignOut,
                   icon: const Icon(Icons.logout),
@@ -747,20 +875,29 @@ class _ThreadList extends StatelessWidget {
             _BackendStatusPill(isConnected: isConnected),
             const SizedBox(height: 16),
             Expanded(
-              child: threads.isEmpty
-                  ? const _EmptyThreadList()
-                  : ListView.separated(
-                      itemCount: threads.length,
-                      separatorBuilder: (_, _) => const SizedBox(height: 8),
-                      itemBuilder: (context, index) {
-                        final thread = threads[index];
-                        return _ThreadTile(
-                          thread: thread,
-                          isSelected: thread.id == selectedThread?.id,
-                          onTap: () => onThreadSelected(thread),
-                        );
-                      },
-                    ),
+              child: RefreshIndicator(
+                onRefresh: onRefresh,
+                child: threads.isEmpty
+                    ? ListView(
+                        physics: const AlwaysScrollableScrollPhysics(),
+                        children: const [
+                          SizedBox(height: 280, child: _EmptyThreadList()),
+                        ],
+                      )
+                    : ListView.separated(
+                        physics: const AlwaysScrollableScrollPhysics(),
+                        itemCount: threads.length,
+                        separatorBuilder: (_, _) => const SizedBox(height: 8),
+                        itemBuilder: (context, index) {
+                          final thread = threads[index];
+                          return _ThreadTile(
+                            thread: thread,
+                            isSelected: thread.id == selectedThread?.id,
+                            onTap: () => onThreadSelected(thread),
+                          );
+                        },
+                      ),
+              ),
             ),
           ],
         ),
@@ -955,6 +1092,7 @@ class _ConversationPane extends StatelessWidget {
     required this.onBackToInbox,
     required this.onSend,
     required this.onComposerChanged,
+    required this.onOpenProfile,
     required this.onSignOut,
   });
 
@@ -967,6 +1105,7 @@ class _ConversationPane extends StatelessWidget {
   final VoidCallback onBackToInbox;
   final VoidCallback onSend;
   final ValueChanged<String> onComposerChanged;
+  final VoidCallback onOpenProfile;
   final VoidCallback onSignOut;
 
   @override
@@ -1047,6 +1186,11 @@ class _ConversationPane extends StatelessWidget {
                 tooltip: 'Video',
                 onPressed: () {},
                 icon: const Icon(Icons.videocam_outlined),
+              ),
+              IconButton(
+                tooltip: 'Profile',
+                onPressed: onOpenProfile,
+                icon: const Icon(Icons.account_circle_outlined),
               ),
               IconButton(
                 tooltip: 'Sign out',

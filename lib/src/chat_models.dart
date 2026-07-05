@@ -104,6 +104,8 @@ class ChatThread {
   }
 
   ChatThread copyWith({
+    String? title,
+    String? avatarLabel,
     String? subtitle,
     String? lastActive,
     int? unreadCount,
@@ -117,9 +119,9 @@ class ChatThread {
 
     return ChatThread(
       id: id,
-      title: title,
+      title: title ?? this.title,
       subtitle: subtitle ?? this.subtitle,
-      avatarLabel: avatarLabel,
+      avatarLabel: avatarLabel ?? this.avatarLabel,
       accentColor: accentColor,
       lastActive: lastActive ?? this.lastActive,
       unreadCount: unreadCount ?? this.unreadCount,
@@ -170,6 +172,73 @@ class ChatUser {
       displayName: row['display_name']?.toString() ?? 'Unknown user',
       email: row['email']?.toString(),
       lastSeenAt: _readOptionalTimestamp(row['last_seen_at']),
+    );
+  }
+}
+
+class CurrentUserProfile {
+  const CurrentUserProfile({
+    required this.id,
+    required this.displayName,
+    this.email,
+    this.phone,
+    this.updatedAt,
+  });
+
+  final String id;
+  final String displayName;
+  final String? email;
+  final String? phone;
+  final DateTime? updatedAt;
+
+  String get avatarLabel {
+    final parts = displayName
+        .trim()
+        .split(RegExp(r'\s+'))
+        .where((part) => part.isNotEmpty)
+        .toList();
+
+    if (parts.length >= 2) {
+      return '${parts.first[0]}${parts.last[0]}'.toUpperCase();
+    }
+    if (parts.isNotEmpty) {
+      return parts.first.characters.take(2).toString().toUpperCase();
+    }
+    return '?';
+  }
+
+  factory CurrentUserProfile.local({
+    String displayName = 'You',
+    String? email,
+    String? phone,
+    DateTime? updatedAt,
+  }) {
+    return CurrentUserProfile(
+      id: ChatSeed.localUserId,
+      displayName: displayName,
+      email: email,
+      phone: phone,
+      updatedAt: updatedAt,
+    );
+  }
+
+  factory CurrentUserProfile.fromSupabase(
+    Map<String, dynamic> row, {
+    required String fallbackId,
+    required String fallbackDisplayName,
+    String? fallbackEmail,
+    String? fallbackPhone,
+  }) {
+    final displayName = row['display_name']?.toString().trim();
+
+    return CurrentUserProfile(
+      id: row['id']?.toString() ?? fallbackId,
+      displayName: displayName == null || displayName.isEmpty
+          ? fallbackDisplayName
+          : displayName,
+      email: row['email']?.toString() ?? fallbackEmail,
+      phone: row['phone']?.toString() ?? fallbackPhone,
+      updatedAt: _readOptionalTimestamp(row['updated_at']),
     );
   }
 }

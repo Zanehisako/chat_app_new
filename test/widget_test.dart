@@ -2,6 +2,7 @@ import 'package:chat_app/src/app.dart';
 import 'package:chat_app/src/auth_screen.dart';
 import 'package:chat_app/src/auth_service.dart';
 import 'package:chat_app/src/chat_home_page.dart';
+import 'package:chat_app/src/chat_models.dart';
 import 'package:chat_app/src/chat_repository.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -90,6 +91,72 @@ void main() {
     await tester.pump();
 
     expect(find.text('Starting a new thread'), findsOneWidget);
+  });
+
+  testWidgets('opens profile page and updates local profile info', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(const ChatApp());
+
+    await tester.tap(find.byTooltip('Profile'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Profile'), findsOneWidget);
+    expect(find.byKey(const Key('profile-display-name')), findsOneWidget);
+    expect(find.text('local-preview-user'), findsOneWidget);
+
+    await tester.enterText(
+      find.byKey(const Key('profile-display-name')),
+      'Mina Clarke',
+    );
+    await tester.enterText(
+      find.byKey(const Key('profile-email')),
+      'mina@example.com',
+    );
+    await tester.enterText(find.byKey(const Key('profile-phone')), '+15551234');
+    await tester.tap(find.byKey(const Key('profile-save')));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Mina Clarke'), findsWidgets);
+    expect(find.text('Profile updated.'), findsOneWidget);
+  });
+
+  testWidgets('refreshes peer profile when opening a conversation', (
+    WidgetTester tester,
+  ) async {
+    final repository = _RefreshingChatRepository();
+
+    await tester.pumpWidget(
+      MaterialApp(home: ChatHomePage(repository: repository)),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Old Peer'), findsOneWidget);
+    expect(repository.profileFetchCount, 0);
+
+    await tester.tap(find.text('Old Peer'));
+    await tester.pumpAndSettle();
+
+    expect(repository.profileFetchCount, 1);
+    expect(find.text('Fresh Peer'), findsOneWidget);
+  });
+
+  testWidgets('pulls to refresh conversations', (WidgetTester tester) async {
+    final repository = _RefreshingChatRepository();
+
+    await tester.pumpWidget(
+      MaterialApp(home: ChatHomePage(repository: repository)),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Old Peer'), findsOneWidget);
+
+    await tester.drag(find.byType(ListView).first, const Offset(0, 320));
+    await tester.pump();
+    await tester.pumpAndSettle();
+
+    expect(repository.threadFetchCount, 1);
+    expect(find.text('Refreshed Peer'), findsOneWidget);
   });
 
   testWidgets('compact chat opens threads, goes back, and signs out', (
@@ -231,4 +298,65 @@ class _FakeAuthService implements ChatAuthService {
   Future<void> signOut() {
     throw UnimplementedError();
   }
+}
+
+class _RefreshingChatRepository extends ChatRepository {
+  int profileFetchCount = 0;
+  int threadFetchCount = 0;
+
+  @override
+  bool get isConnected => true;
+
+  @override
+  Stream<List<ChatThread>> watchThreads() {
+    return Stream.value([_testThread('Old Peer')]);
+  }
+
+  @override
+  Future<List<ChatThread>> fetchThreads() async {
+    threadFetchCount += 1;
+    return [_testThread('Refreshed Peer')];
+  }
+
+  @override
+  Future<ChatUser?> profileForUser(String userId) async {
+    profileFetchCount += 1;
+    return ChatUser(id: userId, displayName: 'Fresh Peer');
+  }
+
+  @override
+  Stream<Map<String, UserPresence>> watchPresenceForThreads() {
+    return Stream.value(const {});
+  }
+
+  @override
+  Stream<TypingState> watchConversationTyping(String conversationId) {
+    return Stream.value(TypingState.idle(conversationId));
+  }
+
+  @override
+  Stream<List<ChatMessage>> watchMessages(String conversationId) {
+    return Stream.value(const []);
+  }
+
+  @override
+  Future<void> updateLastSeen() async {}
+
+  @override
+  Future<void> disposeRealtime() async {}
+}
+
+ChatThread _testThread(String title) {
+  return ChatThread(
+    id: 'conversation-1',
+    title: title,
+    subtitle: 'Latest messages are synced.',
+    avatarLabel: 'OP',
+    accentColor: Colors.teal,
+    lastActive: 'Now',
+    unreadCount: 0,
+    isOnline: false,
+    activityLabel: 'Offline',
+    peerUserId: 'peer-1',
+  );
 }

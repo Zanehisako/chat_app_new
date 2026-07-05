@@ -52,6 +52,97 @@ class ChatRepository {
     return 'You';
   }
 
+  Future<CurrentUserProfile> currentProfile() async {
+    final supabase = client;
+    final user = supabase?.auth.currentUser;
+    if (supabase == null || user == null) {
+      return CurrentUserProfile.local(displayName: localSenderName);
+    }
+
+    var row = await supabase
+        .from('profiles')
+        .select('id, display_name, email, phone, updated_at')
+        .eq('id', user.id)
+        .maybeSingle();
+
+    if (row == null) {
+      await upsertCurrentProfile();
+      row = await supabase
+          .from('profiles')
+          .select('id, display_name, email, phone, updated_at')
+          .eq('id', user.id)
+          .maybeSingle();
+    }
+
+    return CurrentUserProfile.fromSupabase(
+      row ?? const <String, dynamic>{},
+      fallbackId: user.id,
+      fallbackDisplayName: localSenderName,
+      fallbackEmail: user.email,
+      fallbackPhone: user.phone,
+    );
+  }
+
+  Future<CurrentUserProfile> updateCurrentProfile({
+    required String displayName,
+    String? email,
+    String? phone,
+  }) async {
+    final trimmedName = displayName.trim();
+    if (trimmedName.isEmpty) {
+      throw ArgumentError('Display name is required.');
+    }
+
+    final normalizedEmail = _nullableText(email);
+    final normalizedPhone = _nullableText(phone);
+    final now = DateTime.now().toUtc();
+    final supabase = client;
+    final user = supabase?.auth.currentUser;
+
+    if (supabase == null || user == null) {
+      return CurrentUserProfile.local(
+        displayName: trimmedName,
+        email: normalizedEmail,
+        phone: normalizedPhone,
+        updatedAt: now.toLocal(),
+      );
+    }
+
+    final metadata = Map<String, dynamic>.from(
+      user.userMetadata ?? const <String, dynamic>{},
+    );
+    await supabase.auth.updateUser(
+      UserAttributes(
+        data: {
+          ...metadata,
+          'display_name': trimmedName,
+          'full_name': trimmedName,
+          'name': trimmedName,
+        },
+      ),
+    );
+
+    final row = await supabase
+        .from('profiles')
+        .upsert({
+          'id': user.id,
+          'display_name': trimmedName,
+          'email': normalizedEmail,
+          'phone': normalizedPhone,
+          'updated_at': now.toIso8601String(),
+        }, onConflict: 'id')
+        .select('id, display_name, email, phone, updated_at')
+        .single();
+
+    return CurrentUserProfile.fromSupabase(
+      row,
+      fallbackId: user.id,
+      fallbackDisplayName: trimmedName,
+      fallbackEmail: normalizedEmail,
+      fallbackPhone: normalizedPhone,
+    );
+  }
+
   Future<void> upsertCurrentProfile() async {
     final supabase = client;
     final user = supabase?.auth.currentUser;
@@ -101,6 +192,24 @@ class ChatRepository {
             rows.where((row) => _belongsToUser(row, user.id)).toList(),
           ),
         );
+  }
+
+  Future<List<ChatThread>> fetchThreads() async {
+    final supabase = client;
+    if (supabase == null) {
+      return ChatSeed.threads;
+    }
+    final user = supabase.auth.currentUser;
+    if (user == null) {
+      return const [];
+    }
+
+    final rows = await supabase.from('conversations').select();
+    return _threadsFromConversationRows(
+      List<Map<String, dynamic>>.from(
+        rows,
+      ).where((row) => _belongsToUser(row, user.id)).toList(),
+    );
   }
 
   Stream<Map<String, UserPresence>> watchPresenceForThreads() {
@@ -306,6 +415,31 @@ class ChatRepository {
         .where((user) => _matchesUser(user, normalizedQuery))
         .take(12)
         .toList();
+  }
+
+  Future<ChatUser?> profileForUser(String userId) async {
+    final normalizedUserId = userId.trim();
+    if (normalizedUserId.isEmpty) {
+      return null;
+    }
+
+    final supabase = client;
+    if (supabase == null) {
+      for (final user in ChatSeed.users) {
+        if (user.id == normalizedUserId) {
+          return user;
+        }
+      }
+      return null;
+    }
+
+    final currentUser = supabase.auth.currentUser;
+    if (currentUser == null) {
+      return null;
+    }
+
+    final profiles = await _profilesById({normalizedUserId});
+    return profiles[normalizedUserId];
   }
 
   Future<ChatThread> startDirectConversation(ChatUser peer) async {
@@ -746,6 +880,14 @@ Future<List<Map<String, dynamic>>> _selectProfiles(
     supabase.from('profiles').select('id, display_name, email, last_seen_at'),
   );
   return List<Map<String, dynamic>>.from(rows);
+}
+
+String? _nullableText(String? value) {
+  final trimmed = value?.trim();
+  if (trimmed == null || trimmed.isEmpty) {
+    return null;
+  }
+  return trimmed;
 }
 
 Color _accentColorFor(String seed) {
