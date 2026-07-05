@@ -1,6 +1,67 @@
 import 'package:flutter/material.dart';
 
-enum DeliveryState { sending, sent, seen }
+class UserPresence {
+  const UserPresence({
+    required this.userId,
+    required this.isOnline,
+    this.displayName,
+    this.lastSeenAt,
+  });
+
+  final String userId;
+  final bool isOnline;
+  final String? displayName;
+  final DateTime? lastSeenAt;
+}
+
+class TypingState {
+  const TypingState({
+    required this.conversationId,
+    required this.userId,
+    required this.displayName,
+    required this.isTyping,
+  });
+
+  final String conversationId;
+  final String userId;
+  final String displayName;
+  final bool isTyping;
+
+  factory TypingState.idle(String conversationId) {
+    return TypingState(
+      conversationId: conversationId,
+      userId: '',
+      displayName: '',
+      isTyping: false,
+    );
+  }
+}
+
+class MessageReceipt {
+  const MessageReceipt({
+    required this.messageId,
+    required this.userId,
+    this.deliveredAt,
+    this.readAt,
+  });
+
+  final String messageId;
+  final String userId;
+  final DateTime? deliveredAt;
+  final DateTime? readAt;
+
+  bool get isDelivered => deliveredAt != null || readAt != null;
+  bool get isRead => readAt != null;
+
+  factory MessageReceipt.fromSupabase(Map<String, dynamic> row) {
+    return MessageReceipt(
+      messageId: row['message_id']?.toString() ?? '',
+      userId: row['user_id']?.toString() ?? '',
+      deliveredAt: _readOptionalTimestamp(row['delivered_at']),
+      readAt: _readOptionalTimestamp(row['read_at']),
+    );
+  }
+}
 
 class ChatThread {
   const ChatThread({
@@ -12,7 +73,11 @@ class ChatThread {
     required this.lastActive,
     required this.unreadCount,
     required this.isOnline,
+    required this.activityLabel,
     this.peerUserId,
+    this.peerLastSeenAt,
+    this.isTyping = false,
+    this.typingUserName,
   });
 
   final String id;
@@ -23,15 +88,65 @@ class ChatThread {
   final String lastActive;
   final int unreadCount;
   final bool isOnline;
+  final String activityLabel;
   final String? peerUserId;
+  final DateTime? peerLastSeenAt;
+  final bool isTyping;
+  final String? typingUserName;
+
+  String get displaySubtitle {
+    if (!isTyping) {
+      return subtitle;
+    }
+
+    final name = typingUserName?.trim();
+    return '${name == null || name.isEmpty ? title : name} is typing...';
+  }
+
+  ChatThread copyWith({
+    String? subtitle,
+    String? lastActive,
+    int? unreadCount,
+    bool? isOnline,
+    String? activityLabel,
+    DateTime? peerLastSeenAt,
+    bool? isTyping,
+    String? typingUserName,
+  }) {
+    final nextIsTyping = isTyping ?? this.isTyping;
+
+    return ChatThread(
+      id: id,
+      title: title,
+      subtitle: subtitle ?? this.subtitle,
+      avatarLabel: avatarLabel,
+      accentColor: accentColor,
+      lastActive: lastActive ?? this.lastActive,
+      unreadCount: unreadCount ?? this.unreadCount,
+      isOnline: isOnline ?? this.isOnline,
+      activityLabel: activityLabel ?? this.activityLabel,
+      peerUserId: peerUserId,
+      peerLastSeenAt: peerLastSeenAt ?? this.peerLastSeenAt,
+      isTyping: nextIsTyping,
+      typingUserName: nextIsTyping
+          ? typingUserName ?? this.typingUserName
+          : null,
+    );
+  }
 }
 
 class ChatUser {
-  const ChatUser({required this.id, required this.displayName, this.email});
+  const ChatUser({
+    required this.id,
+    required this.displayName,
+    this.email,
+    this.lastSeenAt,
+  });
 
   final String id;
   final String displayName;
   final String? email;
+  final DateTime? lastSeenAt;
 
   String get avatarLabel {
     final parts = displayName
@@ -54,6 +169,7 @@ class ChatUser {
       id: row['id']?.toString() ?? '',
       displayName: row['display_name']?.toString() ?? 'Unknown user',
       email: row['email']?.toString(),
+      lastSeenAt: _readOptionalTimestamp(row['last_seen_at']),
     );
   }
 }
@@ -67,7 +183,8 @@ class ChatMessage {
     required this.body,
     required this.createdAt,
     required this.isMine,
-    required this.deliveryState,
+    required this.isDelivered,
+    required this.isRead,
   });
 
   final String id;
@@ -77,13 +194,18 @@ class ChatMessage {
   final String body;
   final DateTime createdAt;
   final bool isMine;
-  final DeliveryState deliveryState;
+  final bool isDelivered;
+  final bool isRead;
 
   factory ChatMessage.fromSupabase(
     Map<String, dynamic> row, {
     required String localUserId,
+    MessageReceipt? receipt,
   }) {
     final senderId = row['sender_id']?.toString() ?? '';
+    final isMine = senderId == localUserId;
+    final isRead = isMine && (receipt?.isRead ?? false);
+    final isDelivered = isMine && ((receipt?.isDelivered ?? false) || isRead);
 
     return ChatMessage(
       id: row['id']?.toString() ?? '',
@@ -94,16 +216,50 @@ class ChatMessage {
       senderId: senderId,
       senderName: row['sender_name']?.toString() ?? 'Unknown',
       body: row['body']?.toString() ?? '',
-      createdAt: _readTimestamp(row['created_at']),
-      isMine: senderId == localUserId,
-      deliveryState: DeliveryState.seen,
+      createdAt: _readRequiredTimestamp(row['created_at']),
+      isMine: isMine,
+      isDelivered: isDelivered,
+      isRead: isRead,
     );
   }
 }
 
-DateTime _readTimestamp(Object? value) {
-  return DateTime.tryParse(value?.toString() ?? '')?.toLocal() ??
-      DateTime.now();
+DateTime _readRequiredTimestamp(Object? value) {
+  return _readOptionalTimestamp(value) ?? DateTime.now();
+}
+
+DateTime? _readOptionalTimestamp(Object? value) {
+  return DateTime.tryParse(value?.toString() ?? '')?.toLocal();
+}
+
+String activityLabelFor({required bool isOnline, DateTime? lastSeenAt}) {
+  if (isOnline) {
+    return 'Online';
+  }
+  if (lastSeenAt == null) {
+    return 'Offline';
+  }
+
+  final difference = DateTime.now().difference(lastSeenAt);
+  if (difference.inMinutes < 1) {
+    return 'Active just now';
+  }
+
+  return 'Active since ${relativeTimeLabel(lastSeenAt)} ago';
+}
+
+String relativeTimeLabel(DateTime time) {
+  final difference = DateTime.now().difference(time);
+  if (difference.inMinutes < 1) {
+    return 'now';
+  }
+  if (difference.inHours < 1) {
+    return '${difference.inMinutes}m';
+  }
+  if (difference.inDays < 1) {
+    return '${difference.inHours}h';
+  }
+  return '${difference.inDays}d';
 }
 
 class ChatSeed {
@@ -134,12 +290,16 @@ class ChatSeed {
     ChatThread(
       id: 'studio',
       title: 'Design Studio',
-      subtitle: 'Samira is typing...',
+      subtitle: 'Done. Messages can come from the realtime table stream.',
       avatarLabel: 'DS',
       accentColor: Color(0xFF127A74),
       lastActive: 'Now',
       unreadCount: 3,
       isOnline: true,
+      activityLabel: 'Typing...',
+      peerUserId: 'samira',
+      isTyping: true,
+      typingUserName: 'Samira',
     ),
     ChatThread(
       id: 'product',
@@ -150,6 +310,8 @@ class ChatSeed {
       lastActive: '12m',
       unreadCount: 0,
       isOnline: true,
+      activityLabel: 'Online',
+      peerUserId: 'alex',
     ),
     ChatThread(
       id: 'maria',
@@ -160,6 +322,8 @@ class ChatSeed {
       lastActive: '1h',
       unreadCount: 1,
       isOnline: false,
+      activityLabel: 'Active since 1h ago',
+      peerUserId: 'maria',
     ),
     ChatThread(
       id: 'ops',
@@ -170,8 +334,54 @@ class ChatSeed {
       lastActive: '4h',
       unreadCount: 0,
       isOnline: false,
+      activityLabel: 'Active since 4h ago',
+      peerUserId: 'nadir',
     ),
   ];
+
+  static Map<String, UserPresence> get presenceByUser {
+    final now = DateTime.now();
+
+    return {
+      'samira': UserPresence(
+        userId: 'samira',
+        displayName: 'Samira',
+        isOnline: true,
+        lastSeenAt: now,
+      ),
+      'alex': UserPresence(
+        userId: 'alex',
+        displayName: 'Alex',
+        isOnline: true,
+        lastSeenAt: now.subtract(const Duration(minutes: 2)),
+      ),
+      'maria': UserPresence(
+        userId: 'maria',
+        displayName: 'Maria',
+        isOnline: false,
+        lastSeenAt: now.subtract(const Duration(hours: 1)),
+      ),
+      'nadir': UserPresence(
+        userId: 'nadir',
+        displayName: 'Nadir',
+        isOnline: false,
+        lastSeenAt: now.subtract(const Duration(hours: 4)),
+      ),
+    };
+  }
+
+  static TypingState typingForConversation(String conversationId) {
+    if (conversationId == 'studio') {
+      return const TypingState(
+        conversationId: 'studio',
+        userId: 'samira',
+        displayName: 'Samira',
+        isTyping: true,
+      );
+    }
+
+    return TypingState.idle(conversationId);
+  }
 
   static List<ChatMessage> messagesFor(String threadId) {
     final now = DateTime.now();
@@ -184,7 +394,8 @@ class ChatSeed {
         body: 'The new chat layout is in a good place.',
         createdAt: now.subtract(const Duration(minutes: 18)),
         isMine: false,
-        deliveryState: DeliveryState.seen,
+        isDelivered: false,
+        isRead: false,
       ),
       ChatMessage(
         id: 'm2',
@@ -194,47 +405,63 @@ class ChatSeed {
         body: 'Nice. I want the backend boundary ready for Supabase too.',
         createdAt: now.subtract(const Duration(minutes: 15)),
         isMine: true,
-        deliveryState: DeliveryState.seen,
+        isDelivered: true,
+        isRead: true,
       ),
       ChatMessage(
         id: 'm3',
+        threadId: 'studio',
+        senderId: localUserId,
+        senderName: 'You',
+        body: 'I will send the final copy next.',
+        createdAt: now.subtract(const Duration(minutes: 12)),
+        isMine: true,
+        isDelivered: true,
+        isRead: false,
+      ),
+      ChatMessage(
+        id: 'm4',
         threadId: 'studio',
         senderId: 'samira',
         senderName: 'Samira',
         body: 'Done. Messages can come from the realtime table stream.',
         createdAt: now.subtract(const Duration(minutes: 8)),
         isMine: false,
-        deliveryState: DeliveryState.seen,
+        isDelivered: false,
+        isRead: false,
       ),
       ChatMessage(
-        id: 'm4',
+        id: 'm5',
         threadId: 'product',
         senderId: 'alex',
         senderName: 'Alex',
         body: 'The release notes are ready for the build review.',
         createdAt: now.subtract(const Duration(minutes: 35)),
         isMine: false,
-        deliveryState: DeliveryState.seen,
+        isDelivered: false,
+        isRead: false,
       ),
       ChatMessage(
-        id: 'm5',
+        id: 'm6',
         threadId: 'maria',
         senderId: 'maria',
         senderName: 'Maria',
         body: 'Can you review the handoff before the client call?',
         createdAt: now.subtract(const Duration(hours: 1)),
         isMine: false,
-        deliveryState: DeliveryState.seen,
+        isDelivered: false,
+        isRead: false,
       ),
       ChatMessage(
-        id: 'm6',
+        id: 'm7',
         threadId: 'ops',
         senderId: 'nadir',
         senderName: 'Nadir',
         body: 'Backend deploy finished. Monitoring looks clean.',
         createdAt: now.subtract(const Duration(hours: 4)),
         isMine: false,
-        deliveryState: DeliveryState.seen,
+        isDelivered: false,
+        isRead: false,
       ),
     ];
 

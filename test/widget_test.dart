@@ -15,6 +15,7 @@ void main() {
 
     expect(find.text('Welcome back'), findsNothing);
     expect(find.text('Design Studio'), findsOneWidget);
+    expect(find.text('Samira is typing...'), findsOneWidget);
     expect(find.byTooltip('Sign out'), findsOneWidget);
 
     await tester.tap(find.text('Design Studio'));
@@ -24,6 +25,9 @@ void main() {
       find.text('The new chat layout is in a good place.'),
       findsOneWidget,
     );
+    expect(find.text('Typing...'), findsOneWidget);
+    expect(find.byKey(const Key('message-status-read')), findsOneWidget);
+    expect(find.byKey(const Key('message-status-delivered')), findsOneWidget);
 
     await tester.enterText(
       find.byKey(const Key('message-composer')),
@@ -33,6 +37,31 @@ void main() {
     await tester.pump();
 
     expect(find.text('Hello Supabase'), findsOneWidget);
+    expect(find.byKey(const Key('message-status-sent')), findsOneWidget);
+  });
+
+  testWidgets('shows typing, online, and active since status priority', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(const ChatApp());
+
+    expect(find.text('Samira is typing...'), findsOneWidget);
+
+    await tester.tap(find.text('Design Studio'));
+    await tester.pumpAndSettle();
+    expect(find.text('Typing...'), findsOneWidget);
+
+    await tester.tap(find.byTooltip('Back to chats'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Product Team'));
+    await tester.pumpAndSettle();
+    expect(find.text('Online'), findsOneWidget);
+
+    await tester.tap(find.byTooltip('Back to chats'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Maria Chen'));
+    await tester.pumpAndSettle();
+    expect(find.text('Active since 1h ago'), findsOneWidget);
   });
 
   testWidgets('starts an empty local preview direct message from user search', (
@@ -71,7 +100,7 @@ void main() {
     await tester.pumpWidget(
       MaterialApp(
         home: ChatHomePage(
-          repository: const ChatRepository(),
+          repository: ChatRepository(),
           onSignOut: () async {
             signedOut = true;
           },

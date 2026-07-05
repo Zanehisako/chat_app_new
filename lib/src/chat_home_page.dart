@@ -15,13 +15,20 @@ class ChatHomePage extends StatefulWidget {
   State<ChatHomePage> createState() => _ChatHomePageState();
 }
 
-class _ChatHomePageState extends State<ChatHomePage> {
+class _ChatHomePageState extends State<ChatHomePage>
+    with WidgetsBindingObserver {
   late Stream<List<ChatThread>> _threadsStream;
   ChatThread? _selectedThread;
   final _messageController = TextEditingController();
   final _searchController = TextEditingController();
   final List<ChatThread> _startedThreads = [];
   final List<ChatMessage> _localMessages = [];
+  final Map<String, UserPresence> _presenceByUser = {};
+  final Map<String, TypingState> _typingByConversation = {};
+  final Map<String, StreamSubscription<TypingState>> _typingSubscriptions = {};
+  StreamSubscription<Map<String, UserPresence>>? _presenceSubscription;
+  Timer? _typingStopTimer;
+  String? _activeTypingConversationId;
   String _query = '';
   bool _isSending = false;
   bool _isCompactConversationOpen = false;
@@ -29,24 +36,126 @@ class _ChatHomePageState extends State<ChatHomePage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _threadsStream = widget.repository.watchThreads();
+    _subscribePresence();
   }
 
   @override
   void didUpdateWidget(covariant ChatHomePage oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.repository != widget.repository) {
+      unawaited(oldWidget.repository.disposeRealtime());
+      _presenceSubscription?.cancel();
+      _cancelTypingSubscriptions();
+      _presenceByUser.clear();
+      _typingByConversation.clear();
       _threadsStream = widget.repository.watchThreads();
       _selectedThread = null;
       _startedThreads.clear();
+      _subscribePresence();
     }
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _typingStopTimer?.cancel();
+    _presenceSubscription?.cancel();
+    _cancelTypingSubscriptions();
+    unawaited(widget.repository.disposeRealtime());
     _messageController.dispose();
     _searchController.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      unawaited(widget.repository.updateLastSeen());
+    }
+  }
+
+  void _subscribePresence() {
+    _presenceSubscription = widget.repository.watchPresenceForThreads().listen((
+      presence,
+    ) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _presenceByUser
+          ..clear()
+          ..addAll(presence);
+      });
+    });
+  }
+
+  void _syncTypingSubscriptions(List<ChatThread> threads) {
+    final activeConversationIds = threads.map((thread) => thread.id).toSet();
+
+    for (final entry in _typingSubscriptions.entries.toList()) {
+      if (!activeConversationIds.contains(entry.key)) {
+        unawaited(entry.value.cancel());
+        _typingSubscriptions.remove(entry.key);
+        _typingByConversation.remove(entry.key);
+      }
+    }
+
+    for (final thread in threads) {
+      if (_typingSubscriptions.containsKey(thread.id)) {
+        continue;
+      }
+
+      _typingSubscriptions[thread.id] = widget.repository
+          .watchConversationTyping(thread.id)
+          .listen((typing) {
+            if (!mounted) {
+              return;
+            }
+
+            setState(() {
+              _typingByConversation[thread.id] = typing;
+            });
+          });
+    }
+  }
+
+  void _cancelTypingSubscriptions() {
+    for (final subscription in _typingSubscriptions.values) {
+      unawaited(subscription.cancel());
+    }
+    _typingSubscriptions.clear();
+  }
+
+  List<ChatThread> _threadsWithActivity(List<ChatThread> threads) {
+    return threads.map((thread) {
+      final presence = thread.peerUserId == null
+          ? null
+          : _presenceByUser[thread.peerUserId];
+      final typing = _typingByConversation[thread.id];
+      final isTyping = typing?.isTyping ?? thread.isTyping;
+      final isOnline = presence?.isOnline ?? thread.isOnline;
+      final lastSeenAt = presence?.lastSeenAt ?? thread.peerLastSeenAt;
+      final activityLabel = isTyping
+          ? 'Typing...'
+          : isOnline
+          ? 'Online'
+          : activityLabelFor(isOnline: false, lastSeenAt: lastSeenAt);
+
+      return thread.copyWith(
+        isOnline: isOnline,
+        peerLastSeenAt: lastSeenAt,
+        activityLabel: activityLabel == 'Offline'
+            ? thread.activityLabel
+            : activityLabel,
+        isTyping: isTyping,
+        typingUserName: typing?.displayName,
+      );
+    }).toList();
   }
 
   @override
@@ -57,7 +166,10 @@ class _ChatHomePageState extends State<ChatHomePage> {
           ? const []
           : widget.repository.threads,
       builder: (context, snapshot) {
-        final threads = _mergeThreads(snapshot.data ?? const []);
+        final threads = _threadsWithActivity(
+          _mergeThreads(snapshot.data ?? const []),
+        );
+        _syncTypingSubscriptions(threads);
         final selectedThread = _selectedThreadFor(threads);
 
         return LayoutBuilder(
@@ -147,6 +259,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
       showBackButton: showBackButton,
       onBackToInbox: _showCompactInbox,
       onSend: () => _sendMessage(thread),
+      onComposerChanged: (value) => _handleComposerChanged(thread, value),
       onSignOut: _requestSignOut,
     );
   }
@@ -159,7 +272,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
 
     return threads.where((thread) {
       return thread.title.toLowerCase().contains(normalizedQuery) ||
-          thread.subtitle.toLowerCase().contains(normalizedQuery);
+          thread.displaySubtitle.toLowerCase().contains(normalizedQuery);
     }).toList();
   }
 
@@ -265,6 +378,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
     }
 
     try {
+      await widget.repository.updateLastSeen();
       await signOut();
     } catch (_) {
       if (!mounted) {
@@ -275,6 +389,47 @@ class _ChatHomePageState extends State<ChatHomePage> {
         const SnackBar(content: Text('Could not sign out. Please try again.')),
       );
     }
+  }
+
+  void _handleComposerChanged(ChatThread thread, String value) {
+    if (!widget.repository.isConnected) {
+      return;
+    }
+
+    _typingStopTimer?.cancel();
+
+    if (value.trim().isEmpty) {
+      unawaited(_stopTyping());
+      return;
+    }
+
+    if (_activeTypingConversationId != thread.id) {
+      if (_activeTypingConversationId != null) {
+        unawaited(_stopTyping());
+      }
+      _activeTypingConversationId = thread.id;
+      unawaited(
+        widget.repository.setTyping(conversationId: thread.id, isTyping: true),
+      );
+    }
+
+    _typingStopTimer = Timer(const Duration(milliseconds: 2500), () {
+      unawaited(_stopTyping());
+    });
+  }
+
+  Future<void> _stopTyping() async {
+    _typingStopTimer?.cancel();
+    final conversationId = _activeTypingConversationId;
+    _activeTypingConversationId = null;
+    if (conversationId == null) {
+      return;
+    }
+
+    await widget.repository.setTyping(
+      conversationId: conversationId,
+      isTyping: false,
+    );
   }
 
   Future<void> _sendMessage(ChatThread selectedThread) async {
@@ -297,7 +452,8 @@ class _ChatHomePageState extends State<ChatHomePage> {
             body: text,
             createdAt: DateTime.now(),
             isMine: true,
-            deliveryState: DeliveryState.sent,
+            isDelivered: false,
+            isRead: false,
           ),
         );
       });
@@ -309,6 +465,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
     });
 
     try {
+      await _stopTyping();
       await widget.repository.sendMessage(
         conversationId: selectedThread.id,
         body: text,
@@ -739,11 +896,16 @@ class _ThreadTile extends StatelessWidget {
                     children: [
                       Expanded(
                         child: Text(
-                          thread.subtitle,
+                          thread.displaySubtitle,
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: theme.textTheme.bodyMedium?.copyWith(
-                            color: theme.colorScheme.onSurfaceVariant,
+                            color: thread.isTyping
+                                ? const Color(0xFF127A74)
+                                : theme.colorScheme.onSurfaceVariant,
+                            fontWeight: thread.isTyping
+                                ? FontWeight.w700
+                                : null,
                           ),
                         ),
                       ),
@@ -792,6 +954,7 @@ class _ConversationPane extends StatelessWidget {
     required this.showBackButton,
     required this.onBackToInbox,
     required this.onSend,
+    required this.onComposerChanged,
     required this.onSignOut,
   });
 
@@ -803,6 +966,7 @@ class _ConversationPane extends StatelessWidget {
   final bool showBackButton;
   final VoidCallback onBackToInbox;
   final VoidCallback onSend;
+  final ValueChanged<String> onComposerChanged;
   final VoidCallback onSignOut;
 
   @override
@@ -849,18 +1013,23 @@ class _ConversationPane extends StatelessWidget {
                         Icon(
                           Icons.circle,
                           size: 8,
-                          color: thread.isOnline
+                          color: thread.isOnline || thread.isTyping
                               ? const Color(0xFF17A36B)
                               : theme.colorScheme.onSurfaceVariant,
                         ),
                         const SizedBox(width: 6),
                         Flexible(
                           child: Text(
-                            thread.isOnline ? 'Online' : 'Away',
+                            thread.activityLabel,
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                             style: theme.textTheme.labelMedium?.copyWith(
-                              color: theme.colorScheme.onSurfaceVariant,
+                              color: thread.isTyping
+                                  ? const Color(0xFF127A74)
+                                  : theme.colorScheme.onSurfaceVariant,
+                              fontWeight: thread.isTyping
+                                  ? FontWeight.w700
+                                  : null,
                             ),
                           ),
                         ),
@@ -896,6 +1065,10 @@ class _ConversationPane extends StatelessWidget {
                 ...localMessages,
               ]..sort((a, b) => a.createdAt.compareTo(b.createdAt));
 
+              if (repository.isConnected && messages.isNotEmpty) {
+                unawaited(repository.markConversationRead(thread.id));
+              }
+
               if (messages.isEmpty) {
                 return const _EmptyMessageList();
               }
@@ -913,6 +1086,7 @@ class _ConversationPane extends StatelessWidget {
         _MessageComposer(
           controller: messageController,
           isSending: isSending,
+          onChanged: onComposerChanged,
           onSend: onSend,
         ),
       ],
@@ -1006,12 +1180,9 @@ class _MessageBubble extends StatelessWidget {
                       ),
                       if (isMine) ...[
                         const SizedBox(width: 6),
-                        Icon(
-                          message.deliveryState == DeliveryState.seen
-                              ? Icons.done_all
-                              : Icons.done,
-                          size: 15,
-                          color: textColor.withValues(alpha: 0.72),
+                        _ReceiptIcon(
+                          message: message,
+                          fallbackColor: textColor.withValues(alpha: 0.72),
                         ),
                       ],
                     ],
@@ -1026,15 +1197,52 @@ class _MessageBubble extends StatelessWidget {
   }
 }
 
+class _ReceiptIcon extends StatelessWidget {
+  const _ReceiptIcon({required this.message, required this.fallbackColor});
+
+  final ChatMessage message;
+  final Color fallbackColor;
+
+  @override
+  Widget build(BuildContext context) {
+    if (message.isRead) {
+      return const Icon(
+        Icons.done_all,
+        key: Key('message-status-read'),
+        size: 15,
+        color: Color(0xFF53BDEB),
+      );
+    }
+
+    if (message.isDelivered) {
+      return Icon(
+        Icons.done_all,
+        key: const Key('message-status-delivered'),
+        size: 15,
+        color: fallbackColor,
+      );
+    }
+
+    return Icon(
+      Icons.done,
+      key: const Key('message-status-sent'),
+      size: 15,
+      color: fallbackColor,
+    );
+  }
+}
+
 class _MessageComposer extends StatelessWidget {
   const _MessageComposer({
     required this.controller,
     required this.isSending,
+    required this.onChanged,
     required this.onSend,
   });
 
   final TextEditingController controller;
   final bool isSending;
+  final ValueChanged<String> onChanged;
   final VoidCallback onSend;
 
   @override
@@ -1065,6 +1273,7 @@ class _MessageComposer extends StatelessWidget {
                 minLines: 1,
                 maxLines: 4,
                 textInputAction: TextInputAction.newline,
+                onChanged: onChanged,
                 decoration: const InputDecoration(hintText: 'Message'),
               ),
             ),
@@ -1118,7 +1327,7 @@ class _Avatar extends StatelessWidget {
             ),
           ),
         ),
-        if (thread.isOnline)
+        if (thread.isOnline || thread.isTyping)
           Positioned(
             right: -2,
             bottom: -2,

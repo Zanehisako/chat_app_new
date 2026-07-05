@@ -20,7 +20,7 @@ class ChatApp extends StatelessWidget {
       theme: _buildTheme(Brightness.light),
       darkTheme: _buildTheme(Brightness.dark),
       home: client == null
-          ? ChatHomePage(repository: const ChatRepository())
+          ? ChatHomePage(repository: ChatRepository())
           : AuthGate(client: client),
     );
   }

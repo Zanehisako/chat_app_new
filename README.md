@@ -12,10 +12,19 @@ Without Supabase environment values, the app runs against local seed messages.
 
 ## Run with Supabase
 
-1. Apply `supabase/schema.sql` in your Supabase SQL editor. The schema creates
-   profiles, one-to-one conversations, realtime messages, RLS policies, and auth
-   triggers. It replaces the old demo `public.messages` table and backfills
-   profiles for existing auth users so user search has results.
+1. Apply database changes through migrations:
+
+```sh
+npx supabase login
+npx supabase link --project-ref your-project-ref
+npx supabase db push
+```
+
+The migration files in `supabase/migrations/` create profiles, one-to-one
+conversations, realtime messages, per-recipient receipts, RLS policies, auth
+triggers, and existing-message receipt backfills. `supabase/schema.sql` is the
+full schema snapshot for reference.
+
 2. In Supabase Auth, enable Email, Phone, and Google providers.
 3. Enable email confirmation if you want signups to require confirm-email.
 4. Add redirect URLs:

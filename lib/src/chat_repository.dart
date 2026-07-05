@@ -1,12 +1,22 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'chat_models.dart';
 
 class ChatRepository {
-  const ChatRepository({this.client});
+  ChatRepository({this.client});
 
   final SupabaseClient? client;
+  RealtimeChannel? _presenceChannel;
+  bool _presenceSubscribed = false;
+  final Map<String, RealtimeChannel> _typingChannels = {};
+  final Map<String, StreamController<TypingState>> _typingControllers = {};
+  final Set<String> _typingSubscribeStartedConversations = {};
+  final Set<String> _typingSubscribedConversations = {};
+  final Map<String, Future<void>> _typingSubscribeFutures = {};
+  final Map<String, bool> _typingValues = {};
 
   bool get isConnected => client != null;
 
@@ -58,6 +68,20 @@ class ChatRepository {
     }, onConflict: 'id');
   }
 
+  Future<void> updateLastSeen() async {
+    final supabase = client;
+    final user = supabase?.auth.currentUser;
+    if (supabase == null || user == null) {
+      return;
+    }
+
+    final now = DateTime.now().toUtc().toIso8601String();
+    await supabase
+        .from('profiles')
+        .update({'last_seen_at': now, 'updated_at': now})
+        .eq('id', user.id);
+  }
+
   Stream<List<ChatThread>> watchThreads() {
     final supabase = client;
     if (supabase == null) {
@@ -79,6 +103,180 @@ class ChatRepository {
         );
   }
 
+  Stream<Map<String, UserPresence>> watchPresenceForThreads() {
+    final supabase = client;
+    final user = supabase?.auth.currentUser;
+    if (supabase == null || user == null) {
+      return Stream.value(ChatSeed.presenceByUser);
+    }
+
+    final controller = StreamController<Map<String, UserPresence>>();
+    final channel = _presenceChannel ??= supabase.channel(
+      'online-users',
+      opts: RealtimeChannelConfig(key: user.id),
+    );
+
+    void emitPresence() {
+      if (!controller.isClosed) {
+        controller.add(_presenceByUserFrom(channel));
+      }
+    }
+
+    channel
+        .onPresenceSync((_) => emitPresence())
+        .onPresenceJoin((_) => emitPresence())
+        .onPresenceLeave((_) => emitPresence());
+
+    if (!_presenceSubscribed) {
+      _presenceSubscribed = true;
+      channel.subscribe((status, [_]) {
+        if (status == RealtimeSubscribeStatus.subscribed) {
+          unawaited(
+            channel.track({
+              'user_id': user.id,
+              'display_name': localSenderName,
+              'online_at': DateTime.now().toUtc().toIso8601String(),
+            }),
+          );
+          emitPresence();
+        }
+      });
+    } else {
+      scheduleMicrotask(emitPresence);
+    }
+
+    return controller.stream;
+  }
+
+  Stream<TypingState> watchConversationTyping(String conversationId) {
+    final supabase = client;
+    final user = supabase?.auth.currentUser;
+    if (supabase == null || user == null) {
+      return Stream.value(ChatSeed.typingForConversation(conversationId));
+    }
+
+    final controller = _typingControllerFor(
+      supabase: supabase,
+      userId: user.id,
+      conversationId: conversationId,
+    );
+    scheduleMicrotask(() => _emitTyping(conversationId, user.id));
+
+    return controller.stream;
+  }
+
+  StreamController<TypingState> _typingControllerFor({
+    required SupabaseClient supabase,
+    required String userId,
+    required String conversationId,
+  }) {
+    final existing = _typingControllers[conversationId];
+    if (existing != null && !existing.isClosed) {
+      return existing;
+    }
+
+    late final StreamController<TypingState> controller;
+    final channel = _typingChannelFor(
+      supabase: supabase,
+      userId: userId,
+      conversationId: conversationId,
+    );
+
+    void emitTyping() {
+      _emitTyping(conversationId, userId);
+    }
+
+    controller = StreamController<TypingState>.broadcast();
+    _typingControllers[conversationId] = controller;
+
+    channel
+        .onPresenceSync((_) => emitTyping())
+        .onPresenceJoin((_) => emitTyping())
+        .onPresenceLeave((_) => emitTyping());
+
+    _subscribeTypingChannel(
+      channel: channel,
+      conversationId: conversationId,
+      onSubscribed: emitTyping,
+    );
+    scheduleMicrotask(emitTyping);
+
+    return controller;
+  }
+
+  Future<void> setTyping({
+    required String conversationId,
+    required bool isTyping,
+  }) async {
+    final supabase = client;
+    final user = supabase?.auth.currentUser;
+    if (supabase == null || user == null) {
+      return;
+    }
+
+    if (_typingValues[conversationId] == isTyping) {
+      return;
+    }
+
+    final channel = _typingChannelFor(
+      supabase: supabase,
+      userId: user.id,
+      conversationId: conversationId,
+    );
+    final isSubscribed = await _subscribeTypingChannel(
+      channel: channel,
+      conversationId: conversationId,
+    );
+    if (!isSubscribed) {
+      return;
+    }
+
+    try {
+      await channel.track({
+        'user_id': user.id,
+        'display_name': localSenderName,
+        'conversation_id': conversationId,
+        'typing': isTyping,
+        'updated_at': DateTime.now().toUtc().toIso8601String(),
+      });
+      _typingValues[conversationId] = isTyping;
+    } catch (_) {
+      // Typing is transient; never let a realtime timing issue break chat flow.
+    }
+  }
+
+  Future<void> markConversationDelivered(String conversationId) async {
+    final supabase = client;
+    final user = supabase?.auth.currentUser;
+    if (supabase == null || user == null) {
+      return;
+    }
+
+    await supabase
+        .from('message_receipts')
+        .update({'delivered_at': DateTime.now().toUtc().toIso8601String()})
+        .eq('conversation_id', conversationId)
+        .eq('user_id', user.id)
+        .isFilter('delivered_at', null);
+  }
+
+  Future<void> markConversationRead(String conversationId) async {
+    final supabase = client;
+    final user = supabase?.auth.currentUser;
+    if (supabase == null || user == null) {
+      return;
+    }
+
+    final now = DateTime.now().toUtc().toIso8601String();
+    await markConversationDelivered(conversationId);
+    await supabase
+        .from('message_receipts')
+        .update({'read_at': now})
+        .eq('conversation_id', conversationId)
+        .eq('user_id', user.id)
+        .isFilter('read_at', null);
+  }
+
   Future<List<ChatUser>> searchUsers(String query) async {
     final normalizedQuery = query.trim().toLowerCase();
     if (normalizedQuery.isEmpty) {
@@ -97,12 +295,11 @@ class ChatRepository {
       return const [];
     }
 
-    final rows = await supabase
-        .from('profiles')
-        .select('id, display_name, email')
-        .neq('id', currentUser.id)
-        .order('display_name')
-        .limit(50);
+    final rows = await _selectProfiles(
+      supabase,
+      (query) =>
+          query.neq('id', currentUser.id).order('display_name').limit(50),
+    );
 
     return rows
         .map(ChatUser.fromSupabase)
@@ -168,23 +365,71 @@ class ChatRepository {
     if (supabase == null) {
       return Stream.value(ChatSeed.messagesFor(conversationId));
     }
-    if (supabase.auth.currentUser == null) {
+    final user = supabase.auth.currentUser;
+    if (user == null) {
       return Stream.value(const []);
     }
 
-    return supabase
+    final controller = StreamController<List<ChatMessage>>();
+    final messagesById = <String, Map<String, dynamic>>{};
+    var receiptsByMessageId = <String, MessageReceipt>{};
+    StreamSubscription<List<Map<String, dynamic>>>? messagesSubscription;
+    StreamSubscription<List<Map<String, dynamic>>>? receiptsSubscription;
+
+    void emitMessages() {
+      if (controller.isClosed) {
+        return;
+      }
+
+      final messages =
+          messagesById.values
+              .map(
+                (row) => ChatMessage.fromSupabase(
+                  row,
+                  localUserId: user.id,
+                  receipt: receiptsByMessageId[row['id']?.toString()],
+                ),
+              )
+              .toList()
+            ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+
+      controller.add(messages);
+    }
+
+    messagesSubscription = supabase
         .from('messages')
         .stream(primaryKey: ['id'])
         .eq('conversation_id', conversationId)
         .order('created_at')
-        .map(
-          (rows) => rows
-              .map(
-                (row) =>
-                    ChatMessage.fromSupabase(row, localUserId: localUserId),
-              )
-              .toList(),
-        );
+        .listen((rows) {
+          messagesById
+            ..clear()
+            ..addEntries(
+              rows.map((row) => MapEntry(row['id']?.toString() ?? '', row)),
+            );
+          emitMessages();
+        }, onError: controller.addError);
+
+    receiptsSubscription = supabase
+        .from('message_receipts')
+        .stream(primaryKey: ['message_id', 'user_id'])
+        .eq('conversation_id', conversationId)
+        .listen((rows) {
+          receiptsByMessageId = {
+            for (final row in rows)
+              if (row['user_id']?.toString() != user.id)
+                MessageReceipt.fromSupabase(row).messageId:
+                    MessageReceipt.fromSupabase(row),
+          };
+          emitMessages();
+        }, onError: controller.addError);
+
+    controller.onCancel = () async {
+      await messagesSubscription?.cancel();
+      await receiptsSubscription?.cancel();
+    };
+
+    return controller.stream;
   }
 
   Future<void> sendMessage({
@@ -208,6 +453,179 @@ class ChatRepository {
       'sender_name': localSenderName,
       'body': trimmed,
     });
+  }
+
+  Future<void> disposeRealtime() async {
+    final supabase = client;
+    if (supabase == null) {
+      return;
+    }
+
+    await updateLastSeen();
+
+    final channels = [?_presenceChannel, ..._typingChannels.values];
+
+    _presenceChannel = null;
+    _presenceSubscribed = false;
+    for (final controller in _typingControllers.values) {
+      await controller.close();
+    }
+    _typingControllers.clear();
+    _typingChannels.clear();
+    _typingSubscribeStartedConversations.clear();
+    _typingSubscribedConversations.clear();
+    _typingSubscribeFutures.clear();
+    _typingValues.clear();
+
+    await Future.wait(
+      channels.map((channel) async {
+        try {
+          await channel.untrack();
+        } catch (_) {
+          // Best effort cleanup; channel removal below is the important part.
+        }
+
+        try {
+          await supabase.removeChannel(channel);
+        } catch (_) {
+          // Realtime cleanup should never block widget disposal.
+        }
+      }),
+    );
+  }
+
+  RealtimeChannel _typingChannelFor({
+    required SupabaseClient supabase,
+    required String userId,
+    required String conversationId,
+  }) {
+    return _typingChannels[conversationId] ??= supabase.channel(
+      'typing:$conversationId',
+      opts: RealtimeChannelConfig(key: userId),
+    );
+  }
+
+  Future<bool> _subscribeTypingChannel({
+    required RealtimeChannel channel,
+    required String conversationId,
+    VoidCallback? onSubscribed,
+  }) async {
+    if (_typingSubscribedConversations.contains(conversationId)) {
+      onSubscribed?.call();
+      return true;
+    }
+
+    final pendingSubscription = _typingSubscribeFutures[conversationId];
+    if (pendingSubscription != null) {
+      await pendingSubscription;
+      if (_typingSubscribedConversations.contains(conversationId)) {
+        onSubscribed?.call();
+        return true;
+      }
+      return false;
+    }
+
+    if (_typingSubscribeStartedConversations.contains(conversationId)) {
+      return _typingSubscribedConversations.contains(conversationId);
+    }
+
+    final completer = Completer<void>();
+    final subscriptionFuture = completer.future
+        .timeout(const Duration(seconds: 2), onTimeout: () {})
+        .whenComplete(() {
+          _typingSubscribeFutures.remove(conversationId);
+        });
+    _typingSubscribeFutures[conversationId] = subscriptionFuture;
+    _typingSubscribeStartedConversations.add(conversationId);
+
+    try {
+      channel.subscribe((status, [_]) {
+        if (status == RealtimeSubscribeStatus.subscribed) {
+          _typingSubscribedConversations.add(conversationId);
+          onSubscribed?.call();
+          if (!completer.isCompleted) {
+            completer.complete();
+          }
+        }
+        if (status == RealtimeSubscribeStatus.channelError &&
+            !completer.isCompleted) {
+          completer.complete();
+        }
+      });
+    } catch (_) {
+      if (!completer.isCompleted) {
+        completer.complete();
+      }
+    }
+
+    await subscriptionFuture;
+    return _typingSubscribedConversations.contains(conversationId);
+  }
+
+  void _emitTyping(String conversationId, String localUserId) {
+    final controller = _typingControllers[conversationId];
+    final channel = _typingChannels[conversationId];
+    if (controller == null || controller.isClosed || channel == null) {
+      return;
+    }
+
+    controller.add(_typingStateFrom(channel, conversationId, localUserId));
+  }
+
+  Map<String, UserPresence> _presenceByUserFrom(RealtimeChannel channel) {
+    final presence = <String, UserPresence>{};
+
+    for (final state in channel.presenceState()) {
+      for (final item in state.presences) {
+        final payload = item.payload;
+        final userId = payload['user_id']?.toString().trim().isNotEmpty == true
+            ? payload['user_id'].toString()
+            : state.key;
+        if (userId.isEmpty) {
+          continue;
+        }
+
+        presence[userId] = UserPresence(
+          userId: userId,
+          displayName: payload['display_name']?.toString(),
+          isOnline: true,
+          lastSeenAt: _readTimestamp(
+            payload['last_seen_at'] ?? payload['online_at'],
+          ),
+        );
+      }
+    }
+
+    return presence;
+  }
+
+  TypingState _typingStateFrom(
+    RealtimeChannel channel,
+    String conversationId,
+    String localUserId,
+  ) {
+    for (final state in channel.presenceState()) {
+      if (state.key == localUserId) {
+        continue;
+      }
+
+      for (final item in state.presences.reversed) {
+        final payload = item.payload;
+        if (payload['conversation_id']?.toString() != conversationId ||
+            payload['typing'] != true) {
+          continue;
+        }
+
+        return TypingState(
+          conversationId: conversationId,
+          userId: payload['user_id']?.toString() ?? state.key,
+          displayName: payload['display_name']?.toString() ?? 'Someone',
+          isTyping: true,
+        );
+      }
+    }
+
+    return TypingState.idle(conversationId);
   }
 
   Future<List<ChatThread>> _threadsFromConversationRows(
@@ -242,10 +660,10 @@ class ChatRepository {
       return const {};
     }
 
-    final rows = await supabase
-        .from('profiles')
-        .select('id, display_name, email')
-        .inFilter('id', ids.toList());
+    final rows = await _selectProfiles(
+      supabase,
+      (query) => query.inFilter('id', ids.toList()),
+    );
 
     return {
       for (final row in rows)
@@ -295,10 +713,17 @@ class ChatRepository {
       subtitle: hasMessages ? 'Latest messages are synced.' : 'No messages yet',
       avatarLabel: peer.avatarLabel,
       accentColor: _accentColorFor(peer.id),
-      lastActive: lastMessageAt == null ? 'New' : _relativeTime(lastMessageAt),
+      lastActive: lastMessageAt == null
+          ? 'New'
+          : relativeTimeLabel(lastMessageAt),
       unreadCount: 0,
       isOnline: false,
+      activityLabel: activityLabelFor(
+        isOnline: false,
+        lastSeenAt: peer.lastSeenAt,
+      ),
       peerUserId: peer.id,
+      peerLastSeenAt: peer.lastSeenAt,
     );
   }
 }
@@ -313,18 +738,14 @@ DateTime? _readTimestamp(Object? value) {
   return DateTime.tryParse(value?.toString() ?? '')?.toLocal();
 }
 
-String _relativeTime(DateTime time) {
-  final difference = DateTime.now().difference(time);
-  if (difference.inMinutes < 1) {
-    return 'Now';
-  }
-  if (difference.inHours < 1) {
-    return '${difference.inMinutes}m';
-  }
-  if (difference.inDays < 1) {
-    return '${difference.inHours}h';
-  }
-  return '${difference.inDays}d';
+Future<List<Map<String, dynamic>>> _selectProfiles(
+  SupabaseClient supabase,
+  dynamic Function(dynamic query) applyFilters,
+) async {
+  final rows = await applyFilters(
+    supabase.from('profiles').select('id, display_name, email, last_seen_at'),
+  );
+  return List<Map<String, dynamic>>.from(rows);
 }
 
 Color _accentColorFor(String seed) {
