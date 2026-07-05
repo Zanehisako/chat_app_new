@@ -12,6 +12,7 @@ class ChatThread {
     required this.lastActive,
     required this.unreadCount,
     required this.isOnline,
+    this.peerUserId,
   });
 
   final String id;
@@ -22,6 +23,39 @@ class ChatThread {
   final String lastActive;
   final int unreadCount;
   final bool isOnline;
+  final String? peerUserId;
+}
+
+class ChatUser {
+  const ChatUser({required this.id, required this.displayName, this.email});
+
+  final String id;
+  final String displayName;
+  final String? email;
+
+  String get avatarLabel {
+    final parts = displayName
+        .trim()
+        .split(RegExp(r'\s+'))
+        .where((part) => part.isNotEmpty)
+        .toList();
+
+    if (parts.length >= 2) {
+      return '${parts.first[0]}${parts.last[0]}'.toUpperCase();
+    }
+    if (parts.isNotEmpty) {
+      return parts.first.characters.take(2).toString().toUpperCase();
+    }
+    return '?';
+  }
+
+  factory ChatUser.fromSupabase(Map<String, dynamic> row) {
+    return ChatUser(
+      id: row['id']?.toString() ?? '',
+      displayName: row['display_name']?.toString() ?? 'Unknown user',
+      email: row['email']?.toString(),
+    );
+  }
 }
 
 class ChatMessage {
@@ -53,7 +87,10 @@ class ChatMessage {
 
     return ChatMessage(
       id: row['id']?.toString() ?? '',
-      threadId: row['thread_id']?.toString() ?? '',
+      threadId:
+          row['conversation_id']?.toString() ??
+          row['thread_id']?.toString() ??
+          '',
       senderId: senderId,
       senderName: row['sender_name']?.toString() ?? 'Unknown',
       body: row['body']?.toString() ?? '',
@@ -73,6 +110,25 @@ class ChatSeed {
   ChatSeed._();
 
   static const localUserId = 'local-preview-user';
+
+  static const users = [
+    ChatUser(
+      id: 'samira',
+      displayName: 'Samira Haddad',
+      email: 'samira@example.com',
+    ),
+    ChatUser(id: 'alex', displayName: 'Alex Morgan', email: 'alex@example.com'),
+    ChatUser(
+      id: 'maria',
+      displayName: 'Maria Chen',
+      email: 'maria@example.com',
+    ),
+    ChatUser(
+      id: 'nadir',
+      displayName: 'Nadir Bell',
+      email: 'nadir@example.com',
+    ),
+  ];
 
   static const threads = [
     ChatThread(

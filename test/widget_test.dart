@@ -35,6 +35,34 @@ void main() {
     expect(find.text('Hello Supabase'), findsOneWidget);
   });
 
+  testWidgets('starts an empty local preview direct message from user search', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(const ChatApp());
+
+    await tester.tap(find.byTooltip('New chat'));
+    await tester.pumpAndSettle();
+
+    await tester.enterText(find.byKey(const Key('new-chat-search')), 'sam');
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Samira Haddad'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Samira Haddad'), findsOneWidget);
+    expect(find.text('No messages yet.'), findsOneWidget);
+
+    await tester.enterText(
+      find.byKey(const Key('message-composer')),
+      'Starting a new thread',
+    );
+    await tester.tap(find.byIcon(Icons.send));
+    await tester.pump();
+
+    expect(find.text('Starting a new thread'), findsOneWidget);
+  });
+
   testWidgets('compact chat opens threads, goes back, and signs out', (
     WidgetTester tester,
   ) async {

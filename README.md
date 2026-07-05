@@ -1,6 +1,6 @@
 # chat_app
 
-A modern Flutter realtime chat UI with local preview data and Supabase auth.
+A modern Flutter realtime direct-messaging UI with local preview data and Supabase auth.
 
 ## Run locally
 
@@ -12,7 +12,10 @@ Without Supabase environment values, the app runs against local seed messages.
 
 ## Run with Supabase
 
-1. Apply `supabase/schema.sql` in your Supabase SQL editor.
+1. Apply `supabase/schema.sql` in your Supabase SQL editor. The schema creates
+   profiles, one-to-one conversations, realtime messages, RLS policies, and auth
+   triggers. It replaces the old demo `public.messages` table and backfills
+   profiles for existing auth users so user search has results.
 2. In Supabase Auth, enable Email, Phone, and Google providers.
 3. Enable email confirmation if you want signups to require confirm-email.
 4. Add redirect URLs:
@@ -34,5 +37,5 @@ apps, keep `chatapp://login-callback` unless you also update Android and iOS
 deep-link settings.
 
 Email/password, phone SMS OTP, forgot-password links, password recovery, Google
-OAuth, and sign out are handled in the app. Realtime messages are only sent after
-Supabase has an authenticated user session.
+OAuth, direct user search, and sign out are handled in the app. Realtime
+messages are only sent after Supabase has an authenticated user session.

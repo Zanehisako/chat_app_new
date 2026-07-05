@@ -29,6 +29,7 @@ class _AuthGateState extends State<AuthGate> {
     super.initState();
     _authService = SupabaseAuthService(client: widget.client);
     _session = _authService.currentSession;
+    unawaited(_syncCurrentProfile());
     _authSubscription = _authService.authStateChanges.listen(
       _handleAuthState,
       onError: (Object error, StackTrace stackTrace) {
@@ -94,5 +95,17 @@ class _AuthGateState extends State<AuthGate> {
         _isRecoveringPassword = false;
       }
     });
+
+    if (state.session != null) {
+      unawaited(_syncCurrentProfile());
+    }
+  }
+
+  Future<void> _syncCurrentProfile() async {
+    try {
+      await ChatRepository(client: widget.client).upsertCurrentProfile();
+    } catch (_) {
+      // Profile sync is best-effort; messaging still handles backend errors.
+    }
   }
 }
