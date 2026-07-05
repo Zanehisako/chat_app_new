@@ -5,20 +5,44 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "chat_app",
+            "name": "Flutter: Current VS Code Device",
+            "type": "dart",
             "request": "launch",
-            "type": "dart"
+            "program": "lib/main.dart"
         },
         {
-            "name": "chat_app (profile mode)",
+            "name": "Flutter: iOS Simulator",
+            "type": "dart",
+            "request": "launch",
+            "program": "lib/main.dart",
+            "deviceId": "iphone"
+        },
+        {
+            "name": "Flutter: macOS",
+            "type": "dart",
+            "request": "launch",
+            "program": "lib/main.dart",
+            "deviceId": "macos"
+        },
+        {
+            "name": "Flutter: Chrome",
             "request": "launch",
             "type": "dart",
+            "program": "lib/main.dart",
+            "deviceId": "chrome"
+        },
+        {
+            "name": "Flutter: Profile (Current VS Code Device)",
+            "request": "launch",
+            "type": "dart",
+            "program": "lib/main.dart",
             "flutterMode": "profile"
         },
         {
-            "name": "chat_app (release mode)",
+            "name": "Flutter: Release (Current VS Code Device)",
             "request": "launch",
             "type": "dart",
+            "program": "lib/main.dart",
             "flutterMode": "release"
         }
     ]
