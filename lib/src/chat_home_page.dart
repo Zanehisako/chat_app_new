@@ -4,9 +4,10 @@ import 'chat_models.dart';
 import 'chat_repository.dart';
 
 class ChatHomePage extends StatefulWidget {
-  const ChatHomePage({super.key, required this.repository});
+  const ChatHomePage({super.key, required this.repository, this.onSignOut});
 
   final ChatRepository repository;
+  final Future<void> Function()? onSignOut;
 
   @override
   State<ChatHomePage> createState() => _ChatHomePageState();
@@ -19,6 +20,7 @@ class _ChatHomePageState extends State<ChatHomePage> {
   final List<ChatMessage> _localMessages = [];
   String _query = '';
   bool _isSending = false;
+  bool _isCompactConversationOpen = false;
 
   @override
   void dispose() {
@@ -54,19 +56,32 @@ class _ChatHomePageState extends State<ChatHomePage> {
             searchController: _searchController,
             onSearchChanged: _setQuery,
             onThreadSelected: _selectThread,
+            onSignOut: _requestSignOut,
           ),
         ),
         const VerticalDivider(width: 1),
-        Expanded(child: _buildConversation(showInboxButton: false)),
+        Expanded(child: _buildConversation(showBackButton: false)),
       ],
     );
   }
 
   Widget _buildCompactLayout() {
-    return _buildConversation(showInboxButton: true);
+    if (!_isCompactConversationOpen) {
+      return _ThreadList(
+        threads: _filteredThreads,
+        selectedThread: _selectedThread,
+        isConnected: widget.repository.isConnected,
+        searchController: _searchController,
+        onSearchChanged: _setQuery,
+        onThreadSelected: _selectCompactThread,
+        onSignOut: _requestSignOut,
+      );
+    }
+
+    return _buildConversation(showBackButton: true);
   }
 
-  Widget _buildConversation({required bool showInboxButton}) {
+  Widget _buildConversation({required bool showBackButton}) {
     return _ConversationPane(
       key: ValueKey(_selectedThread.id),
       thread: _selectedThread,
@@ -76,9 +91,10 @@ class _ChatHomePageState extends State<ChatHomePage> {
           .toList(),
       messageController: _messageController,
       isSending: _isSending,
-      showInboxButton: showInboxButton,
-      onOpenInbox: _showInboxSheet,
+      showBackButton: showBackButton,
+      onBackToInbox: _showCompactInbox,
       onSend: _sendMessage,
+      onSignOut: _requestSignOut,
     );
   }
 
@@ -106,25 +122,43 @@ class _ChatHomePageState extends State<ChatHomePage> {
     });
   }
 
-  void _showInboxSheet() {
-    showModalBottomSheet<void>(
-      context: context,
-      useSafeArea: true,
-      showDragHandle: true,
-      builder: (context) {
-        return _ThreadList(
-          threads: _filteredThreads,
-          selectedThread: _selectedThread,
-          isConnected: widget.repository.isConnected,
-          searchController: _searchController,
-          onSearchChanged: _setQuery,
-          onThreadSelected: (thread) {
-            Navigator.of(context).pop();
-            _selectThread(thread);
-          },
-        );
-      },
-    );
+  void _selectCompactThread(ChatThread thread) {
+    setState(() {
+      _selectedThread = thread;
+      _isCompactConversationOpen = true;
+    });
+  }
+
+  void _showCompactInbox() {
+    setState(() {
+      _isCompactConversationOpen = false;
+    });
+  }
+
+  void _requestSignOut() {
+    _signOut();
+  }
+
+  Future<void> _signOut() async {
+    final signOut = widget.onSignOut;
+    if (signOut == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No active session to sign out.')),
+      );
+      return;
+    }
+
+    try {
+      await signOut();
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not sign out. Please try again.')),
+      );
+    }
   }
 
   Future<void> _sendMessage() async {
@@ -190,6 +224,7 @@ class _ThreadList extends StatelessWidget {
     required this.searchController,
     required this.onSearchChanged,
     required this.onThreadSelected,
+    required this.onSignOut,
   });
 
   final List<ChatThread> threads;
@@ -198,6 +233,7 @@ class _ThreadList extends StatelessWidget {
   final TextEditingController searchController;
   final ValueChanged<String> onSearchChanged;
   final ValueChanged<ChatThread> onThreadSelected;
+  final VoidCallback onSignOut;
 
   @override
   Widget build(BuildContext context) {
@@ -224,6 +260,11 @@ class _ThreadList extends StatelessWidget {
                   tooltip: 'New chat',
                   onPressed: () {},
                   icon: const Icon(Icons.edit_square),
+                ),
+                IconButton(
+                  tooltip: 'Sign out',
+                  onPressed: onSignOut,
+                  icon: const Icon(Icons.logout),
                 ),
               ],
             ),
@@ -398,9 +439,10 @@ class _ConversationPane extends StatelessWidget {
     required this.localMessages,
     required this.messageController,
     required this.isSending,
-    required this.showInboxButton,
-    required this.onOpenInbox,
+    required this.showBackButton,
+    required this.onBackToInbox,
     required this.onSend,
+    required this.onSignOut,
   });
 
   final ChatThread thread;
@@ -408,9 +450,10 @@ class _ConversationPane extends StatelessWidget {
   final List<ChatMessage> localMessages;
   final TextEditingController messageController;
   final bool isSending;
-  final bool showInboxButton;
-  final VoidCallback onOpenInbox;
+  final bool showBackButton;
+  final VoidCallback onBackToInbox;
   final VoidCallback onSend;
+  final VoidCallback onSignOut;
 
   @override
   Widget build(BuildContext context) {
@@ -430,11 +473,11 @@ class _ConversationPane extends StatelessWidget {
           ),
           child: Row(
             children: [
-              if (showInboxButton)
+              if (showBackButton)
                 IconButton(
-                  tooltip: 'Open inbox',
-                  onPressed: onOpenInbox,
-                  icon: const Icon(Icons.forum),
+                  tooltip: 'Back to chats',
+                  onPressed: onBackToInbox,
+                  icon: const Icon(Icons.arrow_back),
                 ),
               _Avatar(thread: thread, size: 44),
               const SizedBox(width: 12),
@@ -487,9 +530,9 @@ class _ConversationPane extends StatelessWidget {
                 icon: const Icon(Icons.videocam_outlined),
               ),
               IconButton(
-                tooltip: 'More',
-                onPressed: () {},
-                icon: const Icon(Icons.more_vert),
+                tooltip: 'Sign out',
+                onPressed: onSignOut,
+                icon: const Icon(Icons.logout),
               ),
             ],
           ),
@@ -645,6 +688,7 @@ class _MessageComposer extends StatelessWidget {
             ),
             Expanded(
               child: TextField(
+                key: const Key('message-composer'),
                 controller: controller,
                 minLines: 1,
                 maxLines: 4,

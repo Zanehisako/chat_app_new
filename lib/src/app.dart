@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import 'auth_gate.dart';
 import 'chat_home_page.dart';
 import 'chat_repository.dart';
 
@@ -11,12 +12,16 @@ class ChatApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final client = supabaseClient;
+
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'Chat App',
       theme: _buildTheme(Brightness.light),
       darkTheme: _buildTheme(Brightness.dark),
-      home: ChatHomePage(repository: ChatRepository(client: supabaseClient)),
+      home: client == null
+          ? ChatHomePage(repository: const ChatRepository())
+          : AuthGate(client: client),
     );
   }
 }

@@ -1,16 +1,22 @@
+import 'package:flutter/foundation.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 class SupabaseConfig {
   SupabaseConfig._();
 
-  static const url = String.fromEnvironment('SUPABASE_URL');
+  static const url = String.fromEnvironment(
+    'SUPABASE_URL',
+    defaultValue: 'https://pwkujcclyhtmpynmysws.supabase.co',
+  );
   static const publishableKey = String.fromEnvironment(
     'SUPABASE_PUBLISHABLE_KEY',
+    defaultValue: 'sb_publishable_LYOkcHs1XhZFspv6IoR_6g_9GSW-onV',
   );
   static const anonKey = String.fromEnvironment('SUPABASE_ANON_KEY');
-  static const autoAnonymousAuth = bool.fromEnvironment(
-    'SUPABASE_AUTO_ANON_AUTH',
+  static const _configuredAuthRedirectUrl = String.fromEnvironment(
+    'SUPABASE_AUTH_REDIRECT_URL',
   );
+  static const nativeAuthRedirectUrl = 'chatapp://login-callback';
 
   static bool _initialized = false;
 
@@ -18,16 +24,24 @@ class SupabaseConfig {
 
   static bool get isConfigured => url.isNotEmpty && key.isNotEmpty;
 
+  static String get authRedirectUrl {
+    if (_configuredAuthRedirectUrl.isNotEmpty) {
+      return _configuredAuthRedirectUrl;
+    }
+
+    if (kIsWeb) {
+      return Uri.base.origin;
+    }
+
+    return nativeAuthRedirectUrl;
+  }
+
   static Future<void> initialize() async {
     if (!isConfigured || _initialized) {
       return;
     }
 
-    final supabase = await Supabase.initialize(url: url, publishableKey: key);
-
-    if (autoAnonymousAuth && supabase.client.auth.currentSession == null) {
-      await supabase.client.auth.signInAnonymously();
-    }
+    await Supabase.initialize(url: url, publishableKey: key);
 
     _initialized = true;
   }
