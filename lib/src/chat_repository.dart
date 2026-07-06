@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:ui' as ui;
 
+import 'package:file_saver/file_saver.dart';
 import 'package:file_selector/file_selector.dart' as file_selector;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -805,6 +806,78 @@ class ChatRepository {
         .createSignedUrl(media.path, const Duration(hours: 1).inSeconds);
   }
 
+  Future<bool> saveMediaAttachment(ChatMedia media) async {
+    final fileName = _safeDownloadName(media);
+    final mimeType = _fileSaverMimeType(media.mimeType);
+    final bytes = await mediaBytes(media);
+
+    if (_isLinuxPlatform) {
+      return _saveMediaWithFileSelector(
+        fileName: fileName,
+        media: media,
+        bytes: bytes,
+      );
+    }
+
+    final path = await FileSaver.instance.saveAs(
+      name: _downloadBaseName(fileName),
+      bytes: bytes,
+      fileExtension: _downloadExtensionFor(fileName),
+      mimeType: mimeType,
+      customMimeType: mimeType == MimeType.custom ? media.mimeType : null,
+    );
+    if (path == null) {
+      return false;
+    }
+    if (path.trim().isEmpty || path == 'Failed to save file') {
+      throw const MediaAttachmentException('Could not save media.');
+    }
+    return true;
+  }
+
+  Future<bool> _saveMediaWithFileSelector({
+    required String fileName,
+    required ChatMedia media,
+    required Uint8List bytes,
+  }) async {
+    final location = await file_selector.getSaveLocation(
+      acceptedTypeGroups: _downloadTypeGroupsFor(media, fileName),
+      suggestedName: fileName,
+      confirmButtonText: 'Save',
+    );
+    if (location == null) {
+      return false;
+    }
+
+    final file = file_selector.XFile.fromData(
+      bytes,
+      mimeType: media.mimeType,
+      name: fileName,
+      length: bytes.length,
+    );
+    await file.saveTo(location.path);
+    return true;
+  }
+
+  Future<Uint8List> mediaBytes(ChatMedia media) async {
+    final localBytes = media.localBytes;
+    if (localBytes != null) {
+      return localBytes;
+    }
+
+    final signedUrl = await signedMediaUrl(media);
+    final response = await http.get(Uri.parse(signedUrl));
+    if (response.statusCode < 200 || response.statusCode > 299) {
+      throw MediaAttachmentException(
+        'Could not download that media.',
+        details:
+            'Media download failed with HTTP ${response.statusCode}: '
+            '${_compactLogValue(response.body)}',
+      );
+    }
+    return response.bodyBytes;
+  }
+
   Future<void> deleteStagedMedia(ChatMedia media) async {
     final supabase = client;
     if (supabase == null || media.path.isEmpty) {
@@ -1262,6 +1335,10 @@ bool get _isDesktopPlatform {
   };
 }
 
+bool get _isLinuxPlatform {
+  return !kIsWeb && defaultTargetPlatform == TargetPlatform.linux;
+}
+
 class MediaAttachmentException implements Exception {
   const MediaAttachmentException(this.message, {this.details});
 
@@ -1462,6 +1539,79 @@ String _safeOriginalName(String name, String mimeType) {
     return fallback;
   }
   return trimmed.replaceAll(RegExp(r'[/\\]'), '_');
+}
+
+String _safeDownloadName(ChatMedia media) {
+  final name = _safeOriginalName(media.originalName ?? '', media.mimeType);
+  if (RegExp(r'\.[a-z0-9]{1,8}$', caseSensitive: false).hasMatch(name)) {
+    return name;
+  }
+  return '$name${_extensionForMime(media.mimeType)}';
+}
+
+String _downloadBaseName(String fileName) {
+  final extension = _downloadExtensionFor(fileName);
+  if (extension.isEmpty) {
+    return fileName;
+  }
+  return fileName.substring(0, fileName.length - extension.length - 1);
+}
+
+String _downloadExtensionFor(String fileName) {
+  final dotIndex = fileName.lastIndexOf('.');
+  if (dotIndex < 0 || dotIndex == fileName.length - 1) {
+    return '';
+  }
+  return fileName.substring(dotIndex + 1).toLowerCase();
+}
+
+List<file_selector.XTypeGroup> _downloadTypeGroupsFor(
+  ChatMedia media,
+  String fileName,
+) {
+  final extension = _downloadExtensionFor(fileName);
+  if (extension.isEmpty) {
+    return const [];
+  }
+
+  final mimeType = media.mimeType.trim();
+  return [
+    file_selector.XTypeGroup(
+      label: _downloadTypeLabel(media),
+      extensions: [extension],
+      mimeTypes: mimeType.isEmpty ? const [] : [mimeType],
+    ),
+  ];
+}
+
+String _downloadTypeLabel(ChatMedia media) {
+  final mimeType = media.mimeType.toLowerCase();
+  if (mimeType == 'image/gif') {
+    return 'GIF';
+  }
+  if (mimeType.startsWith('image/')) {
+    return 'Images';
+  }
+  if (mimeType.startsWith('audio/')) {
+    return 'Audio';
+  }
+  return 'Media';
+}
+
+MimeType _fileSaverMimeType(String mimeType) {
+  return switch (_normalizedMimeType(mimeType)) {
+    'image/jpeg' => MimeType.jpeg,
+    'image/png' => MimeType.png,
+    'image/webp' => MimeType.webp,
+    'image/gif' => MimeType.gif,
+    'image/heic' => MimeType.heic,
+    'image/heif' => MimeType.heif,
+    'audio/aac' => MimeType.aac,
+    'audio/mpeg' || 'audio/mp3' => MimeType.mp3,
+    'audio/mp4' => MimeType.mp4Audio,
+    'application/octet-stream' => MimeType.other,
+    _ => MimeType.custom,
+  };
 }
 
 String _extensionFor(PickedChatMedia media) {

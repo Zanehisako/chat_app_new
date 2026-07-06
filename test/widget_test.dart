@@ -183,6 +183,58 @@ void main() {
     expect(find.byKey(const Key('media-viewer-media-1')), findsOneWidget);
   });
 
+  testWidgets('downloads media from the bubble and full-screen viewer', (
+    WidgetTester tester,
+  ) async {
+    final repository = _DownloadChatRepository([
+      ChatMessage(
+        id: 'media-1',
+        threadId: 'conversation-1',
+        senderId: ChatSeed.localUserId,
+        senderName: 'You',
+        body: 'Local GIF',
+        createdAt: DateTime.now(),
+        isMine: true,
+        isDelivered: true,
+        isRead: false,
+        messageType: ChatMessageType.gif,
+        media: ChatMedia(
+          bucket: ChatRepository.mediaBucket,
+          path: 'conversation-1/local-preview-user/media-1.gif',
+          mimeType: 'image/gif',
+          sizeBytes: _transparentGif.length,
+          width: 1,
+          height: 1,
+          originalName: 'local.gif',
+          localBytes: _transparentGif,
+        ),
+      ),
+    ]);
+
+    await tester.pumpWidget(
+      MaterialApp(home: ChatHomePage(repository: repository)),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Old Peer'));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const Key('media-download-media-1')));
+    await tester.pumpAndSettle();
+
+    expect(repository.saveCount, 1);
+    expect(repository.savedMedia?.originalName, 'local.gif');
+    expect(find.text('Media downloaded.'), findsOneWidget);
+    expect(find.byKey(const Key('media-viewer-media-1')), findsNothing);
+
+    await tester.tap(find.byKey(const Key('media-preview-media-1')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('media-viewer-download-media-1')));
+    await tester.pumpAndSettle();
+
+    expect(repository.saveCount, 2);
+  });
+
   testWidgets('opens profile page and updates local profile info', (
     WidgetTester tester,
   ) async {
@@ -516,7 +568,7 @@ void main() {
     },
   );
 
-  test('macOS entitlements allow desktop picker file reads', () {
+  test('macOS entitlements allow desktop picker file writes', () {
     for (final path in const [
       'macos/Runner/DebugProfile.entitlements',
       'macos/Runner/Release.entitlements',
@@ -524,7 +576,7 @@ void main() {
       final contents = File(path).readAsStringSync();
       expect(
         contents,
-        contains('com.apple.security.files.user-selected.read-only'),
+        contains('com.apple.security.files.user-selected.read-write'),
       );
     }
   });
@@ -657,6 +709,20 @@ class _MessagesChatRepository extends _RefreshingChatRepository {
   @override
   Stream<List<ChatMessage>> watchMessages(String conversationId) {
     return Stream.value(messages);
+  }
+}
+
+class _DownloadChatRepository extends _MessagesChatRepository {
+  _DownloadChatRepository(super.messages);
+
+  int saveCount = 0;
+  ChatMedia? savedMedia;
+
+  @override
+  Future<bool> saveMediaAttachment(ChatMedia media) async {
+    saveCount += 1;
+    savedMedia = media;
+    return true;
   }
 }
 

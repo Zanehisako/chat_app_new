@@ -2145,50 +2145,96 @@ class _MessageMediaPreview extends StatelessWidget {
           ),
         );
       },
-      child: Hero(
-        tag: _mediaHeroTag(message),
-        child: ClipRRect(
-          borderRadius: borderRadius,
-          child: AspectRatio(
-            aspectRatio: _previewAspectRatio(media),
-            child: Stack(
-              fit: StackFit.expand,
-              children: [
-                _ChatMediaImage(
-                  media: media,
-                  repository: repository,
-                  fit: BoxFit.cover,
-                ),
-                if (media.isGif)
-                  Positioned(
-                    left: 8,
-                    bottom: 8,
-                    child: DecoratedBox(
-                      decoration: BoxDecoration(
-                        color: Colors.black.withValues(alpha: 0.62),
-                        borderRadius: BorderRadius.circular(6),
-                      ),
-                      child: const Padding(
-                        padding: EdgeInsets.symmetric(
-                          horizontal: 7,
-                          vertical: 3,
-                        ),
-                        child: Text(
-                          'GIF',
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontSize: 11,
-                            fontWeight: FontWeight.w800,
+      child: Stack(
+        children: [
+          Hero(
+            tag: _mediaHeroTag(message),
+            child: ClipRRect(
+              borderRadius: borderRadius,
+              child: AspectRatio(
+                aspectRatio: _previewAspectRatio(media),
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    _ChatMediaImage(
+                      media: media,
+                      repository: repository,
+                      fit: BoxFit.cover,
+                    ),
+                    if (media.isGif)
+                      Positioned(
+                        left: 8,
+                        bottom: 8,
+                        child: DecoratedBox(
+                          decoration: BoxDecoration(
+                            color: Colors.black.withValues(alpha: 0.62),
+                            borderRadius: BorderRadius.circular(6),
+                          ),
+                          child: const Padding(
+                            padding: EdgeInsets.symmetric(
+                              horizontal: 7,
+                              vertical: 3,
+                            ),
+                            child: Text(
+                              'GIF',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 11,
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
                           ),
                         ),
                       ),
-                    ),
-                  ),
-              ],
+                  ],
+                ),
+              ),
             ),
           ),
-        ),
+          Positioned(
+            top: 8,
+            right: 8,
+            child: _MediaDownloadButton(
+              keyPrefix: 'media-download',
+              message: message,
+              media: media,
+              repository: repository,
+            ),
+          ),
+        ],
       ),
+    );
+  }
+}
+
+class _MediaDownloadButton extends StatelessWidget {
+  const _MediaDownloadButton({
+    required this.keyPrefix,
+    required this.message,
+    required this.media,
+    required this.repository,
+  });
+
+  final String keyPrefix;
+  final ChatMessage message;
+  final ChatMedia media;
+  final ChatRepository repository;
+
+  @override
+  Widget build(BuildContext context) {
+    return IconButton.filledTonal(
+      key: Key('$keyPrefix-${message.id}'),
+      tooltip: 'Download media',
+      style: IconButton.styleFrom(
+        backgroundColor: Colors.black.withValues(alpha: 0.62),
+        foregroundColor: Colors.white,
+      ),
+      onPressed: () => _downloadMediaAttachment(
+        context: context,
+        repository: repository,
+        media: media,
+      ),
+      icon: const Icon(Icons.download_outlined),
     );
   }
 }
@@ -2286,6 +2332,36 @@ class _ChatMediaImageState extends State<_ChatMediaImage> {
   }
 }
 
+Future<void> _downloadMediaAttachment({
+  required BuildContext context,
+  required ChatRepository repository,
+  required ChatMedia media,
+}) async {
+  final messenger = ScaffoldMessenger.of(context);
+
+  try {
+    final saved = await repository.saveMediaAttachment(media);
+    if (!context.mounted || !saved) {
+      return;
+    }
+    messenger.showSnackBar(const SnackBar(content: Text('Media downloaded.')));
+  } on MediaAttachmentException catch (error, stackTrace) {
+    debugPrint('[Media download failed] ${error.toString()}\n$stackTrace');
+    if (!context.mounted) {
+      return;
+    }
+    messenger.showSnackBar(SnackBar(content: Text(error.message)));
+  } catch (error, stackTrace) {
+    debugPrint('[Media download failed] $error\n$stackTrace');
+    if (!context.mounted) {
+      return;
+    }
+    messenger.showSnackBar(
+      const SnackBar(content: Text('Could not download media.')),
+    );
+  }
+}
+
 class _MediaViewerPage extends StatelessWidget {
   const _MediaViewerPage({
     required this.message,
@@ -2326,10 +2402,22 @@ class _MediaViewerPage extends StatelessWidget {
             Positioned(
               top: 8,
               right: 8,
-              child: IconButton.filledTonal(
-                tooltip: 'Close',
-                onPressed: () => Navigator.of(context).pop(),
-                icon: const Icon(Icons.close),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _MediaDownloadButton(
+                    keyPrefix: 'media-viewer-download',
+                    message: message,
+                    media: media,
+                    repository: repository,
+                  ),
+                  const SizedBox(width: 8),
+                  IconButton.filledTonal(
+                    tooltip: 'Close',
+                    onPressed: () => Navigator.of(context).pop(),
+                    icon: const Icon(Icons.close),
+                  ),
+                ],
               ),
             ),
             if (caption.isNotEmpty)
