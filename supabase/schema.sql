@@ -18,7 +18,15 @@ values (
     'image/webp',
     'image/gif',
     'image/heic',
-    'image/heif'
+    'image/heif',
+    'audio/wav',
+    'audio/x-wav',
+    'audio/aac',
+    'audio/mpeg',
+    'audio/mp3',
+    'audio/mp4',
+    'audio/webm',
+    'audio/ogg'
   ]::text[]
 )
 on conflict (id) do update
@@ -63,6 +71,8 @@ create table if not exists public.messages (
   media_size_bytes bigint,
   media_width integer,
   media_height integer,
+  media_duration_ms integer,
+  media_waveform jsonb,
   media_original_name text,
   created_at timestamptz not null default now()
 );
@@ -77,45 +87,49 @@ alter table public.messages
   add column if not exists media_size_bytes bigint,
   add column if not exists media_width integer,
   add column if not exists media_height integer,
+  add column if not exists media_duration_ms integer,
+  add column if not exists media_waveform jsonb,
   add column if not exists media_original_name text;
 
-do $$
-begin
-  if not exists (
-    select 1
-    from pg_constraint
-    where conname = 'messages_message_type_check'
-      and conrelid = 'public.messages'::regclass
-  ) then
-    alter table public.messages
-      add constraint messages_message_type_check
-      check (message_type in ('text', 'image', 'gif'));
-  end if;
+alter table public.messages
+  drop constraint if exists messages_message_type_check,
+  add constraint messages_message_type_check
+  check (message_type in ('text', 'image', 'gif', 'voice'));
 
-  if not exists (
-    select 1
-    from pg_constraint
-    where conname = 'messages_media_payload_check'
-      and conrelid = 'public.messages'::regclass
-  ) then
-    alter table public.messages
-      add constraint messages_media_payload_check
-      check (
-        (
-          message_type = 'text'
-          and media_bucket is null
-          and media_path is null
-        )
-        or (
-          message_type in ('image', 'gif')
-          and media_bucket = 'chat-media'
-          and media_path is not null
-          and media_mime_type like 'image/%'
-          and media_size_bytes between 1 and 15728640
-        )
-      );
-  end if;
-end $$;
+alter table public.messages
+  drop constraint if exists messages_media_payload_check,
+  add constraint messages_media_payload_check
+  check (
+    (
+      message_type = 'text'
+      and media_bucket is null
+      and media_path is null
+      and media_mime_type is null
+      and media_size_bytes is null
+      and media_width is null
+      and media_height is null
+      and media_duration_ms is null
+      and media_waveform is null
+    )
+    or (
+      message_type in ('image', 'gif')
+      and media_bucket = 'chat-media'
+      and media_path is not null
+      and media_mime_type like 'image/%'
+      and media_size_bytes between 1 and 15728640
+      and media_duration_ms is null
+      and media_waveform is null
+    )
+    or (
+      message_type = 'voice'
+      and media_bucket = 'chat-media'
+      and media_path is not null
+      and media_mime_type like 'audio/%'
+      and media_size_bytes between 1 and 15728640
+      and (media_duration_ms is null or media_duration_ms between 0 and 3600000)
+      and (media_waveform is null or jsonb_typeof(media_waveform) = 'array')
+    )
+  );
 
 create table if not exists public.message_receipts (
   message_id uuid not null references public.messages (id) on delete cascade,

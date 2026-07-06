@@ -248,7 +248,8 @@ class CurrentUserProfile {
 enum ChatMessageType {
   text('text'),
   image('image'),
-  gif('gif');
+  gif('gif'),
+  voice('voice');
 
   const ChatMessageType(this.value);
 
@@ -267,6 +268,9 @@ enum ChatMessageType {
     }
     if (mimeType?.toLowerCase().startsWith('image/') ?? false) {
       return image;
+    }
+    if (mimeType?.toLowerCase().startsWith('audio/') ?? false) {
+      return voice;
     }
     return text;
   }
@@ -302,6 +306,8 @@ class ChatMedia {
     required this.sizeBytes,
     this.width,
     this.height,
+    this.duration,
+    this.waveform = const [],
     this.originalName,
     this.localBytes,
   });
@@ -312,10 +318,13 @@ class ChatMedia {
   final int sizeBytes;
   final int? width;
   final int? height;
+  final Duration? duration;
+  final List<double> waveform;
   final String? originalName;
   final Uint8List? localBytes;
 
   bool get isGif => mimeType.toLowerCase() == 'image/gif';
+  bool get isVoice => mimeType.toLowerCase().startsWith('audio/');
 
   String get cacheKey => '$bucket:$path';
 
@@ -335,6 +344,8 @@ class ChatMedia {
     int? sizeBytes,
     int? width,
     int? height,
+    Duration? duration,
+    List<double>? waveform,
     String? originalName,
     Uint8List? localBytes,
   }) {
@@ -345,12 +356,15 @@ class ChatMedia {
       sizeBytes: sizeBytes ?? this.sizeBytes,
       width: width ?? this.width,
       height: height ?? this.height,
+      duration: duration ?? this.duration,
+      waveform: waveform ?? this.waveform,
       originalName: originalName ?? this.originalName,
       localBytes: localBytes ?? this.localBytes,
     );
   }
 
   factory ChatMedia.fromSupabase(Map<String, dynamic> row) {
+    final durationMs = _readOptionalInt(row['media_duration_ms']);
     return ChatMedia(
       bucket: row['media_bucket']?.toString() ?? '',
       path: row['media_path']?.toString() ?? '',
@@ -358,6 +372,8 @@ class ChatMedia {
       sizeBytes: _readInt(row['media_size_bytes']),
       width: _readOptionalInt(row['media_width']),
       height: _readOptionalInt(row['media_height']),
+      duration: durationMs == null ? null : Duration(milliseconds: durationMs),
+      waveform: _readWaveform(row['media_waveform']),
       originalName: row['media_original_name']?.toString(),
     );
   }
@@ -371,6 +387,8 @@ class PickedChatMedia {
     required this.sizeBytes,
     this.width,
     this.height,
+    this.duration,
+    this.waveform = const [],
   });
 
   final Uint8List bytes;
@@ -379,11 +397,17 @@ class PickedChatMedia {
   final int sizeBytes;
   final int? width;
   final int? height;
+  final Duration? duration;
+  final List<double> waveform;
 
   bool get isGif => mimeType.toLowerCase() == 'image/gif';
+  bool get isVoice => mimeType.toLowerCase().startsWith('audio/');
 
-  ChatMessageType get messageType =>
-      isGif ? ChatMessageType.gif : ChatMessageType.image;
+  ChatMessageType get messageType => isVoice
+      ? ChatMessageType.voice
+      : isGif
+      ? ChatMessageType.gif
+      : ChatMessageType.image;
 }
 
 class UploadedChatMedia {
@@ -468,6 +492,23 @@ int? _readOptionalInt(Object? value) {
     return value;
   }
   return int.tryParse(value?.toString() ?? '');
+}
+
+List<double> _readWaveform(Object? value) {
+  if (value is! Iterable) {
+    return const [];
+  }
+
+  return value
+      .map((entry) {
+        if (entry is num) {
+          return entry.toDouble();
+        }
+        return double.tryParse(entry.toString());
+      })
+      .whereType<double>()
+      .map((entry) => entry.clamp(0.0, 1.0).toDouble())
+      .toList(growable: false);
 }
 
 DateTime _readRequiredTimestamp(Object? value) {

@@ -33,6 +33,16 @@ class ChatRepository {
     'image/heic',
     'image/heif',
   };
+  static const _allowedVoiceTypes = {
+    'audio/wav',
+    'audio/x-wav',
+    'audio/aac',
+    'audio/mpeg',
+    'audio/mp3',
+    'audio/mp4',
+    'audio/webm',
+    'audio/ogg',
+  };
 
   final SupabaseClient? client;
   final ImagePicker _imagePicker = ImagePicker();
@@ -625,6 +635,40 @@ class ChatRepository {
     );
   }
 
+  Future<PickedChatMedia> pickedVoiceMessageFromBytes({
+    required Uint8List bytes,
+    required Duration duration,
+    required List<double> waveform,
+    String originalName = 'voice-message.wav',
+    String mimeType = 'audio/wav',
+  }) async {
+    final sizeBytes = bytes.length;
+    if (sizeBytes <= 0) {
+      throw const MediaAttachmentException('Record a voice message first.');
+    }
+    if (sizeBytes > maxMediaBytes) {
+      throw const MediaAttachmentException('Record voice under 15 MB.');
+    }
+
+    final normalizedMimeType = _normalizedMimeType(mimeType);
+    if (!_allowedVoiceTypes.contains(normalizedMimeType)) {
+      throw const MediaAttachmentException(
+        'Record WAV, AAC, MP3, MP4, WebM, or OGG audio.',
+      );
+    }
+
+    return PickedChatMedia(
+      bytes: bytes,
+      originalName: _safeOriginalName(originalName, normalizedMimeType),
+      mimeType: normalizedMimeType,
+      sizeBytes: sizeBytes,
+      duration: duration,
+      waveform: waveform
+          .map((level) => level.clamp(0.0, 1.0).toDouble())
+          .toList(growable: false),
+    );
+  }
+
   Future<List<GiphyGif>> searchGiphyGifs(String query) async {
     if (giphyApiKey.isEmpty) {
       throw const MediaAttachmentException('Missing GIPHY API key.');
@@ -703,6 +747,8 @@ class ChatRepository {
         sizeBytes: pickedMedia.sizeBytes,
         width: pickedMedia.width,
         height: pickedMedia.height,
+        duration: pickedMedia.duration,
+        waveform: pickedMedia.waveform,
         originalName: pickedMedia.originalName,
         localBytes: pickedMedia.bytes,
       ),
@@ -761,6 +807,8 @@ class ChatRepository {
         sizeBytes: pickedMedia.sizeBytes,
         width: pickedMedia.width,
         height: pickedMedia.height,
+        duration: pickedMedia.duration,
+        waveform: pickedMedia.waveform,
         originalName: pickedMedia.originalName,
       ),
     );
@@ -1008,7 +1056,9 @@ class ChatRepository {
       'sender_id': user.id,
       'sender_name': localSenderName,
       'body': body.trim(),
-      'message_type': media.isGif
+      'message_type': media.isVoice
+          ? ChatMessageType.voice.value
+          : media.isGif
           ? ChatMessageType.gif.value
           : ChatMessageType.image.value,
       'media_bucket': media.bucket,
@@ -1017,6 +1067,8 @@ class ChatRepository {
       'media_size_bytes': media.sizeBytes,
       'media_width': media.width,
       'media_height': media.height,
+      'media_duration_ms': media.duration?.inMilliseconds,
+      'media_waveform': media.waveform.isEmpty ? null : media.waveform,
       'media_original_name': media.originalName,
     });
   }
@@ -1412,6 +1464,11 @@ String? _uploadFailureHint(int statusCode, String body) {
   if (statusCode == 413 || normalizedBody.contains('size')) {
     return 'The file may exceed the chat-media 15 MB limit.';
   }
+  if (normalizedBody.contains('invalid_mime_type') &&
+      normalizedBody.contains('audio/')) {
+    return 'The remote chat-media bucket does not allow audio yet. '
+        'Apply supabase/migrations/20260706130000_chat_voice_messages.sql.';
+  }
   if (statusCode == 400 || statusCode == 415) {
     return 'Check MIME type, filename extension, and allowed bucket MIME types.';
   }
@@ -1634,6 +1691,12 @@ String _extensionForMime(String mimeType) {
     'image/gif' => '.gif',
     'image/heic' => '.heic',
     'image/heif' => '.heif',
+    'audio/wav' || 'audio/x-wav' => '.wav',
+    'audio/aac' => '.aac',
+    'audio/mpeg' || 'audio/mp3' => '.mp3',
+    'audio/mp4' => '.m4a',
+    'audio/webm' => '.webm',
+    'audio/ogg' => '.ogg',
     _ => '.img',
   };
 }

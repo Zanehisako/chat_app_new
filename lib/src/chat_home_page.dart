@@ -1,13 +1,18 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:camera/camera.dart' as camera;
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:just_audio/just_audio.dart';
+import 'package:record/record.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'chat_models.dart';
 import 'chat_repository.dart';
 import 'profile_page.dart';
+import 'voice_recording_file.dart';
 
 class ChatHomePage extends StatefulWidget {
   const ChatHomePage({super.key, required this.repository, this.onSignOut});
@@ -20,6 +25,9 @@ class ChatHomePage extends StatefulWidget {
 }
 
 enum _AttachmentUploadState { uploading, uploaded, failed }
+
+const _voiceSampleRate = 16000;
+const _voiceChannelCount = 1;
 
 class _StagedMediaAttachment {
   const _StagedMediaAttachment({
@@ -68,23 +76,36 @@ class _ChatHomePageState extends State<ChatHomePage>
   ChatThread? _selectedThread;
   final _messageController = TextEditingController();
   final _searchController = TextEditingController();
+  final AudioRecorder _voiceRecorder = AudioRecorder();
   final List<ChatThread> _startedThreads = [];
   final List<ChatThread> _refreshedThreads = [];
   final List<ChatMessage> _localMessages = [];
+  final List<int> _voiceBytes = [];
+  final List<double> _voiceLevels = [];
   final Map<String, ChatUser> _profileOverridesByUser = {};
   final Map<String, UserPresence> _presenceByUser = {};
   final Map<String, TypingState> _typingByConversation = {};
   final Map<String, StreamSubscription<TypingState>> _typingSubscriptions = {};
   final Set<String> _profileRefreshesInFlight = {};
   StreamSubscription<Map<String, UserPresence>>? _presenceSubscription;
+  StreamSubscription<Uint8List>? _voiceDataSubscription;
+  StreamSubscription<Amplitude>? _voiceAmplitudeSubscription;
+  Completer<void>? _voiceStreamDone;
   Timer? _typingStopTimer;
+  Timer? _voiceRecordingTimer;
   Object? _activeUploadToken;
   _StagedMediaAttachment? _stagedAttachment;
+  DateTime? _voiceRecordingStartedAt;
+  String? _voiceRecordingFilePath;
   String? _activeTypingConversationId;
   String? _activeConversationId;
   String _query = '';
   bool _isSending = false;
+  bool _isRecordingVoice = false;
+  bool _isVoiceRecordingFileBacked = false;
   bool _isCompactConversationOpen = false;
+  bool _isTearingDown = false;
+  Duration _voiceRecordingElapsed = Duration.zero;
 
   @override
   void initState() {
@@ -98,6 +119,7 @@ class _ChatHomePageState extends State<ChatHomePage>
   void didUpdateWidget(covariant ChatHomePage oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.repository != widget.repository) {
+      unawaited(_cancelVoiceRecording());
       unawaited(_removeStagedAttachment());
       unawaited(oldWidget.repository.disposeRealtime());
       _presenceSubscription?.cancel();
@@ -117,13 +139,16 @@ class _ChatHomePageState extends State<ChatHomePage>
 
   @override
   void dispose() {
+    _isTearingDown = true;
     WidgetsBinding.instance.removeObserver(this);
     _activeUploadToken = null;
     final stagedMedia = _stagedAttachment?.uploadedMedia?.media;
     if (stagedMedia != null) {
       unawaited(widget.repository.deleteStagedMedia(stagedMedia));
     }
+    unawaited(_disposeVoiceRecorder());
     _typingStopTimer?.cancel();
+    _voiceRecordingTimer?.cancel();
     _presenceSubscription?.cancel();
     _cancelTypingSubscriptions();
     unawaited(widget.repository.disposeRealtime());
@@ -350,10 +375,14 @@ class _ChatHomePageState extends State<ChatHomePage>
           : null,
       messageController: _messageController,
       isSending: _isSending,
+      isRecordingVoice: _isRecordingVoice,
+      voiceRecordingElapsed: _voiceRecordingElapsed,
+      voiceRecordingLevels: List<double>.unmodifiable(_voiceLevels),
       showBackButton: showBackButton,
       onBackToInbox: _showCompactInbox,
       onSend: () => _sendMessage(thread),
       onAttachMedia: (source) => _stageMediaAttachment(thread, source),
+      onToggleVoiceRecording: () => _toggleVoiceRecording(thread),
       onRemoveAttachment: _removeStagedAttachment,
       onRetryAttachment: () => _retryStagedAttachment(thread),
       onComposerChanged: (value) => _handleComposerChanged(thread, value),
@@ -411,6 +440,9 @@ class _ChatHomePageState extends State<ChatHomePage>
   }
 
   void _selectThread(ChatThread thread) {
+    if (_isRecordingVoice) {
+      unawaited(_cancelVoiceRecording());
+    }
     if (_stagedAttachment?.conversationId != null &&
         _stagedAttachment?.conversationId != thread.id) {
       unawaited(_removeStagedAttachment());
@@ -421,6 +453,9 @@ class _ChatHomePageState extends State<ChatHomePage>
   }
 
   void _selectCompactThread(ChatThread thread) {
+    if (_isRecordingVoice) {
+      unawaited(_cancelVoiceRecording());
+    }
     if (_stagedAttachment?.conversationId != null &&
         _stagedAttachment?.conversationId != thread.id) {
       unawaited(_removeStagedAttachment());
@@ -633,35 +668,7 @@ class _ChatHomePageState extends State<ChatHomePage>
         return;
       }
 
-      await _removeStagedAttachment();
-
-      final attachment = _StagedMediaAttachment(
-        conversationId: thread.id,
-        pickedMedia: pickedMedia,
-        status: _AttachmentUploadState.uploading,
-        progress: widget.repository.isConnected ? 0 : 1,
-      );
-
-      setState(() {
-        _stagedAttachment = attachment;
-      });
-
-      if (!widget.repository.isConnected) {
-        final uploaded = widget.repository.prepareLocalMediaAttachment(
-          conversationId: thread.id,
-          pickedMedia: pickedMedia,
-        );
-        setState(() {
-          _stagedAttachment = attachment.copyWith(
-            status: _AttachmentUploadState.uploaded,
-            progress: 1,
-            uploadedMedia: uploaded,
-          );
-        });
-        return;
-      }
-
-      await _uploadStagedAttachment(attachment);
+      await _stagePickedMediaAttachment(thread, pickedMedia);
     } on MediaAttachmentException catch (error, stackTrace) {
       _logAttachmentFailure('Media selection failed', error, stackTrace);
       _showAttachmentError(error.message);
@@ -699,6 +706,294 @@ class _ChatHomePageState extends State<ChatHomePage>
       originalName: captured.name,
       mimeType: captured.mimeType ?? 'image/jpeg',
     );
+  }
+
+  Future<void> _toggleVoiceRecording(ChatThread thread) async {
+    if (_isRecordingVoice) {
+      await _stopVoiceRecording(thread);
+      return;
+    }
+
+    await _startVoiceRecording(thread);
+  }
+
+  Future<void> _startVoiceRecording(ChatThread thread) async {
+    if (_isSending) {
+      return;
+    }
+
+    try {
+      final hasPermission = await _voiceRecorder.hasPermission();
+      if (!hasPermission) {
+        _showAttachmentError('Microphone permission is required.');
+        return;
+      }
+
+      await _removeStagedAttachment();
+      await _voiceDataSubscription?.cancel();
+      await _voiceAmplitudeSubscription?.cancel();
+
+      _voiceBytes.clear();
+      _voiceLevels
+        ..clear()
+        ..addAll(List<double>.filled(24, 0.08));
+      _voiceStreamDone = Completer<void>();
+      _voiceRecordingStartedAt = DateTime.now();
+      _voiceRecordingElapsed = Duration.zero;
+
+      final useFileRecording = _shouldUseFileVoiceRecording;
+      _isVoiceRecordingFileBacked = useFileRecording;
+      if (useFileRecording) {
+        final path = await createVoiceRecordingPath('m4a');
+        _voiceRecordingFilePath = path;
+        await _voiceRecorder.start(
+          const RecordConfig(
+            encoder: AudioEncoder.aacLc,
+            sampleRate: 44100,
+            numChannels: 1,
+            bitRate: 64000,
+            echoCancel: true,
+            noiseSuppress: true,
+          ),
+          path: path,
+        );
+      } else {
+        final stream = await _voiceRecorder.startStream(
+          const RecordConfig(
+            encoder: AudioEncoder.pcm16bits,
+            sampleRate: _voiceSampleRate,
+            numChannels: _voiceChannelCount,
+            bitRate: 64000,
+            echoCancel: true,
+            noiseSuppress: true,
+          ),
+        );
+
+        _voiceDataSubscription = stream.listen(
+          _voiceBytes.addAll,
+          onError: (Object error, StackTrace stackTrace) {
+            _logAttachmentFailure('Voice recording failed', error, stackTrace);
+            if (mounted) {
+              _showAttachmentError('Voice recording stopped.');
+            }
+            unawaited(_cancelVoiceRecording());
+          },
+          onDone: () {
+            final done = _voiceStreamDone;
+            if (done != null && !done.isCompleted) {
+              done.complete();
+            }
+          },
+        );
+      }
+
+      _voiceAmplitudeSubscription = _voiceRecorder
+          .onAmplitudeChanged(const Duration(milliseconds: 120))
+          .listen((amplitude) {
+            if (!mounted || !_isRecordingVoice) {
+              return;
+            }
+            setState(() {
+              _voiceLevels.add(_voiceLevelFromDb(amplitude.current));
+              if (_voiceLevels.length > 48) {
+                _voiceLevels.removeRange(0, _voiceLevels.length - 48);
+              }
+            });
+          });
+
+      _voiceRecordingTimer?.cancel();
+      _voiceRecordingTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+        final startedAt = _voiceRecordingStartedAt;
+        if (!mounted || startedAt == null) {
+          return;
+        }
+        setState(() {
+          _voiceRecordingElapsed = DateTime.now().difference(startedAt);
+        });
+      });
+
+      if (!mounted) {
+        await _cancelVoiceRecording();
+        return;
+      }
+
+      setState(() {
+        _isRecordingVoice = true;
+      });
+    } catch (error, stackTrace) {
+      _logAttachmentFailure('Voice recording failed', error, stackTrace);
+      if (mounted) {
+        _showAttachmentError('Could not start voice recording.');
+      }
+      await _cancelVoiceRecording();
+    }
+  }
+
+  Future<void> _stopVoiceRecording(ChatThread thread) async {
+    if (!_isRecordingVoice) {
+      return;
+    }
+
+    final startedAt = _voiceRecordingStartedAt;
+    final elapsed = startedAt == null
+        ? _voiceRecordingElapsed
+        : DateTime.now().difference(startedAt);
+
+    setState(() {
+      _isRecordingVoice = false;
+      _voiceRecordingElapsed = elapsed;
+    });
+
+    _voiceRecordingTimer?.cancel();
+    _voiceRecordingTimer = null;
+    await _voiceAmplitudeSubscription?.cancel();
+    _voiceAmplitudeSubscription = null;
+
+    try {
+      final stoppedPath = await _voiceRecorder.stop();
+      final isFileBacked = _isVoiceRecordingFileBacked;
+      Uint8List bytes;
+      String originalName;
+      String mimeType;
+
+      if (isFileBacked) {
+        final path = stoppedPath ?? _voiceRecordingFilePath;
+        if (path == null || path.isEmpty) {
+          throw const MediaAttachmentException(
+            'Could not save that voice message.',
+          );
+        }
+        bytes = await readVoiceRecordingFile(path);
+        originalName =
+            'voice-${DateTime.now().millisecondsSinceEpoch.toString()}.m4a';
+        mimeType = 'audio/mp4';
+        await deleteVoiceRecordingFile(path);
+      } else {
+        await _voiceStreamDone?.future.timeout(
+          const Duration(seconds: 1),
+          onTimeout: () {},
+        );
+        await _voiceDataSubscription?.cancel();
+        _voiceDataSubscription = null;
+        bytes = _wavBytesFromPcm16(
+          pcmBytes: Uint8List.fromList(_voiceBytes),
+          sampleRate: _voiceSampleRate,
+          numChannels: _voiceChannelCount,
+        );
+        originalName =
+            'voice-${DateTime.now().millisecondsSinceEpoch.toString()}.wav';
+        mimeType = 'audio/wav';
+      }
+
+      final waveform = _compactVoiceLevels(_voiceLevels);
+      _voiceBytes.clear();
+      _voiceLevels.clear();
+      _voiceRecordingStartedAt = null;
+      _voiceRecordingFilePath = null;
+      _voiceStreamDone = null;
+      _isVoiceRecordingFileBacked = false;
+
+      final pickedMedia = await widget.repository.pickedVoiceMessageFromBytes(
+        bytes: bytes,
+        duration: elapsed,
+        waveform: waveform,
+        originalName: originalName,
+        mimeType: mimeType,
+      );
+
+      if (!mounted) {
+        return;
+      }
+      await _stagePickedMediaAttachment(thread, pickedMedia);
+    } on MediaAttachmentException catch (error, stackTrace) {
+      _logAttachmentFailure('Voice recording failed', error, stackTrace);
+      if (mounted) {
+        _showAttachmentError(error.message);
+      }
+      await _cancelVoiceRecording();
+    } catch (error, stackTrace) {
+      _logAttachmentFailure('Voice recording failed', error, stackTrace);
+      if (mounted) {
+        _showAttachmentError('Could not save that voice message.');
+      }
+      await _cancelVoiceRecording();
+    }
+  }
+
+  Future<void> _cancelVoiceRecording() async {
+    _voiceRecordingTimer?.cancel();
+    _voiceRecordingTimer = null;
+    await _voiceAmplitudeSubscription?.cancel();
+    _voiceAmplitudeSubscription = null;
+
+    try {
+      if (await _voiceRecorder.isRecording()) {
+        await _voiceRecorder.stop();
+      }
+    } catch (_) {
+      // Recording cancellation is best-effort during disposal and route changes.
+    }
+
+    await _voiceDataSubscription?.cancel();
+    _voiceDataSubscription = null;
+    final done = _voiceStreamDone;
+    if (done != null && !done.isCompleted) {
+      done.complete();
+    }
+    _voiceStreamDone = null;
+    _voiceBytes.clear();
+    _voiceLevels.clear();
+    _voiceRecordingStartedAt = null;
+    await deleteVoiceRecordingFile(_voiceRecordingFilePath);
+    _voiceRecordingFilePath = null;
+    _isVoiceRecordingFileBacked = false;
+
+    if (mounted && !_isTearingDown) {
+      setState(() {
+        _isRecordingVoice = false;
+        _voiceRecordingElapsed = Duration.zero;
+      });
+    }
+  }
+
+  Future<void> _disposeVoiceRecorder() async {
+    await _cancelVoiceRecording();
+    await _voiceRecorder.dispose();
+  }
+
+  Future<void> _stagePickedMediaAttachment(
+    ChatThread thread,
+    PickedChatMedia pickedMedia,
+  ) async {
+    await _removeStagedAttachment();
+
+    final attachment = _StagedMediaAttachment(
+      conversationId: thread.id,
+      pickedMedia: pickedMedia,
+      status: _AttachmentUploadState.uploading,
+      progress: widget.repository.isConnected ? 0 : 1,
+    );
+
+    setState(() {
+      _stagedAttachment = attachment;
+    });
+
+    if (!widget.repository.isConnected) {
+      final uploaded = widget.repository.prepareLocalMediaAttachment(
+        conversationId: thread.id,
+        pickedMedia: pickedMedia,
+      );
+      setState(() {
+        _stagedAttachment = attachment.copyWith(
+          status: _AttachmentUploadState.uploaded,
+          progress: 1,
+          uploadedMedia: uploaded,
+        );
+      });
+      return;
+    }
+
+    await _uploadStagedAttachment(attachment);
   }
 
   Future<void> _retryStagedAttachment(ChatThread thread) async {
@@ -888,7 +1183,9 @@ class _ChatHomePageState extends State<ChatHomePage>
             isMine: true,
             isDelivered: false,
             isRead: false,
-            messageType: uploadedMedia?.media.isGif == true
+            messageType: uploadedMedia?.media.isVoice == true
+                ? ChatMessageType.voice
+                : uploadedMedia?.media.isGif == true
                 ? ChatMessageType.gif
                 : uploadedMedia == null
                 ? ChatMessageType.text
@@ -1822,10 +2119,14 @@ class _ConversationPane extends StatelessWidget {
     required this.stagedAttachment,
     required this.messageController,
     required this.isSending,
+    required this.isRecordingVoice,
+    required this.voiceRecordingElapsed,
+    required this.voiceRecordingLevels,
     required this.showBackButton,
     required this.onBackToInbox,
     required this.onSend,
     required this.onAttachMedia,
+    required this.onToggleVoiceRecording,
     required this.onRemoveAttachment,
     required this.onRetryAttachment,
     required this.onComposerChanged,
@@ -1839,10 +2140,14 @@ class _ConversationPane extends StatelessWidget {
   final _StagedMediaAttachment? stagedAttachment;
   final TextEditingController messageController;
   final bool isSending;
+  final bool isRecordingVoice;
+  final Duration voiceRecordingElapsed;
+  final List<double> voiceRecordingLevels;
   final bool showBackButton;
   final VoidCallback onBackToInbox;
   final VoidCallback onSend;
   final ValueChanged<ChatMediaSource> onAttachMedia;
+  final VoidCallback onToggleVoiceRecording;
   final Future<void> Function() onRemoveAttachment;
   final VoidCallback onRetryAttachment;
   final ValueChanged<String> onComposerChanged;
@@ -1974,8 +2279,12 @@ class _ConversationPane extends StatelessWidget {
         _MessageComposer(
           controller: messageController,
           isSending: isSending,
+          isRecordingVoice: isRecordingVoice,
+          voiceRecordingElapsed: voiceRecordingElapsed,
+          voiceRecordingLevels: voiceRecordingLevels,
           stagedAttachment: stagedAttachment,
           onAttachMedia: onAttachMedia,
+          onToggleVoiceRecording: onToggleVoiceRecording,
           onRemoveAttachment: onRemoveAttachment,
           onRetryAttachment: onRetryAttachment,
           onChanged: onComposerChanged,
@@ -2129,6 +2438,14 @@ class _MessageMediaPreview extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (media.isVoice) {
+      return _VoiceMessagePreview(
+        message: message,
+        media: media,
+        repository: repository,
+      );
+    }
+
     final borderRadius = BorderRadius.circular(7);
 
     return InkWell(
@@ -2204,6 +2521,400 @@ class _MessageMediaPreview extends StatelessWidget {
         ],
       ),
     );
+  }
+}
+
+class _VoiceMessagePreview extends StatelessWidget {
+  const _VoiceMessagePreview({
+    required this.message,
+    required this.media,
+    required this.repository,
+  });
+
+  final ChatMessage message;
+  final ChatMedia media;
+  final ChatRepository repository;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final foregroundColor = message.isMine
+        ? theme.colorScheme.onPrimary
+        : theme.colorScheme.primary;
+    final subduedColor = foregroundColor.withValues(alpha: 0.72);
+
+    return Container(
+      key: Key('voice-preview-${message.id}'),
+      constraints: const BoxConstraints(minWidth: 220, maxWidth: 330),
+      padding: const EdgeInsets.fromLTRB(8, 8, 6, 8),
+      decoration: BoxDecoration(
+        color: foregroundColor.withValues(alpha: message.isMine ? 0.10 : 0.06),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _VoicePlaybackButton(
+            repository: repository,
+            media: media,
+            foregroundColor: foregroundColor,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: _VoiceWaveform(
+              levels: media.waveform,
+              height: 34,
+              barColor: foregroundColor,
+              trackColor: foregroundColor.withValues(alpha: 0.20),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            _formatDuration(media.duration ?? Duration.zero),
+            style: theme.textTheme.labelMedium?.copyWith(
+              color: subduedColor,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          IconButton(
+            key: Key('voice-download-${message.id}'),
+            tooltip: 'Download voice message',
+            visualDensity: VisualDensity.compact,
+            onPressed: () => _downloadMediaAttachment(
+              context: context,
+              repository: repository,
+              media: media,
+            ),
+            icon: Icon(Icons.download_outlined, color: subduedColor, size: 20),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _VoiceRecordingCard extends StatelessWidget {
+  const _VoiceRecordingCard({required this.elapsed, required this.levels});
+
+  final Duration elapsed;
+  final List<double> levels;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final color = theme.colorScheme.error;
+
+    return Container(
+      key: const Key('voice-recording-card'),
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: color.withValues(alpha: 0.22)),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.fiber_manual_record, color: color, size: 14),
+          const SizedBox(width: 8),
+          Text(
+            _formatDuration(elapsed),
+            style: theme.textTheme.labelLarge?.copyWith(
+              color: color,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: _VoiceWaveform(
+              levels: levels,
+              height: 32,
+              barColor: color,
+              trackColor: color.withValues(alpha: 0.18),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _VoicePlaybackButton extends StatefulWidget {
+  const _VoicePlaybackButton({
+    required this.repository,
+    required this.media,
+    required this.foregroundColor,
+    this.pickedMedia,
+  });
+
+  final ChatRepository? repository;
+  final ChatMedia? media;
+  final PickedChatMedia? pickedMedia;
+  final Color foregroundColor;
+
+  @override
+  State<_VoicePlaybackButton> createState() => _VoicePlaybackButtonState();
+}
+
+class _VoicePlaybackButtonState extends State<_VoicePlaybackButton> {
+  AudioPlayer? _player;
+  StreamSubscription<PlayerState>? _playerStateSubscription;
+  String? _loadedSourceKey;
+  bool _isBusy = false;
+  bool _isPlaying = false;
+
+  @override
+  void didUpdateWidget(covariant _VoicePlaybackButton oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (_sourceKey != _loadedSourceKey) {
+      _loadedSourceKey = null;
+      _isPlaying = false;
+    }
+  }
+
+  @override
+  void dispose() {
+    unawaited(_playerStateSubscription?.cancel());
+    unawaited(_player?.dispose());
+    super.dispose();
+  }
+
+  String get _sourceKey {
+    final pickedMedia = widget.pickedMedia;
+    if (pickedMedia != null) {
+      return 'picked:${pickedMedia.originalName}:${pickedMedia.sizeBytes}';
+    }
+    final media = widget.media;
+    return media == null ? 'empty' : media.cacheKey;
+  }
+
+  Future<void> _togglePlayback() async {
+    if (_isBusy) {
+      return;
+    }
+
+    final player = _ensurePlayer();
+    if (_isPlaying) {
+      await player.pause();
+      return;
+    }
+
+    setState(() {
+      _isBusy = true;
+    });
+
+    try {
+      await _loadSourceIfNeeded(player);
+      if (player.processingState == ProcessingState.completed) {
+        await player.seek(Duration.zero);
+      }
+      await player.play();
+    } catch (error, stackTrace) {
+      debugPrint('[Voice playback failed] $error\n$stackTrace');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not play voice message.')),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isBusy = false;
+        });
+      }
+    }
+  }
+
+  AudioPlayer _ensurePlayer() {
+    final existing = _player;
+    if (existing != null) {
+      return existing;
+    }
+
+    final player = AudioPlayer();
+    _player = player;
+    _playerStateSubscription = player.playerStateStream.listen((state) {
+      if (!mounted) {
+        return;
+      }
+      if (state.processingState == ProcessingState.completed) {
+        unawaited(player.pause());
+        unawaited(player.seek(Duration.zero));
+      }
+      setState(() {
+        _isPlaying =
+            state.playing && state.processingState != ProcessingState.completed;
+      });
+    });
+    return player;
+  }
+
+  Future<void> _loadSourceIfNeeded(AudioPlayer player) async {
+    final sourceKey = _sourceKey;
+    if (_loadedSourceKey == sourceKey) {
+      return;
+    }
+
+    final pickedMedia = widget.pickedMedia;
+    if (pickedMedia != null) {
+      await player.setAudioSource(
+        _BytesAudioSource(pickedMedia.bytes, pickedMedia.mimeType),
+      );
+      _loadedSourceKey = sourceKey;
+      return;
+    }
+
+    final media = widget.media;
+    if (media == null) {
+      throw StateError('Missing voice media.');
+    }
+
+    final localBytes = media.localBytes;
+    if (localBytes != null) {
+      await player.setAudioSource(
+        _BytesAudioSource(localBytes, media.mimeType),
+      );
+      _loadedSourceKey = sourceKey;
+      return;
+    }
+
+    final repository = widget.repository;
+    if (repository == null) {
+      throw StateError('Missing media repository.');
+    }
+
+    final signedUrl = await repository.signedMediaUrl(media);
+    await player.setUrl(signedUrl);
+    _loadedSourceKey = sourceKey;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return IconButton.filledTonal(
+      tooltip: _isPlaying ? 'Pause voice message' : 'Play voice message',
+      visualDensity: VisualDensity.compact,
+      onPressed: _isBusy ? null : _togglePlayback,
+      style: IconButton.styleFrom(
+        backgroundColor: widget.foregroundColor.withValues(alpha: 0.12),
+        foregroundColor: widget.foregroundColor,
+      ),
+      icon: _isBusy
+          ? SizedBox(
+              width: 18,
+              height: 18,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                color: widget.foregroundColor,
+              ),
+            )
+          : Icon(_isPlaying ? Icons.pause : Icons.play_arrow),
+    );
+  }
+}
+
+// `just_audio` marks byte-backed sources experimental; this keeps local voice
+// previews playable before the file exists at a remote URL.
+// ignore: experimental_member_use
+class _BytesAudioSource extends StreamAudioSource {
+  _BytesAudioSource(this.bytes, this.contentType);
+
+  final Uint8List bytes;
+  final String contentType;
+
+  @override
+  // ignore: experimental_member_use
+  Future<StreamAudioResponse> request([int? start, int? end]) async {
+    final effectiveStart = start ?? 0;
+    final effectiveEnd = math.min(end ?? bytes.length, bytes.length);
+    final chunk = Uint8List.sublistView(bytes, effectiveStart, effectiveEnd);
+
+    // ignore: experimental_member_use
+    return StreamAudioResponse(
+      sourceLength: bytes.length,
+      contentLength: chunk.length,
+      offset: effectiveStart,
+      contentType: contentType,
+      stream: Stream.value(chunk),
+    );
+  }
+}
+
+class _VoiceWaveform extends StatelessWidget {
+  const _VoiceWaveform({
+    required this.levels,
+    required this.height,
+    required this.barColor,
+    required this.trackColor,
+  });
+
+  final List<double> levels;
+  final double height;
+  final Color barColor;
+  final Color trackColor;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: height,
+      child: CustomPaint(
+        painter: _VoiceWaveformPainter(
+          levels: _waveformLevels(levels),
+          barColor: barColor,
+          trackColor: trackColor,
+        ),
+        child: const SizedBox.expand(),
+      ),
+    );
+  }
+}
+
+class _VoiceWaveformPainter extends CustomPainter {
+  const _VoiceWaveformPainter({
+    required this.levels,
+    required this.barColor,
+    required this.trackColor,
+  });
+
+  final List<double> levels;
+  final Color barColor;
+  final Color trackColor;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (size.width <= 0 || size.height <= 0) {
+      return;
+    }
+
+    final count = levels.length;
+    final gap = size.width < 180 ? 2.0 : 3.0;
+    final barWidth = math.max(2.0, (size.width - gap * (count - 1)) / count);
+    final radius = Radius.circular(barWidth / 2);
+    final centerY = size.height / 2;
+    final trackPaint = Paint()..color = trackColor;
+    final barPaint = Paint()..color = barColor;
+
+    for (var index = 0; index < count; index += 1) {
+      final left = index * (barWidth + gap);
+      final level = levels[index].clamp(0.0, 1.0).toDouble();
+      final barHeight = math.max(4.0, size.height * (0.22 + level * 0.78));
+      final fullRect = RRect.fromRectAndRadius(
+        Rect.fromLTWH(left, 0, barWidth, size.height),
+        radius,
+      );
+      final activeRect = RRect.fromRectAndRadius(
+        Rect.fromLTWH(left, centerY - barHeight / 2, barWidth, barHeight),
+        radius,
+      );
+
+      canvas.drawRRect(fullRect, trackPaint);
+      canvas.drawRRect(activeRect, barPaint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _VoiceWaveformPainter oldDelegate) {
+    return oldDelegate.levels != levels ||
+        oldDelegate.barColor != barColor ||
+        oldDelegate.trackColor != trackColor;
   }
 }
 
@@ -2487,8 +3198,12 @@ class _MessageComposer extends StatelessWidget {
   const _MessageComposer({
     required this.controller,
     required this.isSending,
+    required this.isRecordingVoice,
+    required this.voiceRecordingElapsed,
+    required this.voiceRecordingLevels,
     required this.stagedAttachment,
     required this.onAttachMedia,
+    required this.onToggleVoiceRecording,
     required this.onRemoveAttachment,
     required this.onRetryAttachment,
     required this.onChanged,
@@ -2497,8 +3212,12 @@ class _MessageComposer extends StatelessWidget {
 
   final TextEditingController controller;
   final bool isSending;
+  final bool isRecordingVoice;
+  final Duration voiceRecordingElapsed;
+  final List<double> voiceRecordingLevels;
   final _StagedMediaAttachment? stagedAttachment;
   final ValueChanged<ChatMediaSource> onAttachMedia;
+  final VoidCallback onToggleVoiceRecording;
   final Future<void> Function() onRemoveAttachment;
   final VoidCallback onRetryAttachment;
   final ValueChanged<String> onChanged;
@@ -2529,11 +3248,18 @@ class _MessageComposer extends StatelessWidget {
               ),
               const SizedBox(height: 10),
             ],
+            if (isRecordingVoice) ...[
+              _VoiceRecordingCard(
+                elapsed: voiceRecordingElapsed,
+                levels: voiceRecordingLevels,
+              ),
+              const SizedBox(height: 10),
+            ],
             Row(
               children: [
                 PopupMenuButton<ChatMediaSource>(
                   tooltip: 'Attach',
-                  enabled: !isSending,
+                  enabled: !isSending && !isRecordingVoice,
                   icon: const Icon(Icons.add),
                   onSelected: onAttachMedia,
                   itemBuilder: (context) => const [
@@ -2563,10 +3289,21 @@ class _MessageComposer extends StatelessWidget {
                     ),
                   ],
                 ),
+                IconButton(
+                  tooltip: isRecordingVoice
+                      ? 'Stop voice message'
+                      : 'Record voice message',
+                  onPressed: isSending ? null : onToggleVoiceRecording,
+                  icon: Icon(
+                    isRecordingVoice ? Icons.stop : Icons.mic_none_outlined,
+                  ),
+                  color: isRecordingVoice ? theme.colorScheme.error : null,
+                ),
                 Expanded(
                   child: TextField(
                     key: const Key('message-composer'),
                     controller: controller,
+                    enabled: !isRecordingVoice,
                     minLines: 1,
                     maxLines: 4,
                     textInputAction: TextInputAction.newline,
@@ -2584,7 +3321,11 @@ class _MessageComposer extends StatelessWidget {
                         stagedAttachment?.status ==
                         _AttachmentUploadState.failed;
                     return FilledButton(
-                      onPressed: isSending || !uploadReady || failed
+                      onPressed:
+                          isSending ||
+                              isRecordingVoice ||
+                              !uploadReady ||
+                              failed
                           ? null
                           : onSend,
                       style: FilledButton.styleFrom(
@@ -2626,6 +3367,7 @@ class _StagedAttachmentCard extends StatelessWidget {
     final theme = Theme.of(context);
     final media = attachment.uploadedMedia?.media;
     final pickedMedia = attachment.pickedMedia;
+    final isVoice = pickedMedia.isVoice;
     final progress = attachment.progress.clamp(0.0, 1.0);
     final isFailed = attachment.status == _AttachmentUploadState.failed;
     final label = isFailed
@@ -2651,7 +3393,19 @@ class _StagedAttachmentCard extends StatelessWidget {
             child: SizedBox(
               width: 58,
               height: 58,
-              child: media == null
+              child: isVoice
+                  ? ColoredBox(
+                      color: theme.colorScheme.primary.withValues(alpha: 0.10),
+                      child: Center(
+                        child: _VoicePlaybackButton(
+                          repository: null,
+                          media: media,
+                          pickedMedia: pickedMedia,
+                          foregroundColor: theme.colorScheme.primary,
+                        ),
+                      ),
+                    )
+                  : media == null
                   ? Image.memory(
                       pickedMedia.bytes,
                       fit: BoxFit.cover,
@@ -2680,7 +3434,9 @@ class _StagedAttachmentCard extends StatelessWidget {
                 ),
                 const SizedBox(height: 3),
                 Text(
-                  '${_formatBytes(pickedMedia.sizeBytes)} · $label',
+                  isVoice
+                      ? '${_formatDuration(pickedMedia.duration ?? Duration.zero)} · ${_formatBytes(pickedMedia.sizeBytes)} · $label'
+                      : '${_formatBytes(pickedMedia.sizeBytes)} · $label',
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: theme.textTheme.labelMedium?.copyWith(
@@ -2689,6 +3445,17 @@ class _StagedAttachmentCard extends StatelessWidget {
                         : theme.colorScheme.onSurfaceVariant,
                   ),
                 ),
+                if (isVoice) ...[
+                  const SizedBox(height: 7),
+                  _VoiceWaveform(
+                    levels: pickedMedia.waveform,
+                    height: 28,
+                    barColor: theme.colorScheme.primary,
+                    trackColor: theme.colorScheme.primary.withValues(
+                      alpha: 0.16,
+                    ),
+                  ),
+                ],
                 if (attachment.isUploading) ...[
                   const SizedBox(height: 7),
                   LinearProgressIndicator(
@@ -2816,6 +3583,110 @@ String _formatBytes(int bytes) {
     return '${(bytes / 1024).toStringAsFixed(1)} KB';
   }
   return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+}
+
+String _formatDuration(Duration duration) {
+  final totalSeconds = math.max(0, duration.inSeconds);
+  final minutes = totalSeconds ~/ 60;
+  final seconds = (totalSeconds % 60).toString().padLeft(2, '0');
+  return '$minutes:$seconds';
+}
+
+double _voiceLevelFromDb(double db) {
+  if (!db.isFinite) {
+    return 0.08;
+  }
+  return ((db + 45) / 45).clamp(0.06, 1.0).toDouble();
+}
+
+List<double> _compactVoiceLevels(List<double> levels, {int target = 32}) {
+  if (levels.isEmpty) {
+    return _fallbackWaveformLevels(target);
+  }
+
+  if (levels.length <= target) {
+    return List<double>.unmodifiable(
+      levels.map((level) => level.clamp(0.0, 1.0).toDouble()),
+    );
+  }
+
+  final compacted = <double>[];
+  for (var index = 0; index < target; index += 1) {
+    final start = (index * levels.length / target).floor();
+    final end = math.max(
+      start + 1,
+      ((index + 1) * levels.length / target).ceil(),
+    );
+    final slice = levels.sublist(start, math.min(end, levels.length));
+    final average = slice.reduce((sum, level) => sum + level) / slice.length;
+    compacted.add(average.clamp(0.0, 1.0).toDouble());
+  }
+  return List<double>.unmodifiable(compacted);
+}
+
+List<double> _waveformLevels(List<double> levels) {
+  if (levels.isEmpty) {
+    return _fallbackWaveformLevels(32);
+  }
+  return _compactVoiceLevels(
+    levels,
+    target: math.min(40, math.max(16, levels.length)),
+  );
+}
+
+List<double> _fallbackWaveformLevels(int count) {
+  return List<double>.generate(count, (index) {
+    final wave = math.sin((index + 1) * 1.7).abs();
+    return 0.22 + wave * 0.62;
+  }, growable: false);
+}
+
+bool get _shouldUseFileVoiceRecording {
+  if (kIsWeb) {
+    return false;
+  }
+  return switch (defaultTargetPlatform) {
+    TargetPlatform.macOS ||
+    TargetPlatform.linux ||
+    TargetPlatform.windows => true,
+    _ => false,
+  };
+}
+
+Uint8List _wavBytesFromPcm16({
+  required Uint8List pcmBytes,
+  required int sampleRate,
+  required int numChannels,
+}) {
+  const bitsPerSample = 16;
+  const bytesPerSample = bitsPerSample ~/ 8;
+  final byteRate = sampleRate * numChannels * bytesPerSample;
+  final blockAlign = numChannels * bytesPerSample;
+  final output = Uint8List(44 + pcmBytes.length);
+  final data = ByteData.sublistView(output);
+
+  _writeAscii(output, 0, 'RIFF');
+  data.setUint32(4, 36 + pcmBytes.length, Endian.little);
+  _writeAscii(output, 8, 'WAVE');
+  _writeAscii(output, 12, 'fmt ');
+  data.setUint32(16, 16, Endian.little);
+  data.setUint16(20, 1, Endian.little);
+  data.setUint16(22, numChannels, Endian.little);
+  data.setUint32(24, sampleRate, Endian.little);
+  data.setUint32(28, byteRate, Endian.little);
+  data.setUint16(32, blockAlign, Endian.little);
+  data.setUint16(34, bitsPerSample, Endian.little);
+  _writeAscii(output, 36, 'data');
+  data.setUint32(40, pcmBytes.length, Endian.little);
+  output.setRange(44, output.length, pcmBytes);
+
+  return output;
+}
+
+void _writeAscii(Uint8List bytes, int offset, String value) {
+  for (var index = 0; index < value.length; index += 1) {
+    bytes[offset + index] = value.codeUnitAt(index);
+  }
 }
 
 String _shortError(Object error) {

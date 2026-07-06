@@ -41,6 +41,8 @@
 	<true/>
 	<key>NSCameraUsageDescription</key>
 	<string>Chat App uses the camera so you can take photos to send in conversations.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Chat App uses the microphone so you can record voice messages.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Chat App uses your photo library so you can choose photos to send in conversations.</string>
 	<key>UIApplicationSceneManifest</key>

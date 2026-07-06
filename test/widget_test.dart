@@ -235,6 +235,53 @@ void main() {
     expect(repository.saveCount, 2);
   });
 
+  testWidgets('renders voice message waveform and downloads audio', (
+    WidgetTester tester,
+  ) async {
+    final repository = _DownloadChatRepository([
+      ChatMessage(
+        id: 'voice-1',
+        threadId: 'conversation-1',
+        senderId: ChatSeed.localUserId,
+        senderName: 'You',
+        body: '',
+        createdAt: DateTime.now(),
+        isMine: true,
+        isDelivered: true,
+        isRead: false,
+        messageType: ChatMessageType.voice,
+        media: ChatMedia(
+          bucket: ChatRepository.mediaBucket,
+          path: 'conversation-1/local-preview-user/voice-1.wav',
+          mimeType: 'audio/wav',
+          sizeBytes: _tinyWav.length,
+          duration: const Duration(seconds: 7),
+          waveform: const [0.2, 0.7, 0.4, 0.9, 0.3, 0.6],
+          originalName: 'voice-1.wav',
+          localBytes: _tinyWav,
+        ),
+      ),
+    ]);
+
+    await tester.pumpWidget(
+      MaterialApp(home: ChatHomePage(repository: repository)),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Old Peer'));
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const Key('voice-preview-voice-1')), findsOneWidget);
+    expect(find.text('0:07'), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('voice-download-voice-1')));
+    await tester.pumpAndSettle();
+
+    expect(repository.saveCount, 1);
+    expect(repository.savedMedia?.mimeType, 'audio/wav');
+    expect(find.text('Media downloaded.'), findsOneWidget);
+  });
+
   testWidgets('opens profile page and updates local profile info', (
     WidgetTester tester,
   ) async {
@@ -389,6 +436,28 @@ void main() {
     expect(mediaMessage.messageType, ChatMessageType.gif);
     expect(mediaMessage.media?.path, 'conversation-1/user-1/m1.gif');
     expect(mediaMessage.media?.aspectRatio, closeTo(16 / 9, 0.01));
+
+    final voiceMessage = ChatMessage.fromSupabase({
+      'id': 'm3',
+      'conversation_id': 'conversation-1',
+      'sender_id': 'user-2',
+      'sender_name': 'You',
+      'body': '',
+      'created_at': DateTime.utc(2026).toIso8601String(),
+      'message_type': 'voice',
+      'media_bucket': ChatRepository.mediaBucket,
+      'media_path': 'conversation-1/user-2/m3.wav',
+      'media_mime_type': 'audio/wav',
+      'media_size_bytes': 128,
+      'media_duration_ms': 1234,
+      'media_waveform': [0.1, '0.5', 2],
+      'media_original_name': 'voice.wav',
+    }, localUserId: 'user-2');
+
+    expect(voiceMessage.messageType, ChatMessageType.voice);
+    expect(voiceMessage.media?.isVoice, isTrue);
+    expect(voiceMessage.media?.duration, const Duration(milliseconds: 1234));
+    expect(voiceMessage.media?.waveform, [0.1, 0.5, 1.0]);
 
     final textMessage = ChatMessage.fromSupabase({
       'id': 'm2',
@@ -701,6 +770,53 @@ final _transparentGif = Uint8List.fromList([
   0x3b,
 ]);
 
+final _tinyWav = Uint8List.fromList([
+  0x52,
+  0x49,
+  0x46,
+  0x46,
+  0x24,
+  0x00,
+  0x00,
+  0x00,
+  0x57,
+  0x41,
+  0x56,
+  0x45,
+  0x66,
+  0x6d,
+  0x74,
+  0x20,
+  0x10,
+  0x00,
+  0x00,
+  0x00,
+  0x01,
+  0x00,
+  0x01,
+  0x00,
+  0x40,
+  0x1f,
+  0x00,
+  0x00,
+  0x80,
+  0x3e,
+  0x00,
+  0x00,
+  0x02,
+  0x00,
+  0x10,
+  0x00,
+  0x64,
+  0x61,
+  0x74,
+  0x61,
+  0x00,
+  0x00,
+  0x00,
+  0x00,
+]);
+
 class _MessagesChatRepository extends _RefreshingChatRepository {
   _MessagesChatRepository(this.messages);
 
@@ -777,6 +893,8 @@ class _MediaChatRepository extends _MessagesChatRepository {
         sizeBytes: pickedMedia.sizeBytes,
         width: pickedMedia.width,
         height: pickedMedia.height,
+        duration: pickedMedia.duration,
+        waveform: pickedMedia.waveform,
         originalName: pickedMedia.originalName,
       ),
     );

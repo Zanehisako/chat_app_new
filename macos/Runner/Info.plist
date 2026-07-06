@@ -26,6 +26,8 @@
 	<string>$(PRODUCT_COPYRIGHT)</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Chat App uses the camera so you can take photos to send in conversations.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Chat App uses the microphone so you can record voice messages.</string>
 	<key>NSMainNibFile</key>
 	<string>MainMenu</string>
 	<key>NSPrincipalClass</key>
