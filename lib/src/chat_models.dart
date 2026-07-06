@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 
 class UserPresence {
@@ -243,6 +245,154 @@ class CurrentUserProfile {
   }
 }
 
+enum ChatMessageType {
+  text('text'),
+  image('image'),
+  gif('gif');
+
+  const ChatMessageType(this.value);
+
+  final String value;
+
+  static ChatMessageType fromValue(String? value, {String? mimeType}) {
+    final normalized = value?.trim().toLowerCase();
+    for (final type in values) {
+      if (type.value == normalized) {
+        return type;
+      }
+    }
+
+    if (mimeType?.toLowerCase() == 'image/gif') {
+      return gif;
+    }
+    if (mimeType?.toLowerCase().startsWith('image/') ?? false) {
+      return image;
+    }
+    return text;
+  }
+}
+
+enum ChatMediaSource { gallery, camera, giphy }
+
+class GiphyGif {
+  const GiphyGif({
+    required this.id,
+    required this.title,
+    required this.previewUrl,
+    required this.originalUrl,
+    this.width,
+    this.height,
+    this.sizeBytes,
+  });
+
+  final String id;
+  final String title;
+  final String previewUrl;
+  final String originalUrl;
+  final int? width;
+  final int? height;
+  final int? sizeBytes;
+}
+
+class ChatMedia {
+  const ChatMedia({
+    required this.bucket,
+    required this.path,
+    required this.mimeType,
+    required this.sizeBytes,
+    this.width,
+    this.height,
+    this.originalName,
+    this.localBytes,
+  });
+
+  final String bucket;
+  final String path;
+  final String mimeType;
+  final int sizeBytes;
+  final int? width;
+  final int? height;
+  final String? originalName;
+  final Uint8List? localBytes;
+
+  bool get isGif => mimeType.toLowerCase() == 'image/gif';
+
+  String get cacheKey => '$bucket:$path';
+
+  double? get aspectRatio {
+    final mediaWidth = width;
+    final mediaHeight = height;
+    if (mediaWidth == null || mediaHeight == null || mediaHeight == 0) {
+      return null;
+    }
+    return mediaWidth / mediaHeight;
+  }
+
+  ChatMedia copyWith({
+    String? bucket,
+    String? path,
+    String? mimeType,
+    int? sizeBytes,
+    int? width,
+    int? height,
+    String? originalName,
+    Uint8List? localBytes,
+  }) {
+    return ChatMedia(
+      bucket: bucket ?? this.bucket,
+      path: path ?? this.path,
+      mimeType: mimeType ?? this.mimeType,
+      sizeBytes: sizeBytes ?? this.sizeBytes,
+      width: width ?? this.width,
+      height: height ?? this.height,
+      originalName: originalName ?? this.originalName,
+      localBytes: localBytes ?? this.localBytes,
+    );
+  }
+
+  factory ChatMedia.fromSupabase(Map<String, dynamic> row) {
+    return ChatMedia(
+      bucket: row['media_bucket']?.toString() ?? '',
+      path: row['media_path']?.toString() ?? '',
+      mimeType: row['media_mime_type']?.toString() ?? 'image/jpeg',
+      sizeBytes: _readInt(row['media_size_bytes']),
+      width: _readOptionalInt(row['media_width']),
+      height: _readOptionalInt(row['media_height']),
+      originalName: row['media_original_name']?.toString(),
+    );
+  }
+}
+
+class PickedChatMedia {
+  const PickedChatMedia({
+    required this.bytes,
+    required this.originalName,
+    required this.mimeType,
+    required this.sizeBytes,
+    this.width,
+    this.height,
+  });
+
+  final Uint8List bytes;
+  final String originalName;
+  final String mimeType;
+  final int sizeBytes;
+  final int? width;
+  final int? height;
+
+  bool get isGif => mimeType.toLowerCase() == 'image/gif';
+
+  ChatMessageType get messageType =>
+      isGif ? ChatMessageType.gif : ChatMessageType.image;
+}
+
+class UploadedChatMedia {
+  const UploadedChatMedia({required this.messageId, required this.media});
+
+  final String messageId;
+  final ChatMedia media;
+}
+
 class ChatMessage {
   const ChatMessage({
     required this.id,
@@ -254,6 +404,8 @@ class ChatMessage {
     required this.isMine,
     required this.isDelivered,
     required this.isRead,
+    this.messageType = ChatMessageType.text,
+    this.media,
   });
 
   final String id;
@@ -265,6 +417,10 @@ class ChatMessage {
   final bool isMine;
   final bool isDelivered;
   final bool isRead;
+  final ChatMessageType messageType;
+  final ChatMedia? media;
+
+  bool get hasMedia => media != null && messageType != ChatMessageType.text;
 
   factory ChatMessage.fromSupabase(
     Map<String, dynamic> row, {
@@ -275,6 +431,14 @@ class ChatMessage {
     final isMine = senderId == localUserId;
     final isRead = isMine && (receipt?.isRead ?? false);
     final isDelivered = isMine && ((receipt?.isDelivered ?? false) || isRead);
+    final mediaPath = row['media_path']?.toString();
+    final media = mediaPath == null || mediaPath.isEmpty
+        ? null
+        : ChatMedia.fromSupabase(row);
+    final messageType = ChatMessageType.fromValue(
+      row['message_type']?.toString(),
+      mimeType: media?.mimeType,
+    );
 
     return ChatMessage(
       id: row['id']?.toString() ?? '',
@@ -289,8 +453,21 @@ class ChatMessage {
       isMine: isMine,
       isDelivered: isDelivered,
       isRead: isRead,
+      messageType: media == null ? ChatMessageType.text : messageType,
+      media: media,
     );
   }
+}
+
+int _readInt(Object? value) {
+  return _readOptionalInt(value) ?? 0;
+}
+
+int? _readOptionalInt(Object? value) {
+  if (value is int) {
+    return value;
+  }
+  return int.tryParse(value?.toString() ?? '');
 }
 
 DateTime _readRequiredTimestamp(Object? value) {

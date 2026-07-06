@@ -1,6 +1,9 @@
 import 'dart:async';
 
+import 'package:camera/camera.dart' as camera;
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'chat_models.dart';
 import 'chat_repository.dart';
@@ -14,6 +17,49 @@ class ChatHomePage extends StatefulWidget {
 
   @override
   State<ChatHomePage> createState() => _ChatHomePageState();
+}
+
+enum _AttachmentUploadState { uploading, uploaded, failed }
+
+class _StagedMediaAttachment {
+  const _StagedMediaAttachment({
+    required this.conversationId,
+    required this.pickedMedia,
+    required this.status,
+    required this.progress,
+    this.uploadedMedia,
+    this.errorMessage,
+    this.errorDetails,
+  });
+
+  final String conversationId;
+  final PickedChatMedia pickedMedia;
+  final _AttachmentUploadState status;
+  final double progress;
+  final UploadedChatMedia? uploadedMedia;
+  final String? errorMessage;
+  final String? errorDetails;
+
+  bool get isUploading => status == _AttachmentUploadState.uploading;
+  bool get canSend => uploadedMedia != null && !isUploading;
+
+  _StagedMediaAttachment copyWith({
+    _AttachmentUploadState? status,
+    double? progress,
+    UploadedChatMedia? uploadedMedia,
+    String? errorMessage,
+    String? errorDetails,
+  }) {
+    return _StagedMediaAttachment(
+      conversationId: conversationId,
+      pickedMedia: pickedMedia,
+      status: status ?? this.status,
+      progress: progress ?? this.progress,
+      uploadedMedia: uploadedMedia ?? this.uploadedMedia,
+      errorMessage: errorMessage,
+      errorDetails: errorDetails,
+    );
+  }
 }
 
 class _ChatHomePageState extends State<ChatHomePage>
@@ -32,6 +78,8 @@ class _ChatHomePageState extends State<ChatHomePage>
   final Set<String> _profileRefreshesInFlight = {};
   StreamSubscription<Map<String, UserPresence>>? _presenceSubscription;
   Timer? _typingStopTimer;
+  Object? _activeUploadToken;
+  _StagedMediaAttachment? _stagedAttachment;
   String? _activeTypingConversationId;
   String? _activeConversationId;
   String _query = '';
@@ -50,6 +98,7 @@ class _ChatHomePageState extends State<ChatHomePage>
   void didUpdateWidget(covariant ChatHomePage oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.repository != widget.repository) {
+      unawaited(_removeStagedAttachment());
       unawaited(oldWidget.repository.disposeRealtime());
       _presenceSubscription?.cancel();
       _cancelTypingSubscriptions();
@@ -69,6 +118,11 @@ class _ChatHomePageState extends State<ChatHomePage>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _activeUploadToken = null;
+    final stagedMedia = _stagedAttachment?.uploadedMedia?.media;
+    if (stagedMedia != null) {
+      unawaited(widget.repository.deleteStagedMedia(stagedMedia));
+    }
     _typingStopTimer?.cancel();
     _presenceSubscription?.cancel();
     _cancelTypingSubscriptions();
@@ -291,11 +345,17 @@ class _ChatHomePageState extends State<ChatHomePage>
       localMessages: _localMessages
           .where((message) => message.threadId == thread.id)
           .toList(),
+      stagedAttachment: _stagedAttachment?.conversationId == thread.id
+          ? _stagedAttachment
+          : null,
       messageController: _messageController,
       isSending: _isSending,
       showBackButton: showBackButton,
       onBackToInbox: _showCompactInbox,
       onSend: () => _sendMessage(thread),
+      onAttachMedia: (source) => _stageMediaAttachment(thread, source),
+      onRemoveAttachment: _removeStagedAttachment,
+      onRetryAttachment: () => _retryStagedAttachment(thread),
       onComposerChanged: (value) => _handleComposerChanged(thread, value),
       onOpenProfile: _openProfile,
       onSignOut: _requestSignOut,
@@ -351,12 +411,20 @@ class _ChatHomePageState extends State<ChatHomePage>
   }
 
   void _selectThread(ChatThread thread) {
+    if (_stagedAttachment?.conversationId != null &&
+        _stagedAttachment?.conversationId != thread.id) {
+      unawaited(_removeStagedAttachment());
+    }
     setState(() {
       _selectedThread = thread;
     });
   }
 
   void _selectCompactThread(ChatThread thread) {
+    if (_stagedAttachment?.conversationId != null &&
+        _stagedAttachment?.conversationId != thread.id) {
+      unawaited(_removeStagedAttachment());
+    }
     setState(() {
       _selectedThread = thread;
       _isCompactConversationOpen = true;
@@ -551,9 +619,254 @@ class _ChatHomePageState extends State<ChatHomePage>
     );
   }
 
+  Future<void> _stageMediaAttachment(
+    ChatThread thread,
+    ChatMediaSource source,
+  ) async {
+    try {
+      final pickedMedia = source == ChatMediaSource.giphy
+          ? await _pickGiphyMedia()
+          : source == ChatMediaSource.camera
+          ? await _captureCameraMedia()
+          : await widget.repository.pickMediaAttachment(source);
+      if (pickedMedia == null || !mounted) {
+        return;
+      }
+
+      await _removeStagedAttachment();
+
+      final attachment = _StagedMediaAttachment(
+        conversationId: thread.id,
+        pickedMedia: pickedMedia,
+        status: _AttachmentUploadState.uploading,
+        progress: widget.repository.isConnected ? 0 : 1,
+      );
+
+      setState(() {
+        _stagedAttachment = attachment;
+      });
+
+      if (!widget.repository.isConnected) {
+        final uploaded = widget.repository.prepareLocalMediaAttachment(
+          conversationId: thread.id,
+          pickedMedia: pickedMedia,
+        );
+        setState(() {
+          _stagedAttachment = attachment.copyWith(
+            status: _AttachmentUploadState.uploaded,
+            progress: 1,
+            uploadedMedia: uploaded,
+          );
+        });
+        return;
+      }
+
+      await _uploadStagedAttachment(attachment);
+    } on MediaAttachmentException catch (error, stackTrace) {
+      _logAttachmentFailure('Media selection failed', error, stackTrace);
+      _showAttachmentError(error.message);
+    } catch (error, stackTrace) {
+      _logAttachmentFailure('Media selection failed', error, stackTrace);
+      _showAttachmentError(
+        'Could not add that image or GIF: ${_shortError(error)}',
+      );
+    }
+  }
+
+  Future<PickedChatMedia?> _pickGiphyMedia() async {
+    final gif = await showDialog<GiphyGif>(
+      context: context,
+      builder: (context) => _GiphyPickerDialog(repository: widget.repository),
+    );
+    if (gif == null) {
+      return null;
+    }
+
+    return widget.repository.downloadGiphyGif(gif);
+  }
+
+  Future<PickedChatMedia?> _captureCameraMedia() async {
+    final captured = await showDialog<camera.XFile>(
+      context: context,
+      builder: (context) => const _CameraCaptureDialog(),
+    );
+    if (captured == null) {
+      return null;
+    }
+
+    return widget.repository.pickedMediaFromBytes(
+      bytes: await captured.readAsBytes(),
+      originalName: captured.name,
+      mimeType: captured.mimeType ?? 'image/jpeg',
+    );
+  }
+
+  Future<void> _retryStagedAttachment(ChatThread thread) async {
+    final staged = _stagedAttachment;
+    if (staged == null || staged.conversationId != thread.id) {
+      return;
+    }
+
+    final nextStaged = _StagedMediaAttachment(
+      conversationId: staged.conversationId,
+      pickedMedia: staged.pickedMedia,
+      status: _AttachmentUploadState.uploading,
+      progress: 0,
+    );
+
+    setState(() {
+      _stagedAttachment = nextStaged;
+    });
+
+    await _uploadStagedAttachment(nextStaged);
+  }
+
+  Future<void> _uploadStagedAttachment(
+    _StagedMediaAttachment attachment,
+  ) async {
+    final uploadToken = Object();
+    _activeUploadToken = uploadToken;
+
+    try {
+      final uploaded = await widget.repository.uploadMediaAttachment(
+        conversationId: attachment.conversationId,
+        pickedMedia: attachment.pickedMedia,
+        onProgress: (progress) {
+          if (!mounted ||
+              _activeUploadToken != uploadToken ||
+              _stagedAttachment?.pickedMedia != attachment.pickedMedia) {
+            return;
+          }
+
+          setState(() {
+            _stagedAttachment = _stagedAttachment?.copyWith(
+              status: _AttachmentUploadState.uploading,
+              progress: progress,
+            );
+          });
+        },
+      );
+
+      if (!mounted ||
+          _activeUploadToken != uploadToken ||
+          _stagedAttachment?.pickedMedia != attachment.pickedMedia) {
+        await widget.repository.deleteStagedMedia(uploaded.media);
+        return;
+      }
+
+      setState(() {
+        _stagedAttachment = _stagedAttachment?.copyWith(
+          status: _AttachmentUploadState.uploaded,
+          progress: 1,
+          uploadedMedia: uploaded,
+        );
+      });
+    } catch (error, stackTrace) {
+      if (!mounted || _activeUploadToken != uploadToken) {
+        return;
+      }
+
+      final message = _uploadErrorMessage(error);
+      final details = _attachmentErrorDetails(error, stackTrace);
+      _logAttachmentFailure('Media upload failed', error, stackTrace);
+
+      setState(() {
+        _stagedAttachment = _stagedAttachment?.copyWith(
+          status: _AttachmentUploadState.failed,
+          progress: 0,
+          errorMessage: message,
+          errorDetails: details,
+        );
+      });
+    } finally {
+      if (_activeUploadToken == uploadToken) {
+        _activeUploadToken = null;
+      }
+    }
+  }
+
+  Future<void> _removeStagedAttachment() async {
+    _activeUploadToken = null;
+    final uploadedMedia = _stagedAttachment?.uploadedMedia?.media;
+    if (mounted) {
+      setState(() {
+        _stagedAttachment = null;
+      });
+    } else {
+      _stagedAttachment = null;
+    }
+
+    if (uploadedMedia != null) {
+      await widget.repository.deleteStagedMedia(uploadedMedia);
+    }
+  }
+
+  void _showAttachmentError(String message) {
+    if (!mounted) {
+      return;
+    }
+
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  String _uploadErrorMessage(Object error) {
+    if (error is ChatMediaUploadException) {
+      return error.message;
+    }
+    if (error is StorageException) {
+      final status = error.statusCode == null ? '' : ' (${error.statusCode})';
+      return 'Upload failed$status: ${error.message}';
+    }
+    if (error is AuthException) {
+      return error.message;
+    }
+    if (error is MediaAttachmentException) {
+      return error.message;
+    }
+    return 'Upload failed: ${_shortError(error)}';
+  }
+
+  String _attachmentErrorDetails(Object error, StackTrace stackTrace) {
+    final buffer = StringBuffer();
+    if (error is ChatMediaUploadException) {
+      buffer.writeln(error.details);
+    } else if (error is MediaAttachmentException && error.details != null) {
+      buffer.writeln(error.details);
+    } else if (error is StorageException) {
+      buffer
+        ..writeln('StorageException: ${error.message}')
+        ..writeln('Status: ${error.statusCode ?? 'unknown'}');
+    } else if (error is AuthException) {
+      buffer.writeln('AuthException: ${error.message}');
+    } else {
+      buffer.writeln('${error.runtimeType}: $error');
+    }
+    buffer.writeln('Stack: ${_firstStackFrame(stackTrace)}');
+    return buffer.toString().trimRight();
+  }
+
+  void _logAttachmentFailure(
+    String label,
+    Object error,
+    StackTrace stackTrace,
+  ) {
+    debugPrint('[$label] ${_attachmentErrorDetails(error, stackTrace)}');
+  }
+
   Future<void> _sendMessage(ChatThread selectedThread) async {
     final text = _messageController.text.trim();
-    if (text.isEmpty || _isSending) {
+    final stagedAttachment =
+        _stagedAttachment?.conversationId == selectedThread.id
+        ? _stagedAttachment
+        : null;
+    final uploadedMedia = stagedAttachment?.uploadedMedia;
+
+    if (_isSending ||
+        stagedAttachment?.isUploading == true ||
+        stagedAttachment?.status == _AttachmentUploadState.failed ||
+        (text.isEmpty && uploadedMedia == null)) {
       return;
     }
 
@@ -564,7 +877,9 @@ class _ChatHomePageState extends State<ChatHomePage>
       setState(() {
         _localMessages.add(
           ChatMessage(
-            id: 'local-${DateTime.now().microsecondsSinceEpoch}',
+            id:
+                uploadedMedia?.messageId ??
+                'local-${DateTime.now().microsecondsSinceEpoch}',
             threadId: selectedThread.id,
             senderId: ChatSeed.localUserId,
             senderName: 'You',
@@ -573,8 +888,15 @@ class _ChatHomePageState extends State<ChatHomePage>
             isMine: true,
             isDelivered: false,
             isRead: false,
+            messageType: uploadedMedia?.media.isGif == true
+                ? ChatMessageType.gif
+                : uploadedMedia == null
+                ? ChatMessageType.text
+                : ChatMessageType.image,
+            media: uploadedMedia?.media,
           ),
         );
+        _stagedAttachment = null;
       });
       return;
     }
@@ -585,10 +907,24 @@ class _ChatHomePageState extends State<ChatHomePage>
 
     try {
       await _stopTyping();
-      await widget.repository.sendMessage(
-        conversationId: selectedThread.id,
-        body: text,
-      );
+      if (uploadedMedia == null) {
+        await widget.repository.sendMessage(
+          conversationId: selectedThread.id,
+          body: text,
+        );
+      } else {
+        await widget.repository.sendMediaMessage(
+          conversationId: selectedThread.id,
+          messageId: uploadedMedia.messageId,
+          body: text,
+          media: uploadedMedia.media,
+        );
+      }
+      if (mounted && uploadedMedia != null) {
+        setState(() {
+          _stagedAttachment = null;
+        });
+      }
     } catch (_) {
       if (mounted) {
         _messageController.text = text;
@@ -769,6 +1105,403 @@ class _NewChatDialogState extends State<_NewChatDialog> {
         _isLoading = false;
       });
     }
+  }
+}
+
+class _GiphyPickerDialog extends StatefulWidget {
+  const _GiphyPickerDialog({required this.repository});
+
+  final ChatRepository repository;
+
+  @override
+  State<_GiphyPickerDialog> createState() => _GiphyPickerDialogState();
+}
+
+class _GiphyPickerDialogState extends State<_GiphyPickerDialog> {
+  final _controller = TextEditingController();
+  Timer? _debounce;
+  List<GiphyGif> _gifs = const [];
+  String? _error;
+  bool _isLoading = true;
+  int _requestId = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadGifs(''));
+  }
+
+  @override
+  void dispose() {
+    _debounce?.cancel();
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return AlertDialog(
+      title: const Row(
+        children: [
+          Icon(Icons.gif_box_outlined),
+          SizedBox(width: 10),
+          Text('GIF'),
+        ],
+      ),
+      content: SizedBox(
+        width: 520,
+        height: 520,
+        child: Column(
+          children: [
+            TextField(
+              key: const Key('giphy-search'),
+              controller: _controller,
+              autofocus: true,
+              textInputAction: TextInputAction.search,
+              onChanged: _scheduleSearch,
+              decoration: const InputDecoration(
+                hintText: 'Search GIPHY',
+                prefixIcon: Icon(Icons.search),
+              ),
+            ),
+            const SizedBox(height: 12),
+            Expanded(child: _buildResults(theme)),
+            const SizedBox(height: 8),
+            Align(
+              alignment: Alignment.centerRight,
+              child: Text(
+                'Powered by GIPHY',
+                style: theme.textTheme.labelSmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildResults(ThemeData theme) {
+    if (_isLoading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    if (_error != null) {
+      return Center(
+        child: Text(
+          _error!,
+          textAlign: TextAlign.center,
+          style: theme.textTheme.bodyMedium?.copyWith(
+            color: theme.colorScheme.error,
+          ),
+        ),
+      );
+    }
+
+    if (_gifs.isEmpty) {
+      return Center(
+        child: Text(
+          'No GIFs found.',
+          style: theme.textTheme.bodyMedium?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+      );
+    }
+
+    return GridView.builder(
+      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: 3,
+        mainAxisSpacing: 8,
+        crossAxisSpacing: 8,
+      ),
+      itemCount: _gifs.length,
+      itemBuilder: (context, index) {
+        final gif = _gifs[index];
+        return InkWell(
+          key: Key('giphy-result-${gif.id}'),
+          borderRadius: BorderRadius.circular(8),
+          onTap: () => Navigator.of(context).pop(gif),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(8),
+            child: CachedNetworkImage(
+              imageUrl: gif.previewUrl,
+              cacheKey: 'giphy-preview:${gif.id}',
+              fit: BoxFit.cover,
+              placeholder: (context, url) =>
+                  ColoredBox(color: theme.colorScheme.surfaceContainerHighest),
+              errorWidget: (context, url, error) => ColoredBox(
+                color: theme.colorScheme.surfaceContainerHighest,
+                child: const Center(child: Icon(Icons.broken_image_outlined)),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  void _scheduleSearch(String value) {
+    _debounce?.cancel();
+    _debounce = Timer(
+      const Duration(milliseconds: 300),
+      () => _loadGifs(value),
+    );
+  }
+
+  Future<void> _loadGifs(String query) async {
+    final requestId = ++_requestId;
+
+    setState(() {
+      _isLoading = true;
+      _error = null;
+    });
+
+    try {
+      final gifs = await widget.repository.searchGiphyGifs(query);
+      if (!mounted || requestId != _requestId) {
+        return;
+      }
+
+      setState(() {
+        _gifs = gifs;
+        _isLoading = false;
+      });
+    } catch (_) {
+      if (!mounted || requestId != _requestId) {
+        return;
+      }
+
+      setState(() {
+        _error = 'Could not load GIFs.';
+        _isLoading = false;
+      });
+    }
+  }
+}
+
+class _CameraCaptureDialog extends StatefulWidget {
+  const _CameraCaptureDialog();
+
+  @override
+  State<_CameraCaptureDialog> createState() => _CameraCaptureDialogState();
+}
+
+class _CameraCaptureDialogState extends State<_CameraCaptureDialog> {
+  List<camera.CameraDescription> _cameras = const [];
+  camera.CameraController? _controller;
+  String? _error;
+  bool _isLoading = true;
+  bool _isCapturing = false;
+  int _cameraIndex = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadCameras());
+  }
+
+  @override
+  void dispose() {
+    _controller?.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return AlertDialog(
+      title: const Row(
+        children: [
+          Icon(Icons.photo_camera_outlined),
+          SizedBox(width: 10),
+          Text('Camera'),
+        ],
+      ),
+      content: SizedBox(width: 620, height: 500, child: _buildContent(theme)),
+      actions: [
+        TextButton(
+          onPressed: _isCapturing ? null : () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        if (_cameras.length > 1)
+          TextButton.icon(
+            onPressed: _isCapturing ? null : _switchCamera,
+            icon: const Icon(Icons.cameraswitch_outlined),
+            label: const Text('Switch'),
+          ),
+        FilledButton.icon(
+          key: const Key('camera-capture'),
+          onPressed: _controller?.value.isInitialized == true && !_isCapturing
+              ? _capture
+              : null,
+          icon: _isCapturing
+              ? const SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Icon(Icons.camera_alt_outlined),
+          label: const Text('Capture'),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildContent(ThemeData theme) {
+    if (_isLoading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    if (_error != null) {
+      return Center(
+        child: Text(
+          _error!,
+          textAlign: TextAlign.center,
+          style: theme.textTheme.bodyMedium?.copyWith(
+            color: theme.colorScheme.error,
+          ),
+        ),
+      );
+    }
+
+    final controller = _controller;
+    if (controller == null || !controller.value.isInitialized) {
+      return Center(
+        child: Text(
+          'No camera preview available.',
+          style: theme.textTheme.bodyMedium?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+      );
+    }
+
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(8),
+      child: ColoredBox(
+        color: Colors.black,
+        child: Center(
+          child: AspectRatio(
+            aspectRatio: controller.value.aspectRatio,
+            child: camera.CameraPreview(controller),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _loadCameras() async {
+    try {
+      final cameras = await camera.availableCameras();
+      if (!mounted) {
+        return;
+      }
+      if (cameras.isEmpty) {
+        setState(() {
+          _error = 'No camera found.';
+          _isLoading = false;
+        });
+        return;
+      }
+
+      _cameras = cameras;
+      await _initializeCamera(0);
+    } on camera.CameraException catch (error) {
+      _setCameraError(error.description ?? error.code);
+    } catch (_) {
+      _setCameraError('Could not open the camera.');
+    }
+  }
+
+  Future<void> _initializeCamera(int index) async {
+    setState(() {
+      _isLoading = true;
+      _error = null;
+    });
+
+    final oldController = _controller;
+    _controller = null;
+    await oldController?.dispose();
+
+    final controller = camera.CameraController(
+      _cameras[index],
+      camera.ResolutionPreset.high,
+      enableAudio: false,
+    );
+
+    try {
+      await controller.initialize();
+      if (!mounted) {
+        await controller.dispose();
+        return;
+      }
+
+      setState(() {
+        _cameraIndex = index;
+        _controller = controller;
+        _isLoading = false;
+      });
+    } on camera.CameraException catch (error) {
+      await controller.dispose();
+      _setCameraError(error.description ?? error.code);
+    } catch (_) {
+      await controller.dispose();
+      _setCameraError('Could not open the camera.');
+    }
+  }
+
+  Future<void> _switchCamera() async {
+    if (_cameras.length < 2) {
+      return;
+    }
+    final nextIndex = (_cameraIndex + 1) % _cameras.length;
+    await _initializeCamera(nextIndex);
+  }
+
+  Future<void> _capture() async {
+    final controller = _controller;
+    if (controller == null || !controller.value.isInitialized || _isCapturing) {
+      return;
+    }
+
+    setState(() {
+      _isCapturing = true;
+    });
+
+    try {
+      final image = await controller.takePicture();
+      if (mounted) {
+        Navigator.of(context).pop(image);
+      }
+    } on camera.CameraException catch (error) {
+      _setCameraError(error.description ?? error.code);
+    } catch (_) {
+      _setCameraError('Could not capture a photo.');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isCapturing = false;
+        });
+      }
+    }
+  }
+
+  void _setCameraError(String message) {
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _error = message;
+      _isLoading = false;
+      _isCapturing = false;
+    });
   }
 }
 
@@ -1086,11 +1819,15 @@ class _ConversationPane extends StatelessWidget {
     required this.thread,
     required this.repository,
     required this.localMessages,
+    required this.stagedAttachment,
     required this.messageController,
     required this.isSending,
     required this.showBackButton,
     required this.onBackToInbox,
     required this.onSend,
+    required this.onAttachMedia,
+    required this.onRemoveAttachment,
+    required this.onRetryAttachment,
     required this.onComposerChanged,
     required this.onOpenProfile,
     required this.onSignOut,
@@ -1099,11 +1836,15 @@ class _ConversationPane extends StatelessWidget {
   final ChatThread thread;
   final ChatRepository repository;
   final List<ChatMessage> localMessages;
+  final _StagedMediaAttachment? stagedAttachment;
   final TextEditingController messageController;
   final bool isSending;
   final bool showBackButton;
   final VoidCallback onBackToInbox;
   final VoidCallback onSend;
+  final ValueChanged<ChatMediaSource> onAttachMedia;
+  final Future<void> Function() onRemoveAttachment;
+  final VoidCallback onRetryAttachment;
   final ValueChanged<String> onComposerChanged;
   final VoidCallback onOpenProfile;
   final VoidCallback onSignOut;
@@ -1221,7 +1962,10 @@ class _ConversationPane extends StatelessWidget {
                 padding: const EdgeInsets.fromLTRB(18, 18, 18, 24),
                 itemCount: messages.length,
                 itemBuilder: (context, index) {
-                  return _MessageBubble(message: messages[index]);
+                  return _MessageBubble(
+                    message: messages[index],
+                    repository: repository,
+                  );
                 },
               );
             },
@@ -1230,6 +1974,10 @@ class _ConversationPane extends StatelessWidget {
         _MessageComposer(
           controller: messageController,
           isSending: isSending,
+          stagedAttachment: stagedAttachment,
+          onAttachMedia: onAttachMedia,
+          onRemoveAttachment: onRemoveAttachment,
+          onRetryAttachment: onRetryAttachment,
           onChanged: onComposerChanged,
           onSend: onSend,
         ),
@@ -1257,14 +2005,17 @@ class _EmptyMessageList extends StatelessWidget {
 }
 
 class _MessageBubble extends StatelessWidget {
-  const _MessageBubble({required this.message});
+  const _MessageBubble({required this.message, required this.repository});
 
   final ChatMessage message;
+  final ChatRepository repository;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final isMine = message.isMine;
+    final media = message.media;
+    final hasText = message.body.trim().isNotEmpty;
     final bubbleColor = isMine
         ? theme.colorScheme.primary
         : theme.colorScheme.surfaceContainerHighest;
@@ -1289,7 +2040,12 @@ class _MessageBubble extends StatelessWidget {
               ),
             ),
             child: Padding(
-              padding: const EdgeInsets.fromLTRB(14, 10, 14, 8),
+              padding: EdgeInsets.fromLTRB(
+                media == null ? 14 : 6,
+                media == null ? 10 : 6,
+                media == null ? 14 : 6,
+                8,
+              ),
               child: Column(
                 crossAxisAlignment: isMine
                     ? CrossAxisAlignment.end
@@ -1305,36 +2061,299 @@ class _MessageBubble extends StatelessWidget {
                     ),
                     const SizedBox(height: 4),
                   ],
-                  Text(
-                    message.body,
-                    style: theme.textTheme.bodyLarge?.copyWith(
-                      color: textColor,
-                      height: 1.25,
+                  if (media != null) ...[
+                    _MessageMediaPreview(
+                      message: message,
+                      media: media,
+                      repository: repository,
                     ),
-                  ),
-                  const SizedBox(height: 6),
-                  Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(
-                        _formatTime(message.createdAt),
-                        style: theme.textTheme.labelSmall?.copyWith(
-                          color: textColor.withValues(alpha: 0.72),
+                    if (hasText) const SizedBox(height: 8),
+                  ],
+                  if (hasText)
+                    Padding(
+                      padding: EdgeInsets.symmetric(
+                        horizontal: media == null ? 0 : 8,
+                      ),
+                      child: Text(
+                        message.body,
+                        style: theme.textTheme.bodyLarge?.copyWith(
+                          color: textColor,
+                          height: 1.25,
                         ),
                       ),
-                      if (isMine) ...[
-                        const SizedBox(width: 6),
-                        _ReceiptIcon(
-                          message: message,
-                          fallbackColor: textColor.withValues(alpha: 0.72),
+                    ),
+                  const SizedBox(height: 6),
+                  Padding(
+                    padding: EdgeInsets.symmetric(
+                      horizontal: media == null ? 0 : 8,
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          _formatTime(message.createdAt),
+                          style: theme.textTheme.labelSmall?.copyWith(
+                            color: textColor.withValues(alpha: 0.72),
+                          ),
                         ),
+                        if (isMine) ...[
+                          const SizedBox(width: 6),
+                          _ReceiptIcon(
+                            message: message,
+                            fallbackColor: textColor.withValues(alpha: 0.72),
+                          ),
+                        ],
                       ],
-                    ],
+                    ),
                   ),
                 ],
               ),
             ),
           ),
+        ),
+      ),
+    );
+  }
+}
+
+class _MessageMediaPreview extends StatelessWidget {
+  const _MessageMediaPreview({
+    required this.message,
+    required this.media,
+    required this.repository,
+  });
+
+  final ChatMessage message;
+  final ChatMedia media;
+  final ChatRepository repository;
+
+  @override
+  Widget build(BuildContext context) {
+    final borderRadius = BorderRadius.circular(7);
+
+    return InkWell(
+      key: Key('media-preview-${message.id}'),
+      borderRadius: borderRadius,
+      onTap: () {
+        Navigator.of(context).push(
+          MaterialPageRoute<void>(
+            builder: (context) => _MediaViewerPage(
+              message: message,
+              media: media,
+              repository: repository,
+            ),
+          ),
+        );
+      },
+      child: Hero(
+        tag: _mediaHeroTag(message),
+        child: ClipRRect(
+          borderRadius: borderRadius,
+          child: AspectRatio(
+            aspectRatio: _previewAspectRatio(media),
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                _ChatMediaImage(
+                  media: media,
+                  repository: repository,
+                  fit: BoxFit.cover,
+                ),
+                if (media.isGif)
+                  Positioned(
+                    left: 8,
+                    bottom: 8,
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        color: Colors.black.withValues(alpha: 0.62),
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: const Padding(
+                        padding: EdgeInsets.symmetric(
+                          horizontal: 7,
+                          vertical: 3,
+                        ),
+                        child: Text(
+                          'GIF',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 11,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ChatMediaImage extends StatefulWidget {
+  const _ChatMediaImage({
+    required this.media,
+    required this.repository,
+    required this.fit,
+  });
+
+  final ChatMedia media;
+  final ChatRepository repository;
+  final BoxFit fit;
+
+  @override
+  State<_ChatMediaImage> createState() => _ChatMediaImageState();
+}
+
+class _ChatMediaImageState extends State<_ChatMediaImage> {
+  Future<String>? _signedUrl;
+
+  @override
+  void initState() {
+    super.initState();
+    _syncSignedUrl();
+  }
+
+  @override
+  void didUpdateWidget(covariant _ChatMediaImage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.media.cacheKey != widget.media.cacheKey ||
+        oldWidget.repository != widget.repository) {
+      _syncSignedUrl();
+    }
+  }
+
+  void _syncSignedUrl() {
+    _signedUrl = widget.media.localBytes == null
+        ? widget.repository.signedMediaUrl(widget.media)
+        : null;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final localBytes = widget.media.localBytes;
+    if (localBytes != null) {
+      return Image.memory(
+        localBytes,
+        fit: widget.fit,
+        gaplessPlayback: true,
+        filterQuality: FilterQuality.high,
+      );
+    }
+
+    return FutureBuilder<String>(
+      future: _signedUrl,
+      builder: (context, snapshot) {
+        final signedUrl = snapshot.data;
+        if (signedUrl == null) {
+          return ColoredBox(
+            color: Colors.black.withValues(alpha: 0.06),
+            child: const Center(
+              child: SizedBox(
+                width: 22,
+                height: 22,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+            ),
+          );
+        }
+
+        return CachedNetworkImage(
+          imageUrl: signedUrl,
+          cacheKey: widget.media.cacheKey,
+          fit: widget.fit,
+          fadeInDuration: const Duration(milliseconds: 120),
+          placeholder: (context, url) => ColoredBox(
+            color: Colors.black.withValues(alpha: 0.06),
+            child: const Center(
+              child: SizedBox(
+                width: 22,
+                height: 22,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+            ),
+          ),
+          errorWidget: (context, url, error) => ColoredBox(
+            color: Colors.black.withValues(alpha: 0.08),
+            child: const Center(child: Icon(Icons.broken_image_outlined)),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _MediaViewerPage extends StatelessWidget {
+  const _MediaViewerPage({
+    required this.message,
+    required this.media,
+    required this.repository,
+  });
+
+  final ChatMessage message;
+  final ChatMedia media;
+  final ChatRepository repository;
+
+  @override
+  Widget build(BuildContext context) {
+    final caption = message.body.trim();
+
+    return Scaffold(
+      key: Key('media-viewer-${message.id}'),
+      backgroundColor: Colors.black,
+      body: SafeArea(
+        child: Stack(
+          children: [
+            Positioned.fill(
+              child: InteractiveViewer(
+                minScale: 1,
+                maxScale: 4,
+                child: Hero(
+                  tag: _mediaHeroTag(message),
+                  child: SizedBox.expand(
+                    child: _ChatMediaImage(
+                      media: media,
+                      repository: repository,
+                      fit: BoxFit.contain,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            Positioned(
+              top: 8,
+              right: 8,
+              child: IconButton.filledTonal(
+                tooltip: 'Close',
+                onPressed: () => Navigator.of(context).pop(),
+                icon: const Icon(Icons.close),
+              ),
+            ),
+            if (caption.isNotEmpty)
+              Positioned(
+                left: 18,
+                right: 18,
+                bottom: 18,
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.58),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: Text(
+                      caption,
+                      style: Theme.of(
+                        context,
+                      ).textTheme.bodyLarge?.copyWith(color: Colors.white),
+                    ),
+                  ),
+                ),
+              ),
+          ],
         ),
       ),
     );
@@ -1380,12 +2399,20 @@ class _MessageComposer extends StatelessWidget {
   const _MessageComposer({
     required this.controller,
     required this.isSending,
+    required this.stagedAttachment,
+    required this.onAttachMedia,
+    required this.onRemoveAttachment,
+    required this.onRetryAttachment,
     required this.onChanged,
     required this.onSend,
   });
 
   final TextEditingController controller;
   final bool isSending;
+  final _StagedMediaAttachment? stagedAttachment;
+  final ValueChanged<ChatMediaSource> onAttachMedia;
+  final Future<void> Function() onRemoveAttachment;
+  final VoidCallback onRetryAttachment;
   final ValueChanged<String> onChanged;
   final VoidCallback onSend;
 
@@ -1403,41 +2430,209 @@ class _MessageComposer extends StatelessWidget {
       ),
       child: SafeArea(
         top: false,
-        child: Row(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            IconButton(
-              tooltip: 'Attach',
-              onPressed: () {},
-              icon: const Icon(Icons.add),
-            ),
-            Expanded(
-              child: TextField(
-                key: const Key('message-composer'),
-                controller: controller,
-                minLines: 1,
-                maxLines: 4,
-                textInputAction: TextInputAction.newline,
-                onChanged: onChanged,
-                decoration: const InputDecoration(hintText: 'Message'),
+            if (stagedAttachment != null) ...[
+              _StagedAttachmentCard(
+                attachment: stagedAttachment!,
+                onRemove: onRemoveAttachment,
+                onRetry: onRetryAttachment,
               ),
-            ),
-            const SizedBox(width: 8),
-            FilledButton(
-              onPressed: isSending ? null : onSend,
-              style: FilledButton.styleFrom(
-                minimumSize: const Size(48, 48),
-                padding: EdgeInsets.zero,
-              ),
-              child: isSending
-                  ? const SizedBox(
-                      width: 18,
-                      height: 18,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Icon(Icons.send),
+              const SizedBox(height: 10),
+            ],
+            Row(
+              children: [
+                PopupMenuButton<ChatMediaSource>(
+                  tooltip: 'Attach',
+                  enabled: !isSending,
+                  icon: const Icon(Icons.add),
+                  onSelected: onAttachMedia,
+                  itemBuilder: (context) => const [
+                    PopupMenuItem(
+                      value: ChatMediaSource.gallery,
+                      child: ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        leading: Icon(Icons.photo_library_outlined),
+                        title: Text('Photo or GIF'),
+                      ),
+                    ),
+                    PopupMenuItem(
+                      value: ChatMediaSource.giphy,
+                      child: ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        leading: Icon(Icons.gif_box_outlined),
+                        title: Text('GIF'),
+                      ),
+                    ),
+                    PopupMenuItem(
+                      value: ChatMediaSource.camera,
+                      child: ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        leading: Icon(Icons.photo_camera_outlined),
+                        title: Text('Camera'),
+                      ),
+                    ),
+                  ],
+                ),
+                Expanded(
+                  child: TextField(
+                    key: const Key('message-composer'),
+                    controller: controller,
+                    minLines: 1,
+                    maxLines: 4,
+                    textInputAction: TextInputAction.newline,
+                    onChanged: onChanged,
+                    decoration: const InputDecoration(hintText: 'Message'),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                ValueListenableBuilder<TextEditingValue>(
+                  valueListenable: controller,
+                  builder: (context, _, child) {
+                    final uploadReady =
+                        stagedAttachment == null || stagedAttachment!.canSend;
+                    final failed =
+                        stagedAttachment?.status ==
+                        _AttachmentUploadState.failed;
+                    return FilledButton(
+                      onPressed: isSending || !uploadReady || failed
+                          ? null
+                          : onSend,
+                      style: FilledButton.styleFrom(
+                        minimumSize: const Size(48, 48),
+                        padding: EdgeInsets.zero,
+                      ),
+                      child: isSending
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.send),
+                    );
+                  },
+                ),
+              ],
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class _StagedAttachmentCard extends StatelessWidget {
+  const _StagedAttachmentCard({
+    required this.attachment,
+    required this.onRemove,
+    required this.onRetry,
+  });
+
+  final _StagedMediaAttachment attachment;
+  final Future<void> Function() onRemove;
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final media = attachment.uploadedMedia?.media;
+    final pickedMedia = attachment.pickedMedia;
+    final progress = attachment.progress.clamp(0.0, 1.0);
+    final isFailed = attachment.status == _AttachmentUploadState.failed;
+    final label = isFailed
+        ? attachment.errorMessage ?? 'Upload failed.'
+        : attachment.isUploading
+        ? 'Uploading ${(progress * 100).round()}%'
+        : 'Ready';
+
+    return Container(
+      key: const Key('staged-media-attachment'),
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerHighest.withValues(
+          alpha: 0.64,
+        ),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: theme.dividerColor.withValues(alpha: 0.08)),
+      ),
+      child: Row(
+        children: [
+          ClipRRect(
+            borderRadius: BorderRadius.circular(6),
+            child: SizedBox(
+              width: 58,
+              height: 58,
+              child: media == null
+                  ? Image.memory(
+                      pickedMedia.bytes,
+                      fit: BoxFit.cover,
+                      gaplessPlayback: true,
+                    )
+                  : Image.memory(
+                      media.localBytes ?? pickedMedia.bytes,
+                      fit: BoxFit.cover,
+                      gaplessPlayback: true,
+                    ),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  pickedMedia.originalName,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.labelLarge?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  '${_formatBytes(pickedMedia.sizeBytes)} · $label',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.labelMedium?.copyWith(
+                    color: isFailed
+                        ? theme.colorScheme.error
+                        : theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+                if (attachment.isUploading) ...[
+                  const SizedBox(height: 7),
+                  LinearProgressIndicator(
+                    value: progress == 0 ? null : progress,
+                  ),
+                ],
+                if (isFailed && attachment.errorDetails != null) ...[
+                  const SizedBox(height: 6),
+                  Text(
+                    attachment.errorDetails!,
+                    maxLines: 5,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.colorScheme.error,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          if (isFailed)
+            IconButton(
+              tooltip: 'Retry upload',
+              onPressed: onRetry,
+              icon: const Icon(Icons.refresh),
+            ),
+          IconButton(
+            tooltip: 'Remove attachment',
+            onPressed: onRemove,
+            icon: const Icon(Icons.close),
+          ),
+        ],
       ),
     );
   }
@@ -1523,4 +2718,51 @@ String _formatTime(DateTime time) {
   final hour = time.hour.toString().padLeft(2, '0');
   final minute = time.minute.toString().padLeft(2, '0');
   return '$hour:$minute';
+}
+
+String _formatBytes(int bytes) {
+  if (bytes < 1024) {
+    return '$bytes B';
+  }
+  if (bytes < 1024 * 1024) {
+    return '${(bytes / 1024).toStringAsFixed(1)} KB';
+  }
+  return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+}
+
+String _shortError(Object error) {
+  final message = error.toString().trim().replaceAll(RegExp(r'\s+'), ' ');
+  if (message.isEmpty) {
+    return error.runtimeType.toString();
+  }
+  if (message.length <= 160) {
+    return message;
+  }
+  return '${message.substring(0, 160)}...';
+}
+
+String _firstStackFrame(StackTrace stackTrace) {
+  final lines = stackTrace.toString().trim().split('\n');
+  if (lines.isEmpty || lines.first.trim().isEmpty) {
+    return 'unavailable';
+  }
+  return lines.first.trim();
+}
+
+double _previewAspectRatio(ChatMedia media) {
+  final aspectRatio = media.aspectRatio;
+  if (aspectRatio == null) {
+    return 1;
+  }
+  if (aspectRatio > 1.18) {
+    return 4 / 3;
+  }
+  if (aspectRatio < 0.84) {
+    return 3 / 4;
+  }
+  return 1;
+}
+
+String _mediaHeroTag(ChatMessage message) {
+  return 'message-media-${message.id}';
 }

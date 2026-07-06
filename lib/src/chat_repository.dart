@@ -1,14 +1,41 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:ui' as ui;
 
+import 'package:file_selector/file_selector.dart' as file_selector;
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'package:http_parser/http_parser.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:mime/mime.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:uuid/uuid.dart';
 
 import 'chat_models.dart';
 
 class ChatRepository {
   ChatRepository({this.client});
 
+  static const mediaBucket = 'chat-media';
+  static const giphyApiKey = String.fromEnvironment(
+    'GIPHY_API_KEY',
+    defaultValue: 'MDd2YDtyctTXW6Z8fkRPJOwUcPZQJlvE',
+  );
+  static const maxMediaBytes = 15 * 1024 * 1024;
+  static const _mediaCacheControl = '31536000';
+  static const _allowedMediaTypes = {
+    'image/jpeg',
+    'image/png',
+    'image/webp',
+    'image/gif',
+    'image/heic',
+    'image/heif',
+  };
+
   final SupabaseClient? client;
+  final ImagePicker _imagePicker = ImagePicker();
+  final Uuid _uuid = const Uuid();
   RealtimeChannel? _presenceChannel;
   bool _presenceSubscribed = false;
   final Map<String, RealtimeChannel> _typingChannels = {};
@@ -494,6 +521,303 @@ class ChatRepository {
     }
   }
 
+  Future<PickedChatMedia?> pickMediaAttachment(ChatMediaSource source) async {
+    if (source == ChatMediaSource.giphy) {
+      throw UnsupportedError('Use searchGiphyGifs before selecting a GIF.');
+    }
+    if (source == ChatMediaSource.camera) {
+      throw UnsupportedError('Use captureMediaAttachment for camera photos.');
+    }
+
+    if (_isDesktopPlatform) {
+      final file = await _openDesktopMediaFile();
+      if (file == null) {
+        return null;
+      }
+
+      late final Uint8List bytes;
+      try {
+        bytes = await file.readAsBytes();
+      } catch (error) {
+        throw MediaAttachmentException(
+          'Could not read that file.',
+          details:
+              'Desktop file read failed for "${file.name}" on '
+              '$defaultTargetPlatform: $error',
+        );
+      }
+
+      return pickedMediaFromBytes(
+        bytes: bytes,
+        originalName: file.name,
+        mimeType: file.mimeType,
+      );
+    }
+
+    final image = await _imagePicker.pickImage(
+      source: ImageSource.gallery,
+      requestFullMetadata: false,
+    );
+    if (image == null) {
+      return null;
+    }
+
+    return pickedMediaFromBytes(
+      bytes: await image.readAsBytes(),
+      originalName: image.name,
+      mimeType: image.mimeType,
+    );
+  }
+
+  Future<file_selector.XFile?> _openDesktopMediaFile() async {
+    try {
+      return await file_selector.openFile(
+        acceptedTypeGroups: const [
+          file_selector.XTypeGroup(
+            label: 'Images and GIFs',
+            extensions: ['jpg', 'jpeg', 'png', 'webp', 'gif', 'heic', 'heif'],
+            mimeTypes: [
+              'image/jpeg',
+              'image/png',
+              'image/webp',
+              'image/gif',
+              'image/heic',
+              'image/heif',
+            ],
+            uniformTypeIdentifiers: ['public.image'],
+          ),
+        ],
+      );
+    } catch (error) {
+      throw MediaAttachmentException(
+        'Could not open the desktop photo picker.',
+        details: 'Desktop file picker failed on $defaultTargetPlatform: $error',
+      );
+    }
+  }
+
+  Future<PickedChatMedia> pickedMediaFromBytes({
+    required Uint8List bytes,
+    required String originalName,
+    String? mimeType,
+  }) async {
+    final sizeBytes = bytes.length;
+    if (sizeBytes > maxMediaBytes) {
+      throw MediaAttachmentException('Choose an image or GIF under 15 MB.');
+    }
+
+    final normalizedMimeType = _normalizedMimeType(
+      mimeType ?? lookupMimeType(originalName, headerBytes: bytes),
+    );
+    if (!_allowedMediaTypes.contains(normalizedMimeType)) {
+      throw MediaAttachmentException('Choose a JPEG, PNG, WebP, GIF, or HEIC.');
+    }
+
+    final dimensions = await _readImageDimensions(bytes);
+    return PickedChatMedia(
+      bytes: bytes,
+      originalName: _safeOriginalName(originalName, normalizedMimeType),
+      mimeType: normalizedMimeType,
+      sizeBytes: sizeBytes,
+      width: dimensions?.width,
+      height: dimensions?.height,
+    );
+  }
+
+  Future<List<GiphyGif>> searchGiphyGifs(String query) async {
+    if (giphyApiKey.isEmpty) {
+      throw const MediaAttachmentException('Missing GIPHY API key.');
+    }
+
+    final trimmedQuery = query.trim();
+    final endpoint = trimmedQuery.isEmpty ? 'trending' : 'search';
+    final uri = Uri.https('api.giphy.com', '/v1/gifs/$endpoint', {
+      'api_key': giphyApiKey,
+      'limit': '24',
+      'rating': 'g',
+      if (trimmedQuery.isNotEmpty) 'q': trimmedQuery,
+    });
+
+    final response = await http.get(uri);
+    if (response.statusCode < 200 || response.statusCode > 299) {
+      throw MediaAttachmentException(
+        'Could not load GIFs.',
+        details:
+            'GIPHY $endpoint failed with HTTP ${response.statusCode}: '
+            '${_compactLogValue(response.body)}',
+      );
+    }
+
+    final payload = json.decode(response.body) as Map<String, dynamic>;
+    final data = payload['data'];
+    if (data is! List) {
+      return const [];
+    }
+
+    return data
+        .whereType<Map<String, dynamic>>()
+        .map(_giphyGifFromJson)
+        .whereType<GiphyGif>()
+        .toList();
+  }
+
+  Future<PickedChatMedia> downloadGiphyGif(GiphyGif gif) async {
+    final response = await http.get(Uri.parse(gif.originalUrl));
+    if (response.statusCode < 200 || response.statusCode > 299) {
+      throw MediaAttachmentException(
+        'Could not download that GIF.',
+        details:
+            'GIPHY download failed with HTTP ${response.statusCode}: '
+            '${_compactLogValue(response.body)}',
+      );
+    }
+
+    final bytes = response.bodyBytes;
+    if (bytes.length > maxMediaBytes) {
+      throw const MediaAttachmentException('Choose a GIF under 15 MB.');
+    }
+
+    return PickedChatMedia(
+      bytes: bytes,
+      originalName: 'giphy-${gif.id}.gif',
+      mimeType: 'image/gif',
+      sizeBytes: bytes.length,
+      width: gif.width,
+      height: gif.height,
+    );
+  }
+
+  UploadedChatMedia prepareLocalMediaAttachment({
+    required String conversationId,
+    required PickedChatMedia pickedMedia,
+  }) {
+    final messageId = 'local-${DateTime.now().microsecondsSinceEpoch}';
+    return UploadedChatMedia(
+      messageId: messageId,
+      media: ChatMedia(
+        bucket: mediaBucket,
+        path:
+            '$conversationId/$localUserId/$messageId${_extensionFor(pickedMedia)}',
+        mimeType: pickedMedia.mimeType,
+        sizeBytes: pickedMedia.sizeBytes,
+        width: pickedMedia.width,
+        height: pickedMedia.height,
+        originalName: pickedMedia.originalName,
+        localBytes: pickedMedia.bytes,
+      ),
+    );
+  }
+
+  Future<UploadedChatMedia> uploadMediaAttachment({
+    required String conversationId,
+    required PickedChatMedia pickedMedia,
+    required void Function(double progress) onProgress,
+  }) async {
+    final supabase = client;
+    if (supabase == null) {
+      return prepareLocalMediaAttachment(
+        conversationId: conversationId,
+        pickedMedia: pickedMedia,
+      );
+    }
+
+    final user = supabase.auth.currentUser;
+    final session = supabase.auth.currentSession;
+    if (user == null || session == null) {
+      throw const AuthException('Sign in before sending media.');
+    }
+
+    final messageId = _uuid.v4();
+    final objectPath =
+        '$conversationId/${user.id}/$messageId${_extensionFor(pickedMedia)}';
+    final storage = supabase.storage.from(mediaBucket);
+    final uploadUri = _chatMediaUploadUri(
+      storageUrl: storage.url,
+      objectPath: objectPath,
+    );
+    final uploadHeaders = {
+      ...storage.headers,
+      'authorization': 'Bearer ${session.accessToken}',
+    };
+
+    await _uploadBytesWithProgress(
+      uri: uploadUri,
+      headers: uploadHeaders,
+      bytes: pickedMedia.bytes,
+      fileName: pickedMedia.originalName,
+      mimeType: pickedMedia.mimeType,
+      onProgress: onProgress,
+    );
+
+    onProgress(1);
+
+    return UploadedChatMedia(
+      messageId: messageId,
+      media: ChatMedia(
+        bucket: mediaBucket,
+        path: objectPath,
+        mimeType: pickedMedia.mimeType,
+        sizeBytes: pickedMedia.sizeBytes,
+        width: pickedMedia.width,
+        height: pickedMedia.height,
+        originalName: pickedMedia.originalName,
+      ),
+    );
+  }
+
+  @visibleForTesting
+  static Uri chatMediaUploadUriForTesting({
+    required String storageUrl,
+    required String objectPath,
+  }) {
+    return _chatMediaUploadUri(storageUrl: storageUrl, objectPath: objectPath);
+  }
+
+  @visibleForTesting
+  static Future<void> uploadBytesWithProgressForTesting({
+    required Uri uri,
+    required Map<String, String> headers,
+    required Uint8List bytes,
+    required String fileName,
+    required String mimeType,
+    required void Function(double progress) onProgress,
+    http.Client? httpClient,
+  }) {
+    return _uploadBytesWithProgress(
+      uri: uri,
+      headers: headers,
+      bytes: bytes,
+      fileName: fileName,
+      mimeType: mimeType,
+      onProgress: onProgress,
+      httpClient: httpClient,
+    );
+  }
+
+  Future<String> signedMediaUrl(ChatMedia media) async {
+    final supabase = client;
+    if (supabase == null) {
+      throw StateError('Local media does not need a signed URL.');
+    }
+
+    return supabase.storage
+        .from(media.bucket)
+        .createSignedUrl(media.path, const Duration(hours: 1).inSeconds);
+  }
+
+  Future<void> deleteStagedMedia(ChatMedia media) async {
+    final supabase = client;
+    if (supabase == null || media.path.isEmpty) {
+      return;
+    }
+
+    try {
+      await supabase.storage.from(media.bucket).remove([media.path]);
+    } catch (_) {
+      // Staged media cleanup is best-effort; failed deletes should not break chat.
+    }
+  }
+
   Stream<List<ChatMessage>> watchMessages(String conversationId) {
     final supabase = client;
     if (supabase == null) {
@@ -586,6 +910,41 @@ class ChatRepository {
       'sender_id': user.id,
       'sender_name': localSenderName,
       'body': trimmed,
+    });
+  }
+
+  Future<void> sendMediaMessage({
+    required String conversationId,
+    required String messageId,
+    required String body,
+    required ChatMedia media,
+  }) async {
+    final supabase = client;
+    if (supabase == null) {
+      return;
+    }
+
+    final user = supabase.auth.currentUser;
+    if (user == null) {
+      throw const AuthException('Sign in before sending media.');
+    }
+
+    await supabase.from('messages').insert({
+      'id': messageId,
+      'conversation_id': conversationId,
+      'sender_id': user.id,
+      'sender_name': localSenderName,
+      'body': body.trim(),
+      'message_type': media.isGif
+          ? ChatMessageType.gif.value
+          : ChatMessageType.image.value,
+      'media_bucket': media.bucket,
+      'media_path': media.path,
+      'media_mime_type': media.mimeType,
+      'media_size_bytes': media.sizeBytes,
+      'media_width': media.width,
+      'media_height': media.height,
+      'media_original_name': media.originalName,
     });
   }
 
@@ -888,6 +1247,293 @@ String? _nullableText(String? value) {
     return null;
   }
   return trimmed;
+}
+
+bool get _isDesktopPlatform {
+  if (kIsWeb) {
+    return false;
+  }
+
+  return switch (defaultTargetPlatform) {
+    TargetPlatform.linux ||
+    TargetPlatform.macOS ||
+    TargetPlatform.windows => true,
+    _ => false,
+  };
+}
+
+class MediaAttachmentException implements Exception {
+  const MediaAttachmentException(this.message, {this.details});
+
+  final String message;
+  final String? details;
+
+  @override
+  String toString() => details == null ? message : '$message\n$details';
+}
+
+class ChatMediaUploadException implements Exception {
+  const ChatMediaUploadException({
+    required this.statusCode,
+    required this.requestUri,
+    required this.responseBody,
+    this.reasonPhrase,
+  });
+
+  final int statusCode;
+  final Uri requestUri;
+  final String responseBody;
+  final String? reasonPhrase;
+
+  String get message {
+    final reason = reasonPhrase == null || reasonPhrase!.trim().isEmpty
+        ? ''
+        : ' ${reasonPhrase!.trim()}';
+    return 'Media upload failed (HTTP $statusCode$reason).';
+  }
+
+  String get details {
+    final buffer = StringBuffer()
+      ..writeln(message)
+      ..writeln('Request: ${requestUri.replace(query: '')}');
+    final body = _compactLogValue(responseBody);
+    if (body.isNotEmpty) {
+      buffer.writeln('Response: $body');
+    }
+    final hint = _uploadFailureHint(statusCode, responseBody);
+    if (hint != null) {
+      buffer.writeln('Hint: $hint');
+    }
+    return buffer.toString().trimRight();
+  }
+
+  @override
+  String toString() => details;
+}
+
+String _compactLogValue(String value, {int maxLength = 1200}) {
+  final compact = value.trim().replaceAll(RegExp(r'\s+'), ' ');
+  if (compact.length <= maxLength) {
+    return compact;
+  }
+  return '${compact.substring(0, maxLength)}...';
+}
+
+String? _uploadFailureHint(int statusCode, String body) {
+  final normalizedBody = body.toLowerCase();
+  if (normalizedBody.contains('authorization')) {
+    return 'The upload request is missing the Supabase bearer session header. '
+        'Sign in again and retry; if it persists, inspect uploadHeaders.';
+  }
+  if (statusCode == 401 || statusCode == 403) {
+    return 'Check the signed-in session, storage.objects RLS policies, '
+        'conversation participant IDs, and media path.';
+  }
+  if (statusCode == 404 || normalizedBody.contains('bucket')) {
+    return 'Check that the private chat-media bucket exists in Supabase.';
+  }
+  if (statusCode == 413 || normalizedBody.contains('size')) {
+    return 'The file may exceed the chat-media 15 MB limit.';
+  }
+  if (statusCode == 400 || statusCode == 415) {
+    return 'Check MIME type, filename extension, and allowed bucket MIME types.';
+  }
+  return null;
+}
+
+class _MediaDimensions {
+  const _MediaDimensions({required this.width, required this.height});
+
+  final int width;
+  final int height;
+}
+
+Future<_MediaDimensions?> _readImageDimensions(Uint8List bytes) async {
+  ui.ImmutableBuffer? buffer;
+  ui.ImageDescriptor? descriptor;
+  try {
+    buffer = await ui.ImmutableBuffer.fromUint8List(bytes);
+    descriptor = await ui.ImageDescriptor.encoded(buffer);
+    return _MediaDimensions(width: descriptor.width, height: descriptor.height);
+  } catch (_) {
+    return null;
+  } finally {
+    descriptor?.dispose();
+    buffer?.dispose();
+  }
+}
+
+Future<void> _uploadBytesWithProgress({
+  required Uri uri,
+  required Map<String, String> headers,
+  required Uint8List bytes,
+  required String fileName,
+  required String mimeType,
+  required void Function(double progress) onProgress,
+  http.Client? httpClient,
+}) async {
+  onProgress(0);
+
+  final request = http.MultipartRequest('POST', uri)
+    ..headers.addAll(headers)
+    ..headers['x-upsert'] = 'false'
+    ..fields['cacheControl'] = ChatRepository._mediaCacheControl
+    ..files.add(
+      http.MultipartFile(
+        '',
+        _progressByteStream(bytes, onProgress),
+        bytes.length,
+        filename: fileName,
+        contentType: MediaType.parse(mimeType),
+      ),
+    );
+
+  final client = httpClient ?? http.Client();
+  try {
+    final response = await client.send(request);
+    final body = await response.stream.bytesToString();
+    if (response.statusCode < 200 || response.statusCode > 299) {
+      throw ChatMediaUploadException(
+        statusCode: response.statusCode,
+        reasonPhrase: response.reasonPhrase,
+        requestUri: uri,
+        responseBody: body,
+      );
+    }
+    if (body.isNotEmpty) {
+      json.decode(body);
+    }
+    onProgress(1);
+  } finally {
+    if (httpClient == null) {
+      client.close();
+    }
+  }
+}
+
+Uri _chatMediaUploadUri({
+  required String storageUrl,
+  required String objectPath,
+}) {
+  final encodedPath = Uri(
+    pathSegments: [ChatRepository.mediaBucket, ...objectPath.split('/')],
+  ).path.replaceFirst(RegExp(r'^/'), '');
+  return Uri.parse('$storageUrl/object/$encodedPath');
+}
+
+Stream<List<int>> _progressByteStream(
+  Uint8List bytes,
+  void Function(double progress) onProgress,
+) async* {
+  const chunkSize = 64 * 1024;
+  if (bytes.isEmpty) {
+    onProgress(0);
+    return;
+  }
+
+  for (var offset = 0; offset < bytes.length; offset += chunkSize) {
+    final end = offset + chunkSize > bytes.length
+        ? bytes.length
+        : offset + chunkSize;
+    yield Uint8List.sublistView(bytes, offset, end);
+
+    final fileProgress = end / bytes.length;
+    final cappedProgress = fileProgress * 0.97;
+    onProgress(cappedProgress > 0.97 ? 0.97 : cappedProgress);
+    await Future<void>.delayed(Duration.zero);
+  }
+}
+
+String _normalizedMimeType(String? mimeType) {
+  final normalized = mimeType?.split(';').first.trim().toLowerCase();
+  if (normalized == 'image/jpg') {
+    return 'image/jpeg';
+  }
+  if (normalized == null || normalized.isEmpty) {
+    return 'application/octet-stream';
+  }
+  return normalized;
+}
+
+String _safeOriginalName(String name, String mimeType) {
+  final trimmed = name.trim();
+  final fallback = 'attachment${_extensionForMime(mimeType)}';
+  if (trimmed.isEmpty || trimmed.toLowerCase() == 'image_picker') {
+    return fallback;
+  }
+  return trimmed.replaceAll(RegExp(r'[/\\]'), '_');
+}
+
+String _extensionFor(PickedChatMedia media) {
+  final name = media.originalName.toLowerCase();
+  final lastDot = name.lastIndexOf('.');
+  if (lastDot >= 0 && lastDot < name.length - 1) {
+    final extension = name.substring(lastDot);
+    if (extension.length <= 6) {
+      return extension;
+    }
+  }
+  return _extensionForMime(media.mimeType);
+}
+
+String _extensionForMime(String mimeType) {
+  return switch (mimeType.toLowerCase()) {
+    'image/jpeg' => '.jpg',
+    'image/png' => '.png',
+    'image/webp' => '.webp',
+    'image/gif' => '.gif',
+    'image/heic' => '.heic',
+    'image/heif' => '.heif',
+    _ => '.img',
+  };
+}
+
+GiphyGif? _giphyGifFromJson(Map<String, dynamic> row) {
+  final id = row['id']?.toString();
+  final images = row['images'];
+  if (id == null || images is! Map<String, dynamic>) {
+    return null;
+  }
+
+  final original = images['original'];
+  if (original is! Map<String, dynamic>) {
+    return null;
+  }
+
+  final preview =
+      images['fixed_width'] ??
+      images['downsized_medium'] ??
+      images['downsized'] ??
+      original;
+  if (preview is! Map<String, dynamic>) {
+    return null;
+  }
+
+  final originalUrl = original['url']?.toString();
+  final previewUrl = preview['url']?.toString();
+  if (originalUrl == null ||
+      originalUrl.isEmpty ||
+      previewUrl == null ||
+      previewUrl.isEmpty) {
+    return null;
+  }
+
+  return GiphyGif(
+    id: id,
+    title: row['title']?.toString() ?? 'GIF',
+    previewUrl: previewUrl,
+    originalUrl: originalUrl,
+    width: _readGiphyInt(original['width']),
+    height: _readGiphyInt(original['height']),
+    sizeBytes: _readGiphyInt(original['size']),
+  );
+}
+
+int? _readGiphyInt(Object? value) {
+  if (value is int) {
+    return value;
+  }
+  return int.tryParse(value?.toString() ?? '');
 }
 
 Color _accentColorFor(String seed) {
