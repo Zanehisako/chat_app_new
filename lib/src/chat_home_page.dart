@@ -210,11 +210,15 @@ class _ChatHomePageState extends State<ChatHomePage>
         if (!mounted || _callSnapshot != null) {
           return;
         }
+        debugPrint(
+          '[Incoming call invite] call=${invite.id} from=${invite.callerName}',
+        );
         setState(() {
           _incomingCallInvite = invite;
         });
       },
-      onError: (_) {
+      onError: (Object error, StackTrace stackTrace) {
+        _logCallFailure('Incoming call watch failed', error, stackTrace);
         if (!mounted) {
           return;
         }

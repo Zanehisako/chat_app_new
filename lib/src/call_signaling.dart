@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:realtime_calls/realtime_calls.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
@@ -32,7 +33,8 @@ class SupabaseCallSignaling implements CallSignaling {
 
   @override
   String get localUserId {
-    final userId = client.auth.currentUser?.id;
+    final userId =
+        client.auth.currentUser?.id ?? client.auth.currentSession?.user.id;
     if (userId == null || userId.isEmpty) {
       throw const CallException('Sign in before starting calls.');
     }
@@ -106,20 +108,93 @@ class SupabaseCallSignaling implements CallSignaling {
   @override
   Stream<CallInvite> watchIncomingInvites() {
     final userId = localUserId;
-    return client
+    late final StreamController<CallInvite> controller;
+    StreamSubscription<List<Map<String, dynamic>>>? realtimeSubscription;
+    Timer? pollingTimer;
+    var isFetching = false;
+    final emittedInviteIds = <String>{};
+
+    void emitInvites(List<CallInvite> invites) {
+      invites.sort((a, b) => a.createdAt.compareTo(b.createdAt));
+      for (final invite in invites) {
+        if (invite.isExpired || !emittedInviteIds.add(invite.id)) {
+          continue;
+        }
+        if (!controller.isClosed) {
+          controller.add(invite);
+        }
+      }
+    }
+
+    Future<void> fetchInvites() async {
+      if (isFetching || controller.isClosed) {
+        return;
+      }
+      isFetching = true;
+      try {
+        emitInvites(await _fetchIncomingInvites(userId));
+      } catch (error, stackTrace) {
+        debugPrint('[Incoming call poll failed] $error\n$stackTrace');
+        if (!controller.isClosed) {
+          controller.addError(error, stackTrace);
+        }
+      } finally {
+        isFetching = false;
+      }
+    }
+
+    controller = StreamController<CallInvite>(
+      onListen: () {
+        realtimeSubscription = client
+            .from('call_sessions')
+            .stream(primaryKey: ['id'])
+            .eq('callee_id', userId)
+            .listen(
+              (rows) {
+                emitInvites(
+                  rows
+                      .where((row) => row['status']?.toString() == 'ringing')
+                      .map(_inviteFromRow)
+                      .where((invite) => !invite.isExpired)
+                      .toList(),
+                );
+              },
+              onError: (Object error, StackTrace stackTrace) {
+                debugPrint(
+                  '[Incoming call realtime failed] $error\n$stackTrace',
+                );
+                if (!controller.isClosed) {
+                  controller.addError(error, stackTrace);
+                }
+              },
+            );
+        unawaited(fetchInvites());
+        pollingTimer = Timer.periodic(
+          const Duration(seconds: 2),
+          (_) => unawaited(fetchInvites()),
+        );
+      },
+      onCancel: () async {
+        pollingTimer?.cancel();
+        await realtimeSubscription?.cancel();
+      },
+    );
+
+    return controller.stream;
+  }
+
+  Future<List<CallInvite>> _fetchIncomingInvites(String userId) async {
+    final rows = await client
         .from('call_sessions')
-        .stream(primaryKey: ['id'])
+        .select()
         .eq('callee_id', userId)
-        .map(
-          (rows) =>
-              rows
-                  .where((row) => row['status']?.toString() == 'ringing')
-                  .map(_inviteFromRow)
-                  .where((invite) => !invite.isExpired)
-                  .toList()
-                ..sort((a, b) => b.createdAt.compareTo(a.createdAt)),
-        )
-        .expand((invites) => invites);
+        .eq('status', 'ringing')
+        .gt('expires_at', DateTime.now().toUtc().toIso8601String())
+        .order('created_at');
+
+    return List<Map<String, dynamic>>.from(
+      rows,
+    ).map(_inviteFromRow).where((invite) => !invite.isExpired).toList();
   }
 
   @override
