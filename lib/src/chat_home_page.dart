@@ -2445,16 +2445,6 @@ class _ConversationPane extends StatelessWidget {
                 onPressed: onStartVideoCall,
                 icon: const Icon(Icons.videocam_outlined),
               ),
-              IconButton(
-                tooltip: 'Profile',
-                onPressed: onOpenProfile,
-                icon: const Icon(Icons.account_circle_outlined),
-              ),
-              IconButton(
-                tooltip: 'Sign out',
-                onPressed: onSignOut,
-                icon: const Icon(Icons.logout),
-              ),
             ],
           ),
         ),
