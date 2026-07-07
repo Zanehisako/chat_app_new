@@ -100,6 +100,19 @@ void main() {
     expect(find.text('Starting a new thread'), findsOneWidget);
   });
 
+  testWidgets('local preview calls explain that sign-in is required', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(const ChatApp());
+
+    await tester.tap(find.text('Design Studio'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('Call'));
+    await tester.pump();
+
+    expect(find.text('Calls require a signed-in direct chat.'), findsOneWidget);
+  });
+
   testWidgets('selects a GIPHY GIF, stages upload, and sends caption', (
     WidgetTester tester,
   ) async {
@@ -233,6 +246,48 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(repository.saveCount, 2);
+  });
+
+  testWidgets('renders call history events inside the conversation', (
+    WidgetTester tester,
+  ) async {
+    final repository = _MessagesChatRepository([
+      ChatMessage(
+        id: 'call-1',
+        threadId: 'conversation-1',
+        senderId: 'peer-1',
+        senderName: 'Zane',
+        body: 'Zane started a video call',
+        createdAt: DateTime(2026, 7, 7, 9, 13),
+        isMine: false,
+        isDelivered: false,
+        isRead: false,
+        messageType: ChatMessageType.call,
+      ),
+      ChatMessage(
+        id: 'call-2',
+        threadId: 'conversation-1',
+        senderId: ChatSeed.localUserId,
+        senderName: 'You',
+        body: 'You ended the call',
+        createdAt: DateTime(2026, 7, 7, 9, 15),
+        isMine: true,
+        isDelivered: false,
+        isRead: false,
+        messageType: ChatMessageType.call,
+      ),
+    ]);
+
+    await tester.pumpWidget(
+      MaterialApp(home: ChatHomePage(repository: repository)),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Old Peer'));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('Zane started a video call'), findsOneWidget);
+    expect(find.textContaining('You ended the call'), findsOneWidget);
   });
 
   testWidgets('renders voice message waveform and downloads audio', (
@@ -458,6 +513,20 @@ void main() {
     expect(voiceMessage.media?.isVoice, isTrue);
     expect(voiceMessage.media?.duration, const Duration(milliseconds: 1234));
     expect(voiceMessage.media?.waveform, [0.1, 0.5, 1.0]);
+
+    final callMessage = ChatMessage.fromSupabase({
+      'id': 'm4',
+      'conversation_id': 'conversation-1',
+      'sender_id': 'user-1',
+      'sender_name': 'Mina',
+      'body': 'Mina started a video call',
+      'created_at': DateTime.utc(2026).toIso8601String(),
+      'message_type': 'call',
+    }, localUserId: 'user-2');
+
+    expect(callMessage.messageType, ChatMessageType.call);
+    expect(callMessage.media, isNull);
+    expect(callMessage.body, 'Mina started a video call');
 
     final textMessage = ChatMessage.fromSupabase({
       'id': 'm2',

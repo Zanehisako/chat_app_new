@@ -94,14 +94,14 @@ alter table public.messages
 alter table public.messages
   drop constraint if exists messages_message_type_check,
   add constraint messages_message_type_check
-  check (message_type in ('text', 'image', 'gif', 'voice'));
+  check (message_type in ('text', 'image', 'gif', 'voice', 'call'));
 
 alter table public.messages
   drop constraint if exists messages_media_payload_check,
   add constraint messages_media_payload_check
   check (
     (
-      message_type = 'text'
+      message_type in ('text', 'call')
       and media_bucket is null
       and media_path is null
       and media_mime_type is null
@@ -482,6 +482,321 @@ begin
       and tablename = 'message_receipts'
   ) then
     alter publication supabase_realtime add table public.message_receipts;
+  end if;
+end $$;
+
+create table if not exists public.call_sessions (
+  id uuid primary key default gen_random_uuid(),
+  conversation_id uuid not null references public.conversations (id) on delete cascade,
+  caller_id uuid not null references auth.users (id) on delete cascade,
+  callee_id uuid not null references auth.users (id) on delete cascade,
+  caller_name text not null default 'Caller',
+  is_video boolean not null default true,
+  status text not null default 'ringing',
+  failure_reason text,
+  ended_by_id uuid references auth.users (id) on delete set null,
+  created_at timestamptz not null default now(),
+  expires_at timestamptz not null,
+  accepted_at timestamptz,
+  ended_at timestamptz,
+  constraint call_sessions_distinct_users_check check (caller_id <> callee_id),
+  constraint call_sessions_status_check check (
+    status in ('ringing', 'accepted', 'ended', 'rejected', 'failed')
+  )
+);
+
+create table if not exists public.call_signal_events (
+  id uuid primary key default gen_random_uuid(),
+  call_id uuid not null references public.call_sessions (id) on delete cascade,
+  sender_id uuid not null references auth.users (id) on delete cascade,
+  event_type text not null,
+  sdp text,
+  sdp_type text,
+  candidate text,
+  sdp_mid text,
+  sdp_m_line_index integer,
+  created_at timestamptz not null default now(),
+  constraint call_signal_events_type_check check (
+    event_type in ('offer', 'answer', 'ice_candidate', 'hangup', 'reject')
+  ),
+  constraint call_signal_events_payload_check check (
+    (
+      event_type in ('offer', 'answer')
+      and sdp is not null
+      and sdp_type in ('offer', 'answer')
+      and candidate is null
+    )
+    or (
+      event_type = 'ice_candidate'
+      and candidate is not null
+      and sdp is null
+      and sdp_type is null
+    )
+    or (
+      event_type in ('hangup', 'reject')
+      and sdp is null
+      and sdp_type is null
+      and candidate is null
+    )
+  )
+);
+
+create index if not exists call_sessions_conversation_created_idx
+  on public.call_sessions (conversation_id, created_at desc);
+
+create index if not exists call_sessions_callee_status_idx
+  on public.call_sessions (callee_id, status, created_at desc);
+
+create index if not exists call_signal_events_call_created_idx
+  on public.call_signal_events (call_id, created_at);
+
+alter table public.call_sessions enable row level security;
+alter table public.call_signal_events enable row level security;
+
+alter table public.messages
+  drop constraint if exists messages_message_type_check,
+  add constraint messages_message_type_check
+  check (message_type in ('text', 'image', 'gif', 'voice', 'call'));
+
+alter table public.messages
+  drop constraint if exists messages_media_payload_check,
+  add constraint messages_media_payload_check
+  check (
+    (
+      message_type in ('text', 'call')
+      and media_bucket is null
+      and media_path is null
+      and media_mime_type is null
+      and media_size_bytes is null
+      and media_width is null
+      and media_height is null
+      and media_duration_ms is null
+      and media_waveform is null
+    )
+    or (
+      message_type in ('image', 'gif')
+      and media_bucket = 'chat-media'
+      and media_path is not null
+      and media_mime_type like 'image/%'
+      and media_size_bytes between 1 and 15728640
+      and media_duration_ms is null
+      and media_waveform is null
+    )
+    or (
+      message_type = 'voice'
+      and media_bucket = 'chat-media'
+      and media_path is not null
+      and media_mime_type like 'audio/%'
+      and media_size_bytes between 1 and 15728640
+      and (media_duration_ms is null or media_duration_ms between 0 and 3600000)
+      and (media_waveform is null or jsonb_typeof(media_waveform) = 'array')
+    )
+  );
+
+create or replace function public.log_call_started_message()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  insert into public.messages (
+    conversation_id,
+    sender_id,
+    sender_name,
+    body,
+    message_type,
+    created_at
+  )
+  values (
+    new.conversation_id,
+    new.caller_id,
+    new.caller_name,
+    new.caller_name || ' started a ' ||
+      case when new.is_video then 'video call' else 'voice call' end,
+    'call',
+    new.created_at
+  );
+
+  return new;
+end;
+$$;
+
+drop trigger if exists on_call_session_started_message on public.call_sessions;
+create trigger on_call_session_started_message
+  after insert on public.call_sessions
+  for each row execute function public.log_call_started_message();
+
+create or replace function public.log_call_finished_message()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  actor_id uuid;
+  actor_name text;
+  event_body text;
+begin
+  if old.status in ('ended', 'rejected', 'failed')
+      or new.status not in ('ended', 'rejected', 'failed') then
+    return new;
+  end if;
+
+  actor_id := coalesce(new.ended_by_id, new.caller_id);
+
+  select profiles.display_name
+  into actor_name
+  from public.profiles
+  where profiles.id = actor_id;
+
+  actor_name := coalesce(nullif(actor_name, ''), new.caller_name, 'Someone');
+
+  event_body := case new.status
+    when 'rejected' then actor_name || ' declined the call'
+    when 'failed' then 'Call failed'
+    else actor_name || ' ended the call'
+  end;
+
+  insert into public.messages (
+    conversation_id,
+    sender_id,
+    sender_name,
+    body,
+    message_type,
+    created_at
+  )
+  values (
+    new.conversation_id,
+    actor_id,
+    actor_name,
+    event_body,
+    'call',
+    coalesce(new.ended_at, now())
+  );
+
+  return new;
+end;
+$$;
+
+drop trigger if exists on_call_session_finished_message on public.call_sessions;
+create trigger on_call_session_finished_message
+  after update of status on public.call_sessions
+  for each row execute function public.log_call_finished_message();
+
+drop policy if exists "Conversation members can read call sessions"
+  on public.call_sessions;
+create policy "Conversation members can read call sessions"
+  on public.call_sessions
+  for select
+  to authenticated
+  using (
+    exists (
+      select 1
+      from public.conversations
+      where conversations.id = call_sessions.conversation_id
+        and auth.uid() in (conversations.user_one_id, conversations.user_two_id)
+    )
+  );
+
+drop policy if exists "Conversation members can create call sessions"
+  on public.call_sessions;
+create policy "Conversation members can create call sessions"
+  on public.call_sessions
+  for insert
+  to authenticated
+  with check (
+    caller_id = auth.uid()
+    and status = 'ringing'
+    and exists (
+      select 1
+      from public.conversations
+      where conversations.id = call_sessions.conversation_id
+        and caller_id in (conversations.user_one_id, conversations.user_two_id)
+        and callee_id in (conversations.user_one_id, conversations.user_two_id)
+    )
+  );
+
+drop policy if exists "Conversation members can update own call sessions"
+  on public.call_sessions;
+create policy "Conversation members can update own call sessions"
+  on public.call_sessions
+  for update
+  to authenticated
+  using (
+    auth.uid() in (caller_id, callee_id)
+    and exists (
+      select 1
+      from public.conversations
+      where conversations.id = call_sessions.conversation_id
+        and auth.uid() in (conversations.user_one_id, conversations.user_two_id)
+    )
+  )
+  with check (
+    auth.uid() in (caller_id, callee_id)
+    and exists (
+      select 1
+      from public.conversations
+      where conversations.id = call_sessions.conversation_id
+        and auth.uid() in (conversations.user_one_id, conversations.user_two_id)
+    )
+  );
+
+drop policy if exists "Conversation members can read call signal events"
+  on public.call_signal_events;
+create policy "Conversation members can read call signal events"
+  on public.call_signal_events
+  for select
+  to authenticated
+  using (
+    exists (
+      select 1
+      from public.call_sessions
+      join public.conversations
+        on conversations.id = call_sessions.conversation_id
+      where call_sessions.id = call_signal_events.call_id
+        and auth.uid() in (conversations.user_one_id, conversations.user_two_id)
+    )
+  );
+
+drop policy if exists "Conversation members can create call signal events"
+  on public.call_signal_events;
+create policy "Conversation members can create call signal events"
+  on public.call_signal_events
+  for insert
+  to authenticated
+  with check (
+    sender_id = auth.uid()
+    and exists (
+      select 1
+      from public.call_sessions
+      join public.conversations
+        on conversations.id = call_sessions.conversation_id
+      where call_sessions.id = call_signal_events.call_id
+        and auth.uid() in (conversations.user_one_id, conversations.user_two_id)
+    )
+  );
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_publication_tables
+    where pubname = 'supabase_realtime'
+      and schemaname = 'public'
+      and tablename = 'call_sessions'
+  ) then
+    alter publication supabase_realtime add table public.call_sessions;
+  end if;
+
+  if not exists (
+    select 1
+    from pg_publication_tables
+    where pubname = 'supabase_realtime'
+      and schemaname = 'public'
+      and tablename = 'call_signal_events'
+  ) then
+    alter publication supabase_realtime add table public.call_signal_events;
   end if;
 end $$;
 

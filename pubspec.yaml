@@ -47,6 +47,8 @@ dependencies:
   file_saver: ^0.4.0
   record: ^7.1.1
   just_audio: ^0.10.6
+  realtime_calls:
+    path: packages/realtime_calls
 dev_dependencies:
   flutter_test:
     sdk: flutter

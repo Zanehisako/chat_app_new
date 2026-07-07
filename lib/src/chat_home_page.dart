@@ -6,9 +6,11 @@ import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:realtime_calls/realtime_calls.dart';
 import 'package:record/record.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import 'call_signaling.dart';
 import 'chat_models.dart';
 import 'chat_repository.dart';
 import 'profile_page.dart';
@@ -88,11 +90,17 @@ class _ChatHomePageState extends State<ChatHomePage>
   final Map<String, StreamSubscription<TypingState>> _typingSubscriptions = {};
   final Set<String> _profileRefreshesInFlight = {};
   StreamSubscription<Map<String, UserPresence>>? _presenceSubscription;
+  StreamSubscription<CallInvite>? _incomingCallSubscription;
+  StreamSubscription<CallSnapshot?>? _callSnapshotSubscription;
   StreamSubscription<Uint8List>? _voiceDataSubscription;
   StreamSubscription<Amplitude>? _voiceAmplitudeSubscription;
   Completer<void>? _voiceStreamDone;
+  CallClient? _callClient;
+  CallInvite? _incomingCallInvite;
+  CallSnapshot? _callSnapshot;
   Timer? _typingStopTimer;
   Timer? _voiceRecordingTimer;
+  Timer? _clearEndedCallTimer;
   Object? _activeUploadToken;
   _StagedMediaAttachment? _stagedAttachment;
   DateTime? _voiceRecordingStartedAt;
@@ -113,6 +121,7 @@ class _ChatHomePageState extends State<ChatHomePage>
     WidgetsBinding.instance.addObserver(this);
     _threadsStream = widget.repository.watchThreads();
     _subscribePresence();
+    _configureCalls();
   }
 
   @override
@@ -123,6 +132,7 @@ class _ChatHomePageState extends State<ChatHomePage>
       unawaited(_removeStagedAttachment());
       unawaited(oldWidget.repository.disposeRealtime());
       _presenceSubscription?.cancel();
+      unawaited(_disposeCallClient());
       _cancelTypingSubscriptions();
       _presenceByUser.clear();
       _typingByConversation.clear();
@@ -134,6 +144,7 @@ class _ChatHomePageState extends State<ChatHomePage>
       _profileRefreshesInFlight.clear();
       _activeConversationId = null;
       _subscribePresence();
+      _configureCalls();
     }
   }
 
@@ -149,7 +160,9 @@ class _ChatHomePageState extends State<ChatHomePage>
     unawaited(_disposeVoiceRecorder());
     _typingStopTimer?.cancel();
     _voiceRecordingTimer?.cancel();
+    _clearEndedCallTimer?.cancel();
     _presenceSubscription?.cancel();
+    unawaited(_disposeCallClient());
     _cancelTypingSubscriptions();
     unawaited(widget.repository.disposeRealtime());
     _messageController.dispose();
@@ -180,6 +193,74 @@ class _ChatHomePageState extends State<ChatHomePage>
           ..addAll(presence);
       });
     });
+  }
+
+  void _configureCalls() {
+    final client = widget.repository.client;
+    if (client == null || client.auth.currentUser == null) {
+      return;
+    }
+
+    final callClient = CallClient(
+      signaling: SupabaseCallSignaling(client: client),
+    );
+    _callClient = callClient;
+    _incomingCallSubscription = callClient.watchIncomingInvites().listen(
+      (invite) {
+        if (!mounted || _callSnapshot != null) {
+          return;
+        }
+        setState(() {
+          _incomingCallInvite = invite;
+        });
+      },
+      onError: (_) {
+        if (!mounted) {
+          return;
+        }
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not watch incoming calls.')),
+        );
+      },
+    );
+    _callSnapshotSubscription = callClient.snapshots.listen((snapshot) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _callSnapshot = snapshot;
+        if (snapshot != null) {
+          _incomingCallInvite = null;
+        }
+      });
+
+      if (snapshot?.isTerminal ?? false) {
+        _clearEndedCallTimer?.cancel();
+        _clearEndedCallTimer = Timer(const Duration(milliseconds: 1400), () {
+          if (!mounted || _callSnapshot?.callId != snapshot?.callId) {
+            return;
+          }
+          setState(() {
+            _callSnapshot = null;
+          });
+        });
+      }
+    });
+  }
+
+  Future<void> _disposeCallClient() async {
+    _clearEndedCallTimer?.cancel();
+    final incomingSubscription = _incomingCallSubscription;
+    final snapshotSubscription = _callSnapshotSubscription;
+    final callClient = _callClient;
+    _incomingCallSubscription = null;
+    _callSnapshotSubscription = null;
+    _callClient = null;
+    _incomingCallInvite = null;
+    _callSnapshot = null;
+    await incomingSubscription?.cancel();
+    await snapshotSubscription?.cancel();
+    await callClient?.dispose();
   }
 
   void _syncTypingSubscriptions(List<ChatThread> threads) {
@@ -288,12 +369,30 @@ class _ChatHomePageState extends State<ChatHomePage>
               _scheduleConversationEntryRefresh(selectedThread);
             }
 
-            return Scaffold(
-              body: SafeArea(
-                child: isWide
-                    ? _buildWideLayout(threads, selectedThread)
-                    : _buildCompactLayout(threads, selectedThread),
-              ),
+            return Stack(
+              children: [
+                Scaffold(
+                  body: SafeArea(
+                    child: isWide
+                        ? _buildWideLayout(threads, selectedThread)
+                        : _buildCompactLayout(threads, selectedThread),
+                  ),
+                ),
+                if (_incomingCallInvite case final invite?)
+                  _IncomingCallOverlay(
+                    invite: invite,
+                    onAccept: _acceptIncomingCall,
+                    onReject: _rejectIncomingCall,
+                  ),
+                if (_callSnapshot case final snapshot?)
+                  _ActiveCallOverlay(
+                    snapshot: snapshot,
+                    onToggleMute: () => _toggleCallMute(snapshot),
+                    onToggleCamera: () => _toggleCallCamera(snapshot),
+                    onSwitchCamera: _switchCallCamera,
+                    onHangUp: _hangUpCall,
+                  ),
+              ],
             );
           },
         );
@@ -386,6 +485,8 @@ class _ChatHomePageState extends State<ChatHomePage>
       onRemoveAttachment: _removeStagedAttachment,
       onRetryAttachment: () => _retryStagedAttachment(thread),
       onComposerChanged: (value) => _handleComposerChanged(thread, value),
+      onStartAudioCall: () => _startCall(thread, isVideo: false),
+      onStartVideoCall: () => _startCall(thread, isVideo: true),
       onOpenProfile: _openProfile,
       onSignOut: _requestSignOut,
     );
@@ -611,6 +712,109 @@ class _ChatHomePageState extends State<ChatHomePage>
         const SnackBar(content: Text('Could not sign out. Please try again.')),
       );
     }
+  }
+
+  Future<void> _startCall(ChatThread thread, {required bool isVideo}) async {
+    final callClient = _callClient;
+    final peerUserId = thread.peerUserId;
+    if (callClient == null ||
+        !widget.repository.isConnected ||
+        peerUserId == null ||
+        peerUserId.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Calls require a signed-in direct chat.')),
+      );
+      return;
+    }
+
+    try {
+      await callClient.startCall(
+        conversationId: thread.id,
+        peerUserId: peerUserId,
+        peerName: thread.title,
+        callerName: widget.repository.localSenderName,
+        isVideo: isVideo,
+      );
+    } on CallException catch (error, stackTrace) {
+      _logCallFailure('Call start failed', error, stackTrace);
+      _showCallError('Could not start the call.');
+    } catch (error, stackTrace) {
+      _logCallFailure('Call start failed', error, stackTrace);
+      _showCallError('Could not start the call.');
+    }
+  }
+
+  Future<void> _acceptIncomingCall() async {
+    final invite = _incomingCallInvite;
+    final callClient = _callClient;
+    if (invite == null || callClient == null) {
+      return;
+    }
+
+    setState(() {
+      _incomingCallInvite = null;
+    });
+
+    try {
+      await callClient.acceptInvite(
+        invite: invite,
+        peerName: invite.callerName,
+      );
+    } on CallException catch (error, stackTrace) {
+      _logCallFailure('Call answer failed', error, stackTrace);
+      _showCallError('Could not answer the call.');
+    } catch (error, stackTrace) {
+      _logCallFailure('Call answer failed', error, stackTrace);
+      _showCallError('Could not answer the call.');
+    }
+  }
+
+  Future<void> _rejectIncomingCall() async {
+    final invite = _incomingCallInvite;
+    final callClient = _callClient;
+    if (invite == null || callClient == null) {
+      return;
+    }
+
+    setState(() {
+      _incomingCallInvite = null;
+    });
+    try {
+      await callClient.rejectInvite(invite);
+    } catch (error, stackTrace) {
+      _logCallFailure('Call reject failed', error, stackTrace);
+    }
+  }
+
+  void _toggleCallMute(CallSnapshot snapshot) {
+    unawaited(_callClient?.setMuted(!snapshot.mediaState.isMuted));
+  }
+
+  void _toggleCallCamera(CallSnapshot snapshot) {
+    unawaited(
+      _callClient?.setCameraEnabled(!snapshot.mediaState.isCameraEnabled),
+    );
+  }
+
+  void _switchCallCamera() {
+    unawaited(_callClient?.switchCamera());
+  }
+
+  void _hangUpCall() {
+    unawaited(_callClient?.hangUp());
+  }
+
+  void _showCallError(String message) {
+    if (!mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  void _logCallFailure(String label, Object error, StackTrace stackTrace) {
+    debugPrint('[$label] $error\n$stackTrace');
   }
 
   void _handleComposerChanged(ChatThread thread, String value) {
@@ -2130,6 +2334,8 @@ class _ConversationPane extends StatelessWidget {
     required this.onRemoveAttachment,
     required this.onRetryAttachment,
     required this.onComposerChanged,
+    required this.onStartAudioCall,
+    required this.onStartVideoCall,
     required this.onOpenProfile,
     required this.onSignOut,
   });
@@ -2151,6 +2357,8 @@ class _ConversationPane extends StatelessWidget {
   final Future<void> Function() onRemoveAttachment;
   final VoidCallback onRetryAttachment;
   final ValueChanged<String> onComposerChanged;
+  final VoidCallback onStartAudioCall;
+  final VoidCallback onStartVideoCall;
   final VoidCallback onOpenProfile;
   final VoidCallback onSignOut;
 
@@ -2225,12 +2433,12 @@ class _ConversationPane extends StatelessWidget {
               ),
               IconButton(
                 tooltip: 'Call',
-                onPressed: () {},
+                onPressed: onStartAudioCall,
                 icon: const Icon(Icons.call_outlined),
               ),
               IconButton(
                 tooltip: 'Video',
-                onPressed: () {},
+                onPressed: onStartVideoCall,
                 icon: const Icon(Icons.videocam_outlined),
               ),
               IconButton(
@@ -2295,6 +2503,221 @@ class _ConversationPane extends StatelessWidget {
   }
 }
 
+class _IncomingCallOverlay extends StatelessWidget {
+  const _IncomingCallOverlay({
+    required this.invite,
+    required this.onAccept,
+    required this.onReject,
+  });
+
+  final CallInvite invite;
+  final VoidCallback onAccept;
+  final VoidCallback onReject;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Positioned.fill(
+      child: ColoredBox(
+        color: Colors.black.withValues(alpha: 0.45),
+        child: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 360),
+            child: Card(
+              child: Padding(
+                padding: const EdgeInsets.all(20),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    CircleAvatar(
+                      radius: 34,
+                      backgroundColor: theme.colorScheme.primaryContainer,
+                      child: Icon(
+                        invite.isVideo ? Icons.videocam : Icons.call,
+                        color: theme.colorScheme.onPrimaryContainer,
+                        size: 32,
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    Text(
+                      invite.callerName,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.titleLarge?.copyWith(
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      invite.isVideo ? 'Incoming video call' : 'Incoming call',
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                    const SizedBox(height: 22),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        FilledButton.tonalIcon(
+                          onPressed: onReject,
+                          icon: const Icon(Icons.call_end),
+                          label: const Text('Decline'),
+                        ),
+                        const SizedBox(width: 12),
+                        FilledButton.icon(
+                          onPressed: onAccept,
+                          icon: const Icon(Icons.call),
+                          label: const Text('Answer'),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ActiveCallOverlay extends StatelessWidget {
+  const _ActiveCallOverlay({
+    required this.snapshot,
+    required this.onToggleMute,
+    required this.onToggleCamera,
+    required this.onSwitchCamera,
+    required this.onHangUp,
+  });
+
+  final CallSnapshot snapshot;
+  final VoidCallback onToggleMute;
+  final VoidCallback onToggleCamera;
+  final VoidCallback onSwitchCamera;
+  final VoidCallback onHangUp;
+
+  @override
+  Widget build(BuildContext context) {
+    final isVideo = snapshot.mediaState.isVideoEnabled;
+    return Positioned.fill(
+      child: Material(
+        color: Colors.black,
+        child: Stack(
+          children: [
+            Positioned.fill(
+              child: isVideo
+                  ? CallVideoView(
+                      renderer: snapshot.remoteRenderer,
+                      placeholderIcon: Icons.person,
+                    )
+                  : _AudioCallBackground(snapshot: snapshot),
+            ),
+            Positioned(
+              top: 18,
+              left: 18,
+              right: 18,
+              child: SafeArea(
+                child: Column(
+                  children: [
+                    Text(
+                      snapshot.peerName,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 22,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    CallStatusLabel(snapshot: snapshot),
+                  ],
+                ),
+              ),
+            ),
+            if (isVideo)
+              Positioned(
+                top: 92,
+                right: 18,
+                child: SafeArea(
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(8),
+                    child: SizedBox(
+                      width: 132,
+                      height: 176,
+                      child: CallVideoView(
+                        renderer: snapshot.localRenderer,
+                        mirror: true,
+                        placeholderIcon: Icons.videocam_off,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: 0,
+              child: CallControls(
+                mediaState: snapshot.mediaState,
+                showCameraControls: isVideo,
+                onToggleMute: onToggleMute,
+                onToggleCamera: onToggleCamera,
+                onSwitchCamera: onSwitchCamera,
+                onHangUp: onHangUp,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _AudioCallBackground extends StatelessWidget {
+  const _AudioCallBackground({required this.snapshot});
+
+  final CallSnapshot snapshot;
+
+  @override
+  Widget build(BuildContext context) {
+    final initials = snapshot.peerName
+        .trim()
+        .split(RegExp(r'\s+'))
+        .where((part) => part.isNotEmpty)
+        .map((part) => part.characters.first)
+        .take(2)
+        .join()
+        .toUpperCase();
+
+    return DecoratedBox(
+      decoration: const BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [Color(0xFF071817), Color(0xFF111418), Color(0xFF1B2A2A)],
+        ),
+      ),
+      child: Center(
+        child: CircleAvatar(
+          radius: 58,
+          backgroundColor: Colors.white24,
+          child: Text(
+            initials.isEmpty ? '?' : initials,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 32,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _EmptyMessageList extends StatelessWidget {
   const _EmptyMessageList();
 
@@ -2322,6 +2745,10 @@ class _MessageBubble extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    if (message.messageType == ChatMessageType.call) {
+      return _CallEventBubble(message: message);
+    }
+
     final isMine = message.isMine;
     final media = message.media;
     final hasText = message.body.trim().isNotEmpty;
@@ -2413,6 +2840,59 @@ class _MessageBubble extends StatelessWidget {
                           ),
                         ],
                       ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _CallEventBubble extends StatelessWidget {
+  const _CallEventBubble({required this.message});
+
+  final ChatMessage message;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final text = message.body.trim().isEmpty ? 'Call updated' : message.body;
+
+    return Align(
+      alignment: Alignment.center,
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 420),
+        child: Padding(
+          padding: const EdgeInsets.only(bottom: 12),
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: theme.colorScheme.surfaceContainerHighest,
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.call_outlined,
+                    size: 16,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                  const SizedBox(width: 8),
+                  Flexible(
+                    child: Text(
+                      '$text · ${_formatTime(message.createdAt)}',
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.labelLarge?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                        fontWeight: FontWeight.w700,
+                      ),
                     ),
                   ),
                 ],

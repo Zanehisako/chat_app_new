@@ -48,3 +48,39 @@ deep-link settings.
 Email/password, phone SMS OTP, forgot-password links, password recovery, Google
 OAuth, direct user search, and sign out are handled in the app. Realtime
 messages are only sent after Supabase has an authenticated user session.
+
+## Audio/video calls
+
+Calls are foreground, in-app 1:1 audio/video sessions in direct conversations.
+The app uses the local reusable package at `packages/realtime_calls`, with
+Supabase carrying only call signaling. Audio/video media flows through WebRTC.
+
+Apply the call migration with the same Supabase workflow:
+
+```sh
+npx supabase db push
+```
+
+Deploy the TURN credential Edge Function:
+
+```sh
+npx supabase functions deploy turn-credentials
+npx supabase secrets set \
+  TURN_SECRET=your-shared-turn-rest-secret \
+  TURN_URLS=turn:turn.example.com:3478?transport=udp,turn:turn.example.com:3478?transport=tcp
+```
+
+For local testing without deploying the function, pass direct self-hosted TURN
+values:
+
+```sh
+flutter run \
+  --dart-define=CALL_TURN_URLS=turn:turn.example.com:3478?transport=udp \
+  --dart-define=CALL_TURN_USERNAME=username \
+  --dart-define=CALL_TURN_CREDENTIAL=password
+```
+
+If TURN credentials are missing, the app falls back to public STUN by default
+for local connectivity checks. Use
+`--dart-define=CALL_ALLOW_PUBLIC_STUN_FALLBACK=false` to require TURN.
+Production internet calls should use TURN.

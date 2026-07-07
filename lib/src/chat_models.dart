@@ -249,7 +249,8 @@ enum ChatMessageType {
   text('text'),
   image('image'),
   gif('gif'),
-  voice('voice');
+  voice('voice'),
+  call('call');
 
   const ChatMessageType(this.value);
 
@@ -477,7 +478,7 @@ class ChatMessage {
       isMine: isMine,
       isDelivered: isDelivered,
       isRead: isRead,
-      messageType: media == null ? ChatMessageType.text : messageType,
+      messageType: messageType,
       media: media,
     );
   }

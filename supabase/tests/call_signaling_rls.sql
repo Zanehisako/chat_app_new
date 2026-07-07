@@ -1,0 +1,7 @@
+-- Run with `supabase test db` in a linked/local Supabase project.
+-- This file documents the critical RLS scenarios for call signaling:
+-- 1. conversation members can create/read call_sessions rows for their direct chat.
+-- 2. non-members cannot read or write call_sessions.
+-- 3. conversation members can insert/read call_signal_events for their calls.
+-- 4. signal senders must match auth.uid().
+-- 5. WebRTC media never belongs in Supabase rows; only SDP and ICE payloads do.
