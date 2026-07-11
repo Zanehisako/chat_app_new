@@ -9,13 +9,412 @@ import 'package:chat_app/src/auth_service.dart';
 import 'package:chat_app/src/chat_home_page.dart';
 import 'package:chat_app/src/chat_models.dart';
 import 'package:chat_app/src/chat_repository.dart';
+import 'package:chat_app/src/offline_outbox_media_store.dart';
+import 'package:chat_app/src/outbox_message_sender.dart';
+import 'package:chat_app/src/outbox_database.dart';
+import 'package:chat_app/src/offline_outbox_service.dart';
+import 'package:chat_app/src/notification_registration.dart';
+import 'package:chat_app/src/notification_service.dart';
+import 'package:drift/drift.dart' show driftRuntimeOptions;
+import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 void main() {
+  driftRuntimeOptions.dontWarnAboutMultipleDatabases = true;
+  test('outbox persists queued media for later local rendering', () async {
+    SharedPreferences.setMockInitialValues({});
+    final mediaStore = _TestOutboxMediaStore();
+    final database = _testOutboxDatabase();
+    final outbox = OfflineOutboxService(
+      database: database,
+      mediaStore: mediaStore,
+    );
+    await outbox.initialize();
+
+    final queued = await outbox.enqueue(
+      conversationId: 'conversation-1',
+      senderId: ChatSeed.localUserId,
+      senderName: 'You',
+      body: 'queued caption',
+      pickedMedia: PickedChatMedia(
+        bytes: _transparentGif,
+        originalName: 'queued.gif',
+        mimeType: 'image/gif',
+        sizeBytes: _transparentGif.length,
+        width: 1,
+        height: 1,
+      ),
+    );
+
+    expect(outbox.items.single.id, queued.id);
+    expect(outbox.items.single.status, OutboxSendStatus.pending);
+
+    final localMessages = await outbox.localMessages();
+    expect(localMessages.single.id, queued.id);
+    expect(localMessages.single.sendState, ChatMessageSendState.pending);
+    expect(localMessages.single.media?.localBytes, _transparentGif);
+
+    final reloaded = OfflineOutboxService(
+      database: database,
+      mediaStore: mediaStore,
+    );
+    await reloaded.initialize();
+    expect(reloaded.items.single.id, queued.id);
+
+    await outbox.dispose();
+    await reloaded.dispose();
+    await database.close();
+  });
+
+  test('outbox retryNow makes a failed item pending again', () async {
+    final failed = OutboxMessage(
+      id: 'failed-message',
+      conversationId: 'conversation-1',
+      senderId: ChatSeed.localUserId,
+      senderName: 'You',
+      body: 'try again',
+      createdAt: DateTime(2026, 7, 8),
+      status: OutboxSendStatus.failed,
+      attemptCount: 8,
+      lastError: 'network failed',
+    );
+    SharedPreferences.setMockInitialValues({
+      'chat_app.outbox.messages': jsonEncode([failed.toJson()]),
+    });
+
+    final database = _testOutboxDatabase();
+    final outbox = OfflineOutboxService(
+      database: database,
+      mediaStore: _TestOutboxMediaStore(),
+    );
+    await outbox.initialize();
+    await outbox.retryNow('failed-message');
+
+    expect(outbox.items.single.status, OutboxSendStatus.pending);
+    expect(outbox.items.single.lastError, isNull);
+    await outbox.dispose();
+    await database.close();
+  });
+
+  test('outbox isolates queued messages by backend and account', () async {
+    SharedPreferences.setMockInitialValues({});
+    final database = _testOutboxDatabase();
+    final firstScope = const OutboxScope(
+      backendOrigin: 'https://project-a.supabase.co',
+      userId: 'account-a',
+    );
+    final secondScope = const OutboxScope(
+      backendOrigin: 'https://project-a.supabase.co',
+      userId: 'account-b',
+    );
+    final firstOutbox = OfflineOutboxService(
+      database: database,
+      scope: firstScope,
+      mediaStore: _TestOutboxMediaStore(),
+    );
+    final secondOutbox = OfflineOutboxService(
+      database: database,
+      scope: secondScope,
+      mediaStore: _TestOutboxMediaStore(),
+    );
+
+    await firstOutbox.enqueue(
+      conversationId: 'conversation-1',
+      senderId: 'account-a',
+      senderName: 'Account A',
+      body: 'private queued message',
+    );
+    await secondOutbox.initialize();
+
+    expect(secondOutbox.items, isEmpty);
+    await firstOutbox.dispose();
+    await secondOutbox.dispose();
+    await database.close();
+  });
+
+  test(
+    'outbox persists uploaded media before retrying the message insert',
+    () async {
+      SharedPreferences.setMockInitialValues({});
+      final database = _testOutboxDatabase();
+      final outbox = OfflineOutboxService(
+        database: database,
+        mediaStore: _TestOutboxMediaStore(),
+      );
+      final sender = _TestOutboxSender(failMediaSendAfterUpload: true);
+      final item = await outbox.enqueue(
+        conversationId: 'conversation-1',
+        senderId: ChatSeed.localUserId,
+        senderName: 'You',
+        body: 'photo',
+        pickedMedia: PickedChatMedia(
+          bytes: _transparentGif,
+          originalName: 'photo.gif',
+          mimeType: 'image/gif',
+          sizeBytes: _transparentGif.length,
+        ),
+      );
+
+      await outbox.flush(sender);
+      expect(outbox.items.single.media?.isRemote, isTrue);
+      expect(sender.uploadedMessageIds, [item.id]);
+
+      sender.failMediaSendAfterUpload = false;
+      await outbox.flush(sender, ignoreBackoff: true);
+      expect(sender.uploadedMessageIds, [item.id]);
+      expect(outbox.items, isEmpty);
+      await outbox.dispose();
+      await database.close();
+    },
+  );
+
+  test('outbox schedules the earliest retry after an online failure', () async {
+    SharedPreferences.setMockInitialValues({});
+    final database = _testOutboxDatabase();
+    Duration? scheduledDelay;
+    final outbox = OfflineOutboxService(
+      database: database,
+      mediaStore: _TestOutboxMediaStore(),
+      timerFactory: (duration, _) {
+        scheduledDelay = duration;
+        return _NoopTimer();
+      },
+    );
+    final sender = _TestOutboxSender(shouldFail: true);
+    await outbox.enqueue(
+      conversationId: 'conversation-1',
+      senderId: ChatSeed.localUserId,
+      senderName: 'You',
+      body: 'retry me',
+    );
+    await outbox.flush(sender);
+
+    expect(scheduledDelay, isNotNull);
+    expect(scheduledDelay!, greaterThan(Duration.zero));
+    expect(scheduledDelay!, lessThanOrEqualTo(const Duration(seconds: 2)));
+    await outbox.dispose();
+    await database.close();
+  });
+
+  test('outbox disposal waits for an active send to finish', () async {
+    SharedPreferences.setMockInitialValues({});
+    final database = _testOutboxDatabase();
+    final outbox = OfflineOutboxService(
+      database: database,
+      mediaStore: _TestOutboxMediaStore(),
+    );
+    final sender = _BlockingOutboxSender();
+    await outbox.enqueue(
+      conversationId: 'conversation-1',
+      senderId: ChatSeed.localUserId,
+      senderName: 'You',
+      body: 'finish before close',
+    );
+
+    final flushing = outbox.flush(sender);
+    await sender.started.future;
+    final disposing = outbox.dispose();
+    sender.release();
+
+    await Future.wait([flushing, disposing]);
+    expect(sender.sentTextMessageIds, hasLength(1));
+    await database.close();
+  });
+
+  test(
+    'outbox uploads media, sends once, and removes durable media on success',
+    () async {
+      SharedPreferences.setMockInitialValues({});
+      final mediaStore = _TestOutboxMediaStore();
+      final database = _testOutboxDatabase();
+      final outbox = OfflineOutboxService(
+        database: database,
+        mediaStore: mediaStore,
+      );
+      final sender = _TestOutboxSender();
+      final item = await outbox.enqueue(
+        conversationId: 'conversation-1',
+        senderId: ChatSeed.localUserId,
+        senderName: 'You',
+        body: 'photo',
+        pickedMedia: PickedChatMedia(
+          bytes: _transparentGif,
+          originalName: 'photo.gif',
+          mimeType: 'image/gif',
+          sizeBytes: _transparentGif.length,
+          width: 1,
+          height: 1,
+        ),
+      );
+      await outbox.flush(sender);
+
+      expect(sender.uploadedMessageIds, [item.id]);
+      expect(sender.sentMediaMessageIds, [item.id]);
+      expect(outbox.items, isEmpty);
+      expect(await database.select(database.outboxEntries).get(), isEmpty);
+      await outbox.dispose();
+      await database.close();
+    },
+  );
+
+  test(
+    'outbox preserves stable ids, skips later retries, and sends due items first',
+    () async {
+      final future = OutboxMessage(
+        id: 'later',
+        conversationId: 'conversation-1',
+        senderId: ChatSeed.localUserId,
+        senderName: 'You',
+        body: 'later',
+        createdAt: DateTime(2026, 7, 8),
+        status: OutboxSendStatus.pending,
+        attemptCount: 0,
+        nextAttemptAt: DateTime.now().add(const Duration(hours: 1)),
+      );
+      final due = OutboxMessage(
+        id: 'due-now',
+        conversationId: 'conversation-1',
+        senderId: ChatSeed.localUserId,
+        senderName: 'You',
+        body: 'due',
+        createdAt: DateTime(2026, 7, 8),
+        status: OutboxSendStatus.pending,
+        attemptCount: 0,
+      );
+      SharedPreferences.setMockInitialValues({
+        'chat_app.outbox.messages': jsonEncode([future.toJson(), due.toJson()]),
+      });
+      final database = _testOutboxDatabase();
+      final outbox = OfflineOutboxService(
+        database: database,
+        mediaStore: _TestOutboxMediaStore(),
+      );
+      final sender = _TestOutboxSender(existingMessageIds: {'already-sent'});
+      await outbox.initialize();
+      await outbox.enqueue(
+        conversationId: 'conversation-1',
+        senderId: ChatSeed.localUserId,
+        senderName: 'You',
+        body: 'first',
+        uploadedMedia: UploadedChatMedia(
+          messageId: 'already-sent',
+          media: const ChatMedia(
+            bucket: ChatRepository.mediaBucket,
+            path: 'conversation-1/me/already-sent.gif',
+            mimeType: 'image/gif',
+            sizeBytes: 1,
+          ),
+        ),
+      );
+
+      final duplicate = await outbox.enqueue(
+        conversationId: 'conversation-1',
+        senderId: ChatSeed.localUserId,
+        senderName: 'You',
+        body: 'duplicate',
+        uploadedMedia: UploadedChatMedia(
+          messageId: 'already-sent',
+          media: const ChatMedia(
+            bucket: ChatRepository.mediaBucket,
+            path: 'conversation-1/me/already-sent.gif',
+            mimeType: 'image/gif',
+            sizeBytes: 1,
+          ),
+        ),
+      );
+
+      await outbox.flush(sender);
+
+      expect(duplicate.id, 'already-sent');
+      expect(sender.sentTextMessageIds, ['due-now']);
+      expect(outbox.items.map((item) => item.id), ['later']);
+      await outbox.dispose();
+      await database.close();
+    },
+  );
+
+  test(
+    'outbox retries a failed send and allows a terminal item to be retried',
+    () async {
+      SharedPreferences.setMockInitialValues({});
+      final database = _testOutboxDatabase();
+      final outbox = OfflineOutboxService(
+        database: database,
+        mediaStore: _TestOutboxMediaStore(),
+      );
+      final sender = _TestOutboxSender(shouldFail: true);
+      final item = await outbox.enqueue(
+        conversationId: 'conversation-1',
+        senderId: ChatSeed.localUserId,
+        senderName: 'You',
+        body: 'retry me',
+      );
+
+      for (var attempt = 0; attempt < 8; attempt += 1) {
+        await outbox.flush(sender, ignoreBackoff: true);
+      }
+
+      expect(outbox.items.single.status, OutboxSendStatus.failed);
+      expect(outbox.items.single.attemptCount, 8);
+
+      sender.shouldFail = false;
+      await outbox.retryNow(item.id);
+      await outbox.flush(sender);
+
+      expect(outbox.items, isEmpty);
+      await outbox.dispose();
+      await database.close();
+    },
+  );
+
+  testWidgets('renders pending, sending, sent, and failed outbox states', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(1200, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+    const states = [
+      (ChatMessageSendState.pending, Key('message-status-pending')),
+      (ChatMessageSendState.sending, Key('message-status-sending')),
+      (ChatMessageSendState.sent, Key('message-status-sent')),
+      (ChatMessageSendState.failed, Key('message-status-failed')),
+    ];
+
+    for (final entry in states) {
+      final message = ChatMessage(
+        id: 'state-${entry.$1.name}',
+        threadId: 'conversation-1',
+        senderId: ChatSeed.localUserId,
+        senderName: 'You',
+        body: entry.$1.name,
+        createdAt: DateTime.now(),
+        isMine: true,
+        isDelivered: false,
+        isRead: false,
+        sendState: entry.$1,
+      );
+      await tester.pumpWidget(
+        MaterialApp(
+          home: ChatHomePage(repository: _MessagesChatRepository([message])),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.byKey(entry.$2), findsOneWidget);
+      if (entry.$1 == ChatMessageSendState.failed) {
+        expect(find.byTooltip('Retry message'), findsOneWidget);
+      }
+    }
+  });
+
   testWidgets('renders local preview chat without auth and sends message', (
     WidgetTester tester,
   ) async {
@@ -363,6 +762,62 @@ void main() {
 
     expect(find.text('Mina Clarke'), findsWidgets);
     expect(find.text('Profile updated.'), findsOneWidget);
+  });
+
+  testWidgets('profile reports every notification registration state', (
+    WidgetTester tester,
+  ) async {
+    final notifications = NotificationService.instance;
+    notifications.registrationStatus.value =
+        const NotificationRegistrationStatus.disabled();
+    await tester.pumpWidget(const ChatApp());
+    await tester.tap(find.byTooltip('Profile'));
+    await tester.pumpAndSettle();
+
+    const states = <NotificationRegistrationState, String>{
+      NotificationRegistrationState.disabled: 'Off',
+      NotificationRegistrationState.enabling: 'Enabling...',
+      NotificationRegistrationState.enabled: 'On',
+      NotificationRegistrationState.denied: 'Blocked in device settings',
+      NotificationRegistrationState.unsupported: 'Unavailable on this device',
+      NotificationRegistrationState.failed: 'Registration failed',
+    };
+    for (final entry in states.entries) {
+      notifications.registrationStatus.value = NotificationRegistrationStatus(
+        entry.key,
+      );
+      await tester.pump();
+      expect(find.text(entry.value), findsOneWidget);
+    }
+
+    notifications.registrationStatus.value =
+        const NotificationRegistrationStatus.disabled();
+  });
+
+  testWidgets('repository replacement reuses one outbox database', (
+    WidgetTester tester,
+  ) async {
+    final database = _testOutboxDatabase();
+    final first = _ScopedOutboxRepository('user-one');
+    final second = _ScopedOutboxRepository('user-two');
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ChatHomePage(repository: first, outboxDatabase: database),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ChatHomePage(repository: second, outboxDatabase: database),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pumpAndSettle();
+    await database.close();
   });
 
   testWidgets('refreshes peer profile when opening a conversation', (
@@ -720,6 +1175,10 @@ void main() {
   });
 }
 
+OutboxDatabase _testOutboxDatabase() {
+  return OutboxDatabase.forTesting(NativeDatabase.memory());
+}
+
 Widget _wrapAuthPage() {
   return MaterialApp(home: AuthPage(authService: _FakeAuthService()));
 }
@@ -949,12 +1408,14 @@ class _MediaChatRepository extends _MessagesChatRepository {
     required String conversationId,
     required PickedChatMedia pickedMedia,
     required void Function(double progress) onProgress,
+    String? messageId,
+    bool upsert = false,
   }) async {
     onProgress(0.42);
     await Future<void>.delayed(const Duration(milliseconds: 20));
     onProgress(1);
     return UploadedChatMedia(
-      messageId: 'media-message-1',
+      messageId: messageId ?? 'media-message-1',
       media: ChatMedia(
         bucket: ChatRepository.mediaBucket,
         path: '$conversationId/user-1/media-message-1.gif',
@@ -978,6 +1439,155 @@ class _MediaChatRepository extends _MessagesChatRepository {
   }) async {
     sentBody = body;
     sentMedia = media;
+  }
+}
+
+class _TestOutboxMediaStore implements OutboxMediaStore {
+  final Map<String, Uint8List> _mediaByRef = {};
+
+  @override
+  Future<String> saveMedia({
+    required String messageId,
+    required Uint8List bytes,
+    required String extension,
+  }) async {
+    final ref = 'test:$messageId$extension';
+    _mediaByRef[ref] = Uint8List.fromList(bytes);
+    return ref;
+  }
+
+  @override
+  Future<Uint8List> readMedia(String storageRef) async {
+    return _mediaByRef[storageRef] ?? Uint8List(0);
+  }
+
+  @override
+  Future<void> deleteMedia(String storageRef) async {
+    _mediaByRef.remove(storageRef);
+  }
+}
+
+class _TestOutboxSender implements OutboxMessageSender {
+  _TestOutboxSender({
+    this.shouldFail = false,
+    this.failMediaSendAfterUpload = false,
+    Set<String>? existingMessageIds,
+  }) : _existingMessageIds = existingMessageIds ?? {};
+
+  final Set<String> _existingMessageIds;
+  final List<String> uploadedMessageIds = [];
+  final List<String> sentTextMessageIds = [];
+  final List<String> sentMediaMessageIds = [];
+  bool shouldFail;
+  bool failMediaSendAfterUpload;
+
+  @override
+  bool get isOutboxReady => true;
+
+  @override
+  Future<bool> messageExists(String messageId) async {
+    return _existingMessageIds.contains(messageId);
+  }
+
+  @override
+  Future<UploadedChatMedia> uploadMediaAttachment({
+    required String conversationId,
+    required PickedChatMedia pickedMedia,
+    required void Function(double progress) onProgress,
+    String? messageId,
+    bool upsert = false,
+  }) async {
+    _throwIfConfigured();
+    final resolvedMessageId = messageId!;
+    uploadedMessageIds.add(resolvedMessageId);
+    onProgress(1);
+    return UploadedChatMedia(
+      messageId: resolvedMessageId,
+      media: ChatMedia(
+        bucket: ChatRepository.mediaBucket,
+        path: '$conversationId/me/$resolvedMessageId.gif',
+        mimeType: pickedMedia.mimeType,
+        sizeBytes: pickedMedia.sizeBytes,
+        width: pickedMedia.width,
+        height: pickedMedia.height,
+        duration: pickedMedia.duration,
+        waveform: pickedMedia.waveform,
+        originalName: pickedMedia.originalName,
+      ),
+    );
+  }
+
+  @override
+  Future<void> sendMessage({
+    required String conversationId,
+    required String body,
+    String? messageId,
+  }) async {
+    _throwIfConfigured();
+    sentTextMessageIds.add(messageId!);
+  }
+
+  @override
+  Future<void> sendMediaMessage({
+    required String conversationId,
+    required String messageId,
+    required String body,
+    required ChatMedia media,
+  }) async {
+    _throwIfConfigured();
+    if (failMediaSendAfterUpload) {
+      throw StateError('message insert failed');
+    }
+    sentMediaMessageIds.add(messageId);
+  }
+
+  void _throwIfConfigured() {
+    if (shouldFail) {
+      throw StateError('network unavailable');
+    }
+  }
+}
+
+class _BlockingOutboxSender extends _TestOutboxSender {
+  final Completer<void> started = Completer<void>();
+  final Completer<void> _release = Completer<void>();
+
+  void release() {
+    if (!_release.isCompleted) {
+      _release.complete();
+    }
+  }
+
+  @override
+  Future<void> sendMessage({
+    required String conversationId,
+    required String body,
+    String? messageId,
+  }) async {
+    if (!started.isCompleted) {
+      started.complete();
+    }
+    await _release.future;
+    await super.sendMessage(
+      conversationId: conversationId,
+      body: body,
+      messageId: messageId,
+    );
+  }
+}
+
+class _NoopTimer implements Timer {
+  bool _isActive = true;
+
+  @override
+  bool get isActive => _isActive;
+
+  @override
+  int get tick => 0;
+
+  @override
+  void cancel() {
+    _isActive = false;
   }
 }
 
@@ -1019,6 +1629,36 @@ class _RefreshingChatRepository extends ChatRepository {
   Stream<List<ChatMessage>> watchMessages(String conversationId) {
     return Stream.value(const []);
   }
+
+  @override
+  Future<void> updateLastSeen() async {}
+
+  @override
+  Future<void> disposeRealtime() async {}
+}
+
+class _ScopedOutboxRepository extends ChatRepository {
+  _ScopedOutboxRepository(this.userId);
+
+  final String userId;
+
+  @override
+  bool get isOutboxReady => true;
+
+  @override
+  String? get outboxUserId => userId;
+
+  @override
+  String? get outboxBackendOrigin => 'https://project.supabase.co';
+
+  @override
+  String get localUserId => userId;
+
+  @override
+  String get localSenderName => 'Test User';
+
+  @override
+  Future<bool> messageExists(String messageId) async => false;
 
   @override
   Future<void> updateLastSeen() async {}

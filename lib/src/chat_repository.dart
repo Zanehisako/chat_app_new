@@ -14,8 +14,10 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:uuid/uuid.dart';
 
 import 'chat_models.dart';
+import 'outbox_message_sender.dart';
+import 'supabase_config.dart';
 
-class ChatRepository {
+class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
   ChatRepository({this.client});
 
   static const mediaBucket = 'chat-media';
@@ -57,6 +59,23 @@ class ChatRepository {
   final Map<String, bool> _typingValues = {};
 
   bool get isConnected => client != null;
+
+  @override
+  bool get isOutboxReady => client?.auth.currentUser != null;
+
+  @override
+  String? get outboxUserId => client?.auth.currentUser?.id;
+
+  @override
+  String? get outboxBackendOrigin {
+    if (client == null) {
+      return null;
+    }
+    final uri = Uri.tryParse(SupabaseConfig.url);
+    return uri?.hasScheme == true && uri?.host.isNotEmpty == true
+        ? uri!.origin.toLowerCase()
+        : null;
+  }
 
   List<ChatThread> get threads => ChatSeed.threads;
 
@@ -755,10 +774,13 @@ class ChatRepository {
     );
   }
 
+  @override
   Future<UploadedChatMedia> uploadMediaAttachment({
     required String conversationId,
     required PickedChatMedia pickedMedia,
     required void Function(double progress) onProgress,
+    String? messageId,
+    bool upsert = false,
   }) async {
     final supabase = client;
     if (supabase == null) {
@@ -774,9 +796,9 @@ class ChatRepository {
       throw const AuthException('Sign in before sending media.');
     }
 
-    final messageId = _uuid.v4();
+    final resolvedMessageId = messageId ?? _uuid.v4();
     final objectPath =
-        '$conversationId/${user.id}/$messageId${_extensionFor(pickedMedia)}';
+        '$conversationId/${user.id}/$resolvedMessageId${_extensionFor(pickedMedia)}';
     final storage = supabase.storage.from(mediaBucket);
     final uploadUri = _chatMediaUploadUri(
       storageUrl: storage.url,
@@ -794,12 +816,13 @@ class ChatRepository {
       fileName: pickedMedia.originalName,
       mimeType: pickedMedia.mimeType,
       onProgress: onProgress,
+      upsert: upsert,
     );
 
     onProgress(1);
 
     return UploadedChatMedia(
-      messageId: messageId,
+      messageId: resolvedMessageId,
       media: ChatMedia(
         bucket: mediaBucket,
         path: objectPath,
@@ -831,6 +854,7 @@ class ChatRepository {
     required String mimeType,
     required void Function(double progress) onProgress,
     http.Client? httpClient,
+    bool upsert = false,
   }) {
     return _uploadBytesWithProgress(
       uri: uri,
@@ -840,6 +864,7 @@ class ChatRepository {
       mimeType: mimeType,
       onProgress: onProgress,
       httpClient: httpClient,
+      upsert: upsert,
     );
   }
 
@@ -1011,9 +1036,71 @@ class ChatRepository {
     return controller.stream;
   }
 
+  Stream<ChatMessage> watchIncomingMessages() {
+    final supabase = client;
+    final user = supabase?.auth.currentUser;
+    if (supabase == null || user == null) {
+      return const Stream.empty();
+    }
+
+    late final RealtimeChannel channel;
+    final controller = StreamController<ChatMessage>();
+    controller.onListen = () {
+      channel = supabase
+          .channel('incoming-messages-${user.id}-${_uuid.v4()}')
+          .onPostgresChanges(
+            event: PostgresChangeEvent.insert,
+            schema: 'public',
+            table: 'messages',
+            callback: (payload) {
+              try {
+                final message = ChatMessage.fromSupabase(
+                  payload.newRecord,
+                  localUserId: user.id,
+                );
+                if (!message.isMine && !controller.isClosed) {
+                  controller.add(message);
+                }
+              } catch (error, stackTrace) {
+                if (!controller.isClosed) {
+                  controller.addError(error, stackTrace);
+                }
+              }
+            },
+          );
+      channel.subscribe((status, error) {
+        if (status == RealtimeSubscribeStatus.channelError &&
+            !controller.isClosed) {
+          controller.addError(error ?? StateError('Incoming message watch failed.'));
+        }
+      });
+    };
+    controller.onCancel = () async {
+      await channel.unsubscribe();
+    };
+    return controller.stream;
+  }
+
+  @override
+  Future<bool> messageExists(String messageId) async {
+    final supabase = client;
+    if (supabase == null || messageId.isEmpty) {
+      return false;
+    }
+
+    final row = await supabase
+        .from('messages')
+        .select('id')
+        .eq('id', messageId)
+        .maybeSingle();
+    return row != null;
+  }
+
+  @override
   Future<void> sendMessage({
     required String conversationId,
     required String body,
+    String? messageId,
   }) async {
     final trimmed = body.trim();
     final supabase = client;
@@ -1026,14 +1113,19 @@ class ChatRepository {
       throw const AuthException('Sign in before sending messages.');
     }
 
-    await supabase.from('messages').insert({
+    final row = <String, dynamic>{
       'conversation_id': conversationId,
       'sender_id': user.id,
       'sender_name': localSenderName,
       'body': trimmed,
-    });
+    };
+    if (messageId != null) {
+      row['id'] = messageId;
+    }
+    await supabase.from('messages').insert(row);
   }
 
+  @override
   Future<void> sendMediaMessage({
     required String conversationId,
     required String messageId,
@@ -1505,12 +1597,13 @@ Future<void> _uploadBytesWithProgress({
   required String mimeType,
   required void Function(double progress) onProgress,
   http.Client? httpClient,
+  bool upsert = false,
 }) async {
   onProgress(0);
 
   final request = http.MultipartRequest('POST', uri)
     ..headers.addAll(headers)
-    ..headers['x-upsert'] = 'false'
+    ..headers['x-upsert'] = upsert ? 'true' : 'false'
     ..fields['cacheControl'] = ChatRepository._mediaCacheControl
     ..files.add(
       http.MultipartFile(

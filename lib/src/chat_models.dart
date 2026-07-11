@@ -277,6 +277,8 @@ enum ChatMessageType {
   }
 }
 
+enum ChatMessageSendState { sent, pending, sending, failed }
+
 enum ChatMediaSource { gallery, camera, giphy }
 
 class GiphyGif {
@@ -431,6 +433,8 @@ class ChatMessage {
     required this.isRead,
     this.messageType = ChatMessageType.text,
     this.media,
+    this.sendState = ChatMessageSendState.sent,
+    this.sendError,
   });
 
   final String id;
@@ -444,6 +448,8 @@ class ChatMessage {
   final bool isRead;
   final ChatMessageType messageType;
   final ChatMedia? media;
+  final ChatMessageSendState sendState;
+  final String? sendError;
 
   bool get hasMedia => media != null && messageType != ChatMessageType.text;
 

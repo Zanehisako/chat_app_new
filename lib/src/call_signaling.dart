@@ -110,8 +110,12 @@ class SupabaseCallSignaling implements CallSignaling {
     final userId = localUserId;
     late final StreamController<CallInvite> controller;
     StreamSubscription<List<Map<String, dynamic>>>? realtimeSubscription;
+    Timer? realtimeRetryTimer;
     Timer? pollingTimer;
     var isFetching = false;
+    var isClosing = false;
+    var realtimeAttempt = 0;
+    var pollFailureCount = 0;
     final emittedInviteIds = <String>{};
 
     void emitInvites(List<CallInvite> invites) {
@@ -133,24 +137,60 @@ class SupabaseCallSignaling implements CallSignaling {
       isFetching = true;
       try {
         emitInvites(await _fetchIncomingInvites(userId));
-      } catch (error, stackTrace) {
-        debugPrint('[Incoming call poll failed] $error\n$stackTrace');
-        if (!controller.isClosed) {
-          controller.addError(error, stackTrace);
+        if (pollFailureCount > 0) {
+          debugPrint('[Incoming calls] Polling connection recovered.');
         }
+        pollFailureCount = 0;
+      } catch (error) {
+        if (pollFailureCount == 0) {
+          debugPrint(
+            '[Incoming calls] Polling unavailable '
+            '(${error.runtimeType}); retrying.',
+          );
+        }
+        pollFailureCount += 1;
       } finally {
         isFetching = false;
       }
     }
 
-    controller = StreamController<CallInvite>(
-      onListen: () {
-        realtimeSubscription = client
+    late void Function() startRealtime;
+
+    void scheduleRealtimeRetry(Object? error) {
+      if (isClosing || controller.isClosed || realtimeRetryTimer != null) {
+        return;
+      }
+      final delaySeconds = realtimeAttempt < 5 ? 1 << realtimeAttempt : 30;
+      realtimeAttempt += 1;
+      final errorLabel = error == null ? 'closed' : error.runtimeType;
+      debugPrint(
+        '[Incoming calls] Realtime $errorLabel; retrying in '
+        '${delaySeconds}s while polling remains active.',
+      );
+      realtimeRetryTimer = Timer(Duration(seconds: delaySeconds), () {
+        realtimeRetryTimer = null;
+        startRealtime();
+      });
+    }
+
+    startRealtime = () {
+      if (isClosing || controller.isClosed || realtimeSubscription != null) {
+        return;
+      }
+      try {
+        late final StreamSubscription<List<Map<String, dynamic>>> subscription;
+        subscription = client
             .from('call_sessions')
             .stream(primaryKey: ['id'])
             .eq('callee_id', userId)
             .listen(
               (rows) {
+                if (realtimeAttempt > 0) {
+                  debugPrint(
+                    '[Incoming calls] Realtime subscription recovered.',
+                  );
+                }
+                realtimeAttempt = 0;
                 emitInvites(
                   rows
                       .where((row) => row['status']?.toString() == 'ringing')
@@ -159,15 +199,30 @@ class SupabaseCallSignaling implements CallSignaling {
                       .toList(),
                 );
               },
-              onError: (Object error, StackTrace stackTrace) {
-                debugPrint(
-                  '[Incoming call realtime failed] $error\n$stackTrace',
-                );
-                if (!controller.isClosed) {
-                  controller.addError(error, stackTrace);
+              onError: (Object error, StackTrace _) {
+                if (identical(realtimeSubscription, subscription)) {
+                  realtimeSubscription = null;
                 }
+                scheduleRealtimeRetry(error);
               },
+              onDone: () {
+                if (identical(realtimeSubscription, subscription)) {
+                  realtimeSubscription = null;
+                }
+                scheduleRealtimeRetry(null);
+              },
+              cancelOnError: true,
             );
+        realtimeSubscription = subscription;
+      } catch (error) {
+        realtimeSubscription = null;
+        scheduleRealtimeRetry(error);
+      }
+    };
+
+    controller = StreamController<CallInvite>(
+      onListen: () {
+        startRealtime();
         unawaited(fetchInvites());
         pollingTimer = Timer.periodic(
           const Duration(seconds: 2),
@@ -175,8 +230,11 @@ class SupabaseCallSignaling implements CallSignaling {
         );
       },
       onCancel: () async {
+        isClosing = true;
+        realtimeRetryTimer?.cancel();
         pollingTimer?.cancel();
         await realtimeSubscription?.cancel();
+        realtimeSubscription = null;
       },
     );
 

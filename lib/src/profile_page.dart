@@ -1,7 +1,13 @@
+import 'dart:async';
+
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'chat_models.dart';
 import 'chat_repository.dart';
+import 'notification_registration.dart';
+import 'notification_service.dart';
 
 class ProfilePage extends StatefulWidget {
   const ProfilePage({super.key, required this.repository});
@@ -13,6 +19,8 @@ class ProfilePage extends StatefulWidget {
 }
 
 class _ProfilePageState extends State<ProfilePage> {
+  static const _settingsChannel = MethodChannel('chat_app/settings');
+
   final _formKey = GlobalKey<FormState>();
   final _displayNameController = TextEditingController();
   final _emailController = TextEditingController();
@@ -22,15 +30,26 @@ class _ProfilePageState extends State<ProfilePage> {
   CurrentUserProfile? _profile;
   bool _didFillForm = false;
   bool _isSaving = false;
+  NotificationRegistrationStatus _notificationStatus =
+      const NotificationRegistrationStatus.disabled();
 
   @override
   void initState() {
     super.initState();
     _profileFuture = _loadProfile();
+    final notifications = NotificationService.instance;
+    _notificationStatus = notifications.registrationStatus.value;
+    notifications.registrationStatus.addListener(_handleNotificationStatus);
+    unawaited(
+      notifications.refreshRegistration(client: widget.repository.client),
+    );
   }
 
   @override
   void dispose() {
+    NotificationService.instance.registrationStatus.removeListener(
+      _handleNotificationStatus,
+    );
     _displayNameController.dispose();
     _emailController.dispose();
     _phoneController.dispose();
@@ -67,6 +86,9 @@ class _ProfilePageState extends State<ProfilePage> {
               emailController: _emailController,
               phoneController: _phoneController,
               isSaving: _isSaving,
+              notificationStatus: _notificationStatus,
+              notificationsAvailable: widget.repository.client != null,
+              onNotificationsChanged: _setNotificationsEnabled,
               onSave: _saveProfile,
             );
           },
@@ -142,6 +164,77 @@ class _ProfilePageState extends State<ProfilePage> {
       }
     }
   }
+
+  void _handleNotificationStatus() {
+    if (!mounted) return;
+    setState(() {
+      _notificationStatus =
+          NotificationService.instance.registrationStatus.value;
+    });
+  }
+
+  Future<void> _setNotificationsEnabled(bool enabled) async {
+    final client = widget.repository.client;
+    if (client == null || _notificationStatus.isBusy) return;
+    if (enabled &&
+        _notificationStatus.state == NotificationRegistrationState.denied) {
+      await _openNotificationSettings();
+      return;
+    }
+    if (enabled) {
+      await NotificationService.instance.enableNotifications(client: client);
+    } else {
+      await NotificationService.instance.disableNotifications(client: client);
+    }
+    if (!mounted) return;
+    final status = NotificationService.instance.registrationStatus.value;
+    final message = status.message;
+    if (message != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(message),
+          action:
+              status.state == NotificationRegistrationState.denied && !kIsWeb
+              ? SnackBarAction(
+                  label: 'Settings',
+                  onPressed: () => unawaited(_openNotificationSettings()),
+                )
+              : null,
+        ),
+      );
+    }
+  }
+
+  Future<void> _openNotificationSettings() async {
+    if (kIsWeb) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Allow notifications for this site in browser settings.',
+          ),
+        ),
+      );
+      return;
+    }
+    if (defaultTargetPlatform != TargetPlatform.android) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Open this app in system notification settings.'),
+        ),
+      );
+      return;
+    }
+    try {
+      await _settingsChannel.invokeMethod<void>('openNotificationSettings');
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not open notification settings.')),
+      );
+    }
+  }
 }
 
 class _ProfileForm extends StatelessWidget {
@@ -152,6 +245,9 @@ class _ProfileForm extends StatelessWidget {
     required this.emailController,
     required this.phoneController,
     required this.isSaving,
+    required this.notificationStatus,
+    required this.notificationsAvailable,
+    required this.onNotificationsChanged,
     required this.onSave,
   });
 
@@ -161,6 +257,9 @@ class _ProfileForm extends StatelessWidget {
   final TextEditingController emailController;
   final TextEditingController phoneController;
   final bool isSaving;
+  final NotificationRegistrationStatus notificationStatus;
+  final bool notificationsAvailable;
+  final ValueChanged<bool> onNotificationsChanged;
   final VoidCallback onSave;
 
   @override
@@ -262,6 +361,22 @@ class _ProfileForm extends StatelessWidget {
                   ),
                   onFieldSubmitted: (_) => onSave(),
                 ),
+                const SizedBox(height: 12),
+                SwitchListTile.adaptive(
+                  key: const Key('profile-notifications-toggle'),
+                  contentPadding: const EdgeInsets.symmetric(horizontal: 4),
+                  secondary: const Icon(Icons.notifications_outlined),
+                  title: const Text('Notifications'),
+                  subtitle: Text(_notificationStatusLabel(notificationStatus)),
+                  value: notificationStatus.isEnabled,
+                  onChanged:
+                      !notificationsAvailable ||
+                          notificationStatus.isBusy ||
+                          notificationStatus.state ==
+                              NotificationRegistrationState.unsupported
+                      ? null
+                      : onNotificationsChanged,
+                ),
                 const SizedBox(height: 22),
                 FilledButton.icon(
                   key: const Key('profile-save'),
@@ -282,6 +397,17 @@ class _ProfileForm extends StatelessWidget {
       ),
     );
   }
+}
+
+String _notificationStatusLabel(NotificationRegistrationStatus status) {
+  return switch (status.state) {
+    NotificationRegistrationState.disabled => 'Off',
+    NotificationRegistrationState.enabling => 'Enabling...',
+    NotificationRegistrationState.enabled => 'On',
+    NotificationRegistrationState.denied => 'Blocked in device settings',
+    NotificationRegistrationState.unsupported => 'Unavailable on this device',
+    NotificationRegistrationState.failed => 'Registration failed',
+  };
 }
 
 class _ProfileAvatar extends StatelessWidget {

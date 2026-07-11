@@ -36,6 +36,9 @@ migrate_working_dir/
 # Supabase local CLI metadata
 supabase/.temp/
 
+# Firebase Hosting deployment cache
+.firebase/
+
 # Symbolication related
 app.*.symbols
 

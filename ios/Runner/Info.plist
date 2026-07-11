@@ -45,6 +45,10 @@
 	<string>Chat App uses the microphone for audio calls, video calls, and voice messages.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Chat App uses your photo library so you can choose photos to send in conversations.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>remote-notification</string>
+	</array>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

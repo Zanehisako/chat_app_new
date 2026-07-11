@@ -1,0 +1,4 @@
+project_id = "chat_app"
+
+[functions.notification-dispatch]
+verify_jwt = false

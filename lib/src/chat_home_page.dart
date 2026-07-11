@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:math' as math;
 
 import 'package:camera/camera.dart' as camera;
@@ -12,15 +13,25 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'call_signaling.dart';
 import 'chat_models.dart';
+import 'connectivity_service.dart';
 import 'chat_repository.dart';
+import 'notification_service.dart';
+import 'offline_outbox_service.dart';
+import 'outbox_database.dart';
 import 'profile_page.dart';
 import 'voice_recording_file.dart';
 
 class ChatHomePage extends StatefulWidget {
-  const ChatHomePage({super.key, required this.repository, this.onSignOut});
+  const ChatHomePage({
+    super.key,
+    required this.repository,
+    this.onSignOut,
+    @visibleForTesting this.outboxDatabase,
+  });
 
   final ChatRepository repository;
   final Future<void> Function()? onSignOut;
+  final OutboxDatabase? outboxDatabase;
 
   @override
   State<ChatHomePage> createState() => _ChatHomePageState();
@@ -89,6 +100,18 @@ class _ChatHomePageState extends State<ChatHomePage>
   final Map<String, TypingState> _typingByConversation = {};
   final Map<String, StreamSubscription<TypingState>> _typingSubscriptions = {};
   final Set<String> _profileRefreshesInFlight = {};
+  final Set<String> _knownIncomingMessageIds = {};
+  final Queue<String> _knownIncomingMessageOrder = Queue<String>();
+  OfflineOutboxService? _outboxService;
+  ConnectivityService? _connectivityService;
+  OutboxDatabase? _outboxDatabase;
+  late final bool _ownsOutboxDatabase;
+  Future<OfflineOutboxService?>? _outboxSetup;
+  Future<void>? _outboxTransition;
+  int _outboxGeneration = 0;
+  StreamSubscription<List<OutboxMessage>>? _outboxSubscription;
+  StreamSubscription<ChatMessage>? _incomingMessageSubscription;
+  StreamSubscription<NotificationRoute>? _notificationRouteSubscription;
   StreamSubscription<Map<String, UserPresence>>? _presenceSubscription;
   StreamSubscription<CallInvite>? _incomingCallSubscription;
   StreamSubscription<CallSnapshot?>? _callSnapshotSubscription;
@@ -103,25 +126,32 @@ class _ChatHomePageState extends State<ChatHomePage>
   Timer? _clearEndedCallTimer;
   Object? _activeUploadToken;
   _StagedMediaAttachment? _stagedAttachment;
+  List<ChatMessage> _outboxMessages = [];
   DateTime? _voiceRecordingStartedAt;
   String? _voiceRecordingFilePath;
   String? _activeTypingConversationId;
   String? _activeConversationId;
+  String? _pendingNotificationConversationId;
   String _query = '';
   bool _isSending = false;
   bool _isRecordingVoice = false;
   bool _isVoiceRecordingFileBacked = false;
   bool _isCompactConversationOpen = false;
   bool _isTearingDown = false;
+  static const _maxKnownIncomingMessageIds = 256;
   Duration _voiceRecordingElapsed = Duration.zero;
 
   @override
   void initState() {
     super.initState();
+    _outboxDatabase = widget.outboxDatabase;
+    _ownsOutboxDatabase = widget.outboxDatabase == null;
     WidgetsBinding.instance.addObserver(this);
     _threadsStream = widget.repository.watchThreads();
     _subscribePresence();
     _configureCalls();
+    unawaited(_ensureOfflineOutbox());
+    _configureNotifications();
   }
 
   @override
@@ -137,14 +167,20 @@ class _ChatHomePageState extends State<ChatHomePage>
       _presenceByUser.clear();
       _typingByConversation.clear();
       _threadsStream = widget.repository.watchThreads();
+      _outboxMessages = [];
       _selectedThread = null;
       _startedThreads.clear();
       _refreshedThreads.clear();
       _profileOverridesByUser.clear();
       _profileRefreshesInFlight.clear();
+      _knownIncomingMessageIds.clear();
+      _knownIncomingMessageOrder.clear();
       _activeConversationId = null;
       _subscribePresence();
       _configureCalls();
+      _scheduleOutboxReconfiguration();
+      _disposeNotifications();
+      _configureNotifications();
     }
   }
 
@@ -162,6 +198,14 @@ class _ChatHomePageState extends State<ChatHomePage>
     _voiceRecordingTimer?.cancel();
     _clearEndedCallTimer?.cancel();
     _presenceSubscription?.cancel();
+    _outboxGeneration += 1;
+    final outboxDatabase = _outboxDatabase;
+    _outboxDatabase = null;
+    final outboxShutdown = _disposeOfflineOutbox();
+    if (outboxDatabase != null && _ownsOutboxDatabase) {
+      unawaited(outboxShutdown.whenComplete(outboxDatabase.close));
+    }
+    _disposeNotifications();
     unawaited(_disposeCallClient());
     _cancelTypingSubscriptions();
     unawaited(widget.repository.disposeRealtime());
@@ -172,6 +216,14 @@ class _ChatHomePageState extends State<ChatHomePage>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      unawaited(_flushOutbox(ignoreBackoff: true));
+      unawaited(
+        NotificationService.instance.refreshRegistration(
+          client: widget.repository.client,
+        ),
+      );
+    }
     if (state == AppLifecycleState.inactive ||
         state == AppLifecycleState.paused ||
         state == AppLifecycleState.detached) {
@@ -249,6 +301,226 @@ class _ChatHomePageState extends State<ChatHomePage>
           });
         });
       }
+    });
+  }
+
+  Future<OfflineOutboxService?> _ensureOfflineOutbox() async {
+    while (_outboxTransition != null) {
+      await _outboxTransition;
+    }
+    final ownerId = widget.repository.outboxUserId;
+    final backendOrigin = widget.repository.outboxBackendOrigin;
+    if (ownerId == null || backendOrigin == null) {
+      return null;
+    }
+    final existing = _outboxService;
+    if (existing != null &&
+        existing.scope.userId == ownerId &&
+        existing.scope.backendOrigin == backendOrigin) {
+      return existing;
+    }
+    final activeSetup = _outboxSetup;
+    if (activeSetup != null) return activeSetup;
+
+    final setup = _createOfflineOutbox(
+      ownerId: ownerId,
+      backendOrigin: backendOrigin,
+    );
+    _outboxSetup = setup;
+    try {
+      return await setup;
+    } finally {
+      if (identical(_outboxSetup, setup)) _outboxSetup = null;
+    }
+  }
+
+  Future<OfflineOutboxService?> _createOfflineOutbox({
+    required String ownerId,
+    required String backendOrigin,
+  }) async {
+    final outbox = OfflineOutboxService(
+      scope: OutboxScope(backendOrigin: backendOrigin, userId: ownerId),
+      database: _outboxDatabase ??= OutboxDatabase(),
+    );
+    final connectivity = ConnectivityService();
+    _outboxService = outbox;
+    _connectivityService = connectivity;
+    _outboxSubscription = outbox.stream.listen((_) {
+      unawaited(_refreshOutboxMessages(outbox));
+    });
+
+    await outbox.start(widget.repository);
+    if (!mounted || _isTearingDown || _outboxService != outbox) {
+      await connectivity.dispose();
+      await outbox.dispose();
+      return null;
+    }
+    await _refreshOutboxMessages(outbox);
+    await connectivity.start(() => _flushOutbox(ignoreBackoff: true));
+    return outbox;
+  }
+
+  void _scheduleOutboxReconfiguration() {
+    final generation = ++_outboxGeneration;
+    final transition = _reconfigureOfflineOutbox(generation);
+    _outboxTransition = transition;
+    unawaited(
+      transition.whenComplete(() {
+        if (identical(_outboxTransition, transition)) {
+          _outboxTransition = null;
+        }
+      }),
+    );
+  }
+
+  Future<void> _reconfigureOfflineOutbox(int generation) async {
+    await _disposeOfflineOutbox();
+    if (!mounted || _isTearingDown || generation != _outboxGeneration) return;
+    final ownerId = widget.repository.outboxUserId;
+    final backendOrigin = widget.repository.outboxBackendOrigin;
+    if (ownerId == null || backendOrigin == null) return;
+    await _createOfflineOutbox(ownerId: ownerId, backendOrigin: backendOrigin);
+  }
+
+  Future<void> _disposeOfflineOutbox() async {
+    final subscription = _outboxSubscription;
+    final connectivity = _connectivityService;
+    final outbox = _outboxService;
+    _outboxSubscription = null;
+    _connectivityService = null;
+    _outboxService = null;
+    await subscription?.cancel();
+    await connectivity?.dispose();
+    await outbox?.dispose();
+  }
+
+  Future<void> _refreshOutboxMessages(OfflineOutboxService outbox) async {
+    final messages = await outbox.localMessages();
+    if (!mounted || _outboxService != outbox) {
+      return;
+    }
+    setState(() {
+      _outboxMessages = messages;
+    });
+  }
+
+  Future<void> _flushOutbox({bool ignoreBackoff = false}) async {
+    final outbox = _outboxService;
+    if (outbox == null) {
+      return;
+    }
+    await outbox.flushNow(ignoreBackoff: ignoreBackoff);
+    await _refreshOutboxMessages(outbox);
+  }
+
+  Future<void> _retryOutboxMessage(String messageId) async {
+    final outbox = _outboxService;
+    if (outbox == null) {
+      return;
+    }
+    await outbox.retryNow(messageId);
+    await _refreshOutboxMessages(outbox);
+  }
+
+  void _configureNotifications() {
+    final notifications = NotificationService.instance;
+    _notificationRouteSubscription = notifications.routes.listen(
+      _handleNotificationRoute,
+    );
+    final pendingRoute = notifications.takePendingRoute();
+    if (pendingRoute != null) {
+      scheduleMicrotask(() => _handleNotificationRoute(pendingRoute));
+    }
+
+    if (widget.repository.client == null ||
+        !notifications.showsAppRunningNotificationsOnly) {
+      return;
+    }
+    _incomingMessageSubscription = widget.repository
+        .watchIncomingMessages()
+        .listen(
+          _handleIncomingMessage,
+          onError: (Object error, StackTrace stackTrace) {
+            debugPrint('[Notifications] Incoming message watch failed: $error');
+          },
+        );
+  }
+
+  void _disposeNotifications() {
+    final incomingMessages = _incomingMessageSubscription;
+    final notificationRoutes = _notificationRouteSubscription;
+    _incomingMessageSubscription = null;
+    _notificationRouteSubscription = null;
+    unawaited(incomingMessages?.cancel());
+    unawaited(notificationRoutes?.cancel());
+  }
+
+  void _handleIncomingMessage(ChatMessage message) {
+    if (!_knownIncomingMessageIds.add(message.id)) {
+      return;
+    }
+    _knownIncomingMessageOrder.addLast(message.id);
+    if (_knownIncomingMessageOrder.length > _maxKnownIncomingMessageIds) {
+      _knownIncomingMessageIds.remove(_knownIncomingMessageOrder.removeFirst());
+    }
+    unawaited(
+      NotificationService.instance.showAppRunningMessage(
+        title: message.senderName,
+        body: _notificationPreview(message),
+        conversationId: message.threadId,
+        messageId: message.id,
+      ),
+    );
+  }
+
+  String _notificationPreview(ChatMessage message) {
+    final body = message.body.trim();
+    if (body.isNotEmpty) {
+      return body.length <= 180 ? body : '${body.substring(0, 180)}...';
+    }
+    return switch (message.messageType) {
+      ChatMessageType.image => 'Sent a photo',
+      ChatMessageType.gif => 'Sent a GIF',
+      ChatMessageType.voice => 'Sent a voice message',
+      ChatMessageType.call => 'Call updated',
+      ChatMessageType.text => 'Sent a message',
+    };
+  }
+
+  void _handleNotificationRoute(NotificationRoute route) {
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _pendingNotificationConversationId = route.conversationId;
+      _isCompactConversationOpen = true;
+    });
+  }
+
+  void _scheduleNotificationRouteResolution(List<ChatThread> threads) {
+    final conversationId = _pendingNotificationConversationId;
+    if (conversationId == null) {
+      return;
+    }
+    ChatThread? thread;
+    for (final candidate in threads) {
+      if (candidate.id == conversationId) {
+        thread = candidate;
+        break;
+      }
+    }
+    if (thread == null) {
+      return;
+    }
+    _pendingNotificationConversationId = null;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _selectedThread = thread;
+        _isCompactConversationOpen = true;
+      });
     });
   }
 
@@ -363,6 +635,7 @@ class _ChatHomePageState extends State<ChatHomePage>
         final threads = _threadsWithActivity(
           _mergeThreads(snapshot.data ?? const []),
         );
+        _scheduleNotificationRouteResolution(threads);
         _syncTypingSubscriptions(threads);
         final selectedThread = _selectedThreadFor(threads);
 
@@ -470,9 +743,10 @@ class _ChatHomePageState extends State<ChatHomePage>
       key: ValueKey(thread.id),
       thread: thread,
       repository: widget.repository,
-      localMessages: _localMessages
-          .where((message) => message.threadId == thread.id)
-          .toList(),
+      localMessages: [
+        ..._localMessages,
+        ..._outboxMessages,
+      ].where((message) => message.threadId == thread.id).toList(),
       stagedAttachment: _stagedAttachment?.conversationId == thread.id
           ? _stagedAttachment
           : null,
@@ -488,6 +762,7 @@ class _ChatHomePageState extends State<ChatHomePage>
       onToggleVoiceRecording: () => _toggleVoiceRecording(thread),
       onRemoveAttachment: _removeStagedAttachment,
       onRetryAttachment: () => _retryStagedAttachment(thread),
+      onRetryOutboxMessage: _retryOutboxMessage,
       onComposerChanged: (value) => _handleComposerChanged(thread, value),
       onStartAudioCall: () => _startCall(thread, isVideo: false),
       onStartVideoCall: () => _startCall(thread, isVideo: true),
@@ -1365,11 +1640,23 @@ class _ChatHomePageState extends State<ChatHomePage>
         ? _stagedAttachment
         : null;
     final uploadedMedia = stagedAttachment?.uploadedMedia;
+    final hasSupabaseClient = widget.repository.client != null;
+    final hasQueuedAttachment = stagedAttachment != null;
 
     if (_isSending ||
         stagedAttachment?.isUploading == true ||
-        stagedAttachment?.status == _AttachmentUploadState.failed ||
-        (text.isEmpty && uploadedMedia == null)) {
+        (!hasSupabaseClient &&
+            stagedAttachment?.status == _AttachmentUploadState.failed) ||
+        (text.isEmpty && uploadedMedia == null && !hasQueuedAttachment)) {
+      return;
+    }
+
+    if (hasSupabaseClient) {
+      await _queueAndFlushMessage(
+        selectedThread: selectedThread,
+        text: text,
+        stagedAttachment: stagedAttachment,
+      );
       return;
     }
 
@@ -1439,6 +1726,59 @@ class _ChatHomePageState extends State<ChatHomePage>
           ),
         );
       }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isSending = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _queueAndFlushMessage({
+    required ChatThread selectedThread,
+    required String text,
+    required _StagedMediaAttachment? stagedAttachment,
+  }) async {
+    final activeOutbox = await _ensureOfflineOutbox();
+    if (activeOutbox == null) {
+      throw StateError('The signed-in account is not ready to queue messages.');
+    }
+
+    setState(() {
+      _isSending = true;
+    });
+
+    try {
+      await activeOutbox.initialize();
+      await _stopTyping();
+      await activeOutbox.enqueue(
+        conversationId: selectedThread.id,
+        senderId: widget.repository.localUserId,
+        senderName: widget.repository.localSenderName,
+        body: text,
+        pickedMedia: stagedAttachment?.uploadedMedia == null
+            ? stagedAttachment?.pickedMedia
+            : null,
+        uploadedMedia: stagedAttachment?.uploadedMedia,
+      );
+      if (mounted) {
+        setState(() {
+          _messageController.clear();
+          _stagedAttachment = null;
+        });
+        FocusScope.of(context).unfocus();
+      }
+      await _refreshOutboxMessages(activeOutbox);
+      await _flushOutbox();
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      _messageController.text = text;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Message not queued: ${_shortError(error)}')),
+      );
     } finally {
       if (mounted) {
         setState(() {
@@ -2337,6 +2677,7 @@ class _ConversationPane extends StatelessWidget {
     required this.onToggleVoiceRecording,
     required this.onRemoveAttachment,
     required this.onRetryAttachment,
+    required this.onRetryOutboxMessage,
     required this.onComposerChanged,
     required this.onStartAudioCall,
     required this.onStartVideoCall,
@@ -2360,6 +2701,7 @@ class _ConversationPane extends StatelessWidget {
   final VoidCallback onToggleVoiceRecording;
   final Future<void> Function() onRemoveAttachment;
   final VoidCallback onRetryAttachment;
+  final Future<void> Function(String messageId) onRetryOutboxMessage;
   final ValueChanged<String> onComposerChanged;
   final VoidCallback onStartAudioCall;
   final VoidCallback onStartVideoCall;
@@ -2452,9 +2794,16 @@ class _ConversationPane extends StatelessWidget {
           child: StreamBuilder<List<ChatMessage>>(
             stream: repository.watchMessages(thread.id),
             builder: (context, snapshot) {
+              final remoteMessages =
+                  snapshot.data ?? ChatSeed.messagesFor(thread.id);
+              final remoteIds = remoteMessages
+                  .map((message) => message.id)
+                  .toSet();
               final messages = [
-                ...(snapshot.data ?? ChatSeed.messagesFor(thread.id)),
-                ...localMessages,
+                ...remoteMessages,
+                ...localMessages.where(
+                  (message) => !remoteIds.contains(message.id),
+                ),
               ]..sort((a, b) => a.createdAt.compareTo(b.createdAt));
 
               if (repository.isConnected && messages.isNotEmpty) {
@@ -2472,6 +2821,7 @@ class _ConversationPane extends StatelessWidget {
                   return _MessageBubble(
                     message: messages[index],
                     repository: repository,
+                    onRetry: () => onRetryOutboxMessage(messages[index].id),
                   );
                 },
               );
@@ -2731,10 +3081,15 @@ class _EmptyMessageList extends StatelessWidget {
 }
 
 class _MessageBubble extends StatelessWidget {
-  const _MessageBubble({required this.message, required this.repository});
+  const _MessageBubble({
+    required this.message,
+    required this.repository,
+    required this.onRetry,
+  });
 
   final ChatMessage message;
   final ChatRepository repository;
+  final Future<void> Function() onRetry;
 
   @override
   Widget build(BuildContext context) {
@@ -2831,6 +3186,7 @@ class _MessageBubble extends StatelessWidget {
                           _ReceiptIcon(
                             message: message,
                             fallbackColor: textColor.withValues(alpha: 0.72),
+                            onRetry: onRetry,
                           ),
                         ],
                       ],
@@ -3634,13 +3990,50 @@ class _MediaViewerPage extends StatelessWidget {
 }
 
 class _ReceiptIcon extends StatelessWidget {
-  const _ReceiptIcon({required this.message, required this.fallbackColor});
+  const _ReceiptIcon({
+    required this.message,
+    required this.fallbackColor,
+    required this.onRetry,
+  });
 
   final ChatMessage message;
   final Color fallbackColor;
+  final Future<void> Function() onRetry;
 
   @override
   Widget build(BuildContext context) {
+    if (message.sendState == ChatMessageSendState.failed) {
+      return IconButton(
+        tooltip: message.sendError == null || message.sendError!.isEmpty
+            ? 'Retry message'
+            : 'Retry message: ${message.sendError}',
+        key: const Key('message-status-failed'),
+        visualDensity: VisualDensity.compact,
+        padding: EdgeInsets.zero,
+        constraints: const BoxConstraints.tightFor(width: 22, height: 22),
+        onPressed: () => unawaited(onRetry()),
+        icon: Icon(Icons.error_outline, size: 15, color: fallbackColor),
+      );
+    }
+
+    if (message.sendState == ChatMessageSendState.sending) {
+      return Icon(
+        Icons.sync,
+        key: const Key('message-status-sending'),
+        size: 15,
+        color: fallbackColor,
+      );
+    }
+
+    if (message.sendState == ChatMessageSendState.pending) {
+      return Icon(
+        Icons.schedule,
+        key: const Key('message-status-pending'),
+        size: 15,
+        color: fallbackColor,
+      );
+    }
+
     if (message.isRead) {
       return const Icon(
         Icons.done_all,

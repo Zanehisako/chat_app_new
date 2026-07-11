@@ -11,6 +11,7 @@ add_executable(${BINARY_NAME} WIN32
   "main.cpp"
   "utils.cpp"
   "win32_window.cpp"
+  "windows_push_channel.cpp"
   "${FLUTTER_MANAGED_DIR}/generated_plugin_registrant.cc"
   "Runner.rc"
   "runner.exe.manifest"
@@ -35,6 +36,44 @@ target_compile_definitions(${BINARY_NAME} PRIVATE "NOMINMAX")
 target_link_libraries(${BINARY_NAME} PRIVATE flutter flutter_wrapper_app)
 target_link_libraries(${BINARY_NAME} PRIVATE "dwmapi.lib")
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
+
+option(CHAT_APP_ENABLE_WNS "Enable Windows App SDK WNS registration" OFF)
+if(DEFINED ENV{CHAT_APP_ENABLE_WNS} AND "$ENV{CHAT_APP_ENABLE_WNS}" STREQUAL "ON")
+  set(CHAT_APP_ENABLE_WNS ON CACHE BOOL "Enable Windows App SDK WNS registration" FORCE)
+endif()
+set(CHAT_APP_WINDOWS_APP_SDK_ROOT "$ENV{CHAT_APP_WINDOWS_APP_SDK_ROOT}" CACHE PATH
+  "Root of the Microsoft.WindowsAppSDK NuGet package")
+
+if(CHAT_APP_ENABLE_WNS)
+  find_path(CHAT_APP_WINDOWS_APP_SDK_INCLUDE_DIR
+    NAMES winrt/Microsoft.Windows.PushNotifications.h
+    PATHS
+      "${CHAT_APP_WINDOWS_APP_SDK_ROOT}/include"
+      "${CHAT_APP_WINDOWS_APP_SDK_ROOT}/build/native/include")
+  if(NOT CHAT_APP_WINDOWS_APP_SDK_INCLUDE_DIR)
+    message(FATAL_ERROR
+      "CHAT_APP_ENABLE_WNS requires CHAT_APP_WINDOWS_APP_SDK_ROOT with WinAppSDK headers")
+  endif()
+  if(NOT EXISTS "${CHAT_APP_WINDOWS_APP_SDK_INCLUDE_DIR}/winrt/Microsoft.Windows.AppNotifications.h")
+    message(FATAL_ERROR
+      "CHAT_APP_ENABLE_WNS requires Microsoft.Windows.AppNotifications headers")
+  endif()
+  find_library(CHAT_APP_WINDOWS_APP_SDK_BOOTSTRAP_LIB
+    NAMES Microsoft.WindowsAppRuntime.Bootstrap
+    PATHS
+      "${CHAT_APP_WINDOWS_APP_SDK_ROOT}/lib/native/x64"
+      "${CHAT_APP_WINDOWS_APP_SDK_ROOT}/runtimes/win-x64/native"
+      "${CHAT_APP_WINDOWS_APP_SDK_ROOT}/build/native/x64")
+  if(NOT CHAT_APP_WINDOWS_APP_SDK_BOOTSTRAP_LIB)
+    message(FATAL_ERROR
+      "CHAT_APP_ENABLE_WNS requires Microsoft.WindowsAppRuntime.Bootstrap.lib")
+  endif()
+  target_include_directories(${BINARY_NAME} PRIVATE
+    "${CHAT_APP_WINDOWS_APP_SDK_INCLUDE_DIR}")
+  target_link_libraries(${BINARY_NAME} PRIVATE
+    "${CHAT_APP_WINDOWS_APP_SDK_BOOTSTRAP_LIB}")
+  target_compile_definitions(${BINARY_NAME} PRIVATE CHAT_APP_ENABLE_WNS)
+endif()
 
 # Run the Flutter tool portions of the build. This must not be removed.
 add_dependencies(${BINARY_NAME} flutter_assemble)
