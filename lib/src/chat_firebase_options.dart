@@ -37,6 +37,7 @@ class ChatFirebaseOptions {
     defaultValue:
         'BCqbK-8ngYY6rBrLstjbv11kbxm_15_1KyDgCZCrE2Ix5i9RxsEKhi1LnI3j4JCgFug1b3SUh0r-dcnh6PG3pNo',
   );
+  static const webMessagingServiceWorkerPath = '/firebase-messaging-sw.js';
 
   static const _androidApiKey = String.fromEnvironment(
     'FIREBASE_ANDROID_API_KEY',

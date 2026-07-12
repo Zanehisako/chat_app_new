@@ -30,6 +30,22 @@ Deno.test("FCM obtains OAuth token and sends an Android notification", async () 
       if (payload.message.android.notification.channel_id !== "chat_messages") {
         throw new Error("Android notification channel was not included.");
       }
+      if (payload.message.android.ttl !== "86400s") {
+        throw new Error("Android offline delivery lifetime was not included.");
+      }
+      if (
+        payload.message.data.message_type !== undefined ||
+        payload.message.data.from !== undefined ||
+        payload.message.data["google.test"] !== undefined ||
+        payload.message.data.chat_message_type !== "text" ||
+        payload.message.data.metadata !== '{"source":"test"}'
+      ) {
+        throw new Error(
+          `FCM data keys were not sanitized: ${
+            JSON.stringify(payload.message.data)
+          }`,
+        );
+      }
       return Response.json({ name: "projects/chat-app-92f45/messages/1" });
     },
   );
@@ -40,6 +56,42 @@ Deno.test("FCM obtains OAuth token and sends an Android notification", async () 
     requests.length !== 2
   ) {
     throw new Error(`Unexpected Android FCM result: ${JSON.stringify(result)}`);
+  }
+});
+
+Deno.test("FCM sends web notifications with an offline lifetime", async () => {
+  resetPushProviderCachesForTesting();
+  const serviceAccount = await testServiceAccount();
+  const result = await sendFcm(
+    delivery("web"),
+    envFor(serviceAccount),
+    async (input, init) => {
+      if (input.toString() === "https://oauth2.googleapis.com/token") {
+        return Response.json({
+          access_token: "access-token",
+          expires_in: 3600,
+        });
+      }
+      const payload = JSON.parse(String(init?.body));
+      if (
+        payload.message.webpush.headers.TTL !== "86400" ||
+        payload.message.webpush.headers.Urgency !== "high" ||
+        !payload.message.webpush.fcm_options.link.includes(
+          delivery("web").conversation_id,
+        )
+      ) {
+        throw new Error(
+          `Web offline delivery settings are invalid: ${
+            JSON.stringify(payload)
+          }`,
+        );
+      }
+      return Response.json({ name: "projects/chat-app-92f45/messages/web-1" });
+    },
+  );
+
+  if (!result.ok) {
+    throw new Error(`Unexpected web FCM result: ${JSON.stringify(result)}`);
   }
 });
 
@@ -136,7 +188,13 @@ function delivery(platform: "android" | "web"): NotificationDelivery {
     recipient_id: "10000000-0000-0000-0000-000000000006",
     title: "Sender",
     body: "Hello",
-    data: { type: "message" },
+    data: {
+      type: "message",
+      message_type: "text",
+      from: "reserved",
+      "google.test": "reserved",
+      metadata: { source: "test" },
+    },
     attempt_count: 1,
     token_id: "10000000-0000-0000-0000-000000000007",
     provider: "fcm",

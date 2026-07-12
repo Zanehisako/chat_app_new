@@ -960,7 +960,7 @@ security definer
 set search_path = public
 as $$
 declare
-  recipient_id uuid;
+  target_recipient_id uuid;
   notification_body text;
 begin
   select
@@ -968,12 +968,12 @@ begin
       when conversations.user_one_id = new.sender_id then conversations.user_two_id
       else conversations.user_one_id
     end
-  into recipient_id
+  into target_recipient_id
   from public.conversations
   where conversations.id = new.conversation_id
     and new.sender_id in (conversations.user_one_id, conversations.user_two_id);
 
-  if recipient_id is null or recipient_id = new.sender_id then
+  if target_recipient_id is null or target_recipient_id = new.sender_id then
     return new;
   end if;
 
@@ -994,7 +994,7 @@ begin
   values (
     new.id,
     new.conversation_id,
-    recipient_id,
+    target_recipient_id,
     new.sender_id,
     new.sender_name,
     notification_body,
@@ -1003,10 +1003,11 @@ begin
       'message_id', new.id,
       'conversation_id', new.conversation_id,
       'sender_id', new.sender_id,
-      'message_type', coalesce(new.message_type, 'text')
+      'chat_message_type', coalesce(new.message_type, 'text')
     )
   )
-  on conflict (message_id, recipient_id) do nothing;
+  on conflict on constraint push_notification_jobs_message_recipient_key
+    do nothing;
 
   perform public.invoke_push_notification_dispatch();
   return new;

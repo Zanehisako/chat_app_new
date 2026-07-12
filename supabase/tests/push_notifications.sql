@@ -82,6 +82,8 @@ declare
   second_user uuid := '10000000-0000-0000-0000-000000000002';
   claimed_token_id uuid;
   token_owner uuid;
+  conversation_id uuid := '20000000-0000-0000-0000-000000000001';
+  message_id uuid := '30000000-0000-0000-0000-000000000001';
 begin
   insert into auth.users (
     id, instance_id, aud, role, email, encrypted_password,
@@ -131,6 +133,26 @@ begin
   where id = claimed_token_id;
   if token_owner <> second_user then
     raise exception 'Token registration did not transfer ownership to the active account';
+  end if;
+
+  insert into public.conversations (id, user_one_id, user_two_id)
+  values (conversation_id, first_user, second_user);
+
+  insert into public.messages (
+    id, conversation_id, sender_id, sender_name, body
+  )
+  values (
+    message_id, conversation_id, first_user, 'Push First', 'Trigger test'
+  );
+
+  if not exists (
+    select 1
+    from public.push_notification_jobs as jobs
+    where jobs.message_id = message_id
+      and jobs.recipient_id = second_user
+      and jobs.sender_id = first_user
+  ) then
+    raise exception 'Message trigger did not enqueue the recipient push job';
   end if;
 end;
 $$;

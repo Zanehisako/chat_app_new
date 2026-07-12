@@ -324,6 +324,7 @@ export async function sendFcm(
   if (delivery.platform === "android") {
     message.android = {
       priority: "HIGH",
+      ttl: "86400s",
       notification: {
         channel_id: "chat_messages",
         sound: "default",
@@ -350,6 +351,7 @@ export async function sendFcm(
     const link = new URL("/", webAppUrl);
     link.searchParams.set("conversation", delivery.conversation_id);
     message.webpush = {
+      headers: { TTL: "86400", Urgency: "high" },
       notification: { tag: delivery.message_id, renotify: false },
       fcm_options: { link: link.toString() },
     };
@@ -608,9 +610,30 @@ function base64Url(bytes: Uint8Array) {
 function stringifyData(data: Record<string, unknown>) {
   const result: Record<string, string> = {};
   for (const [key, value] of Object.entries(data)) {
-    result[key] = typeof value === "string" ? value : JSON.stringify(value);
+    const normalizedKey = fcmDataKey(key);
+    if (normalizedKey == null || value === undefined) {
+      continue;
+    }
+    result[normalizedKey] = typeof value === "string"
+      ? value
+      : JSON.stringify(value);
   }
   return result;
+}
+
+function fcmDataKey(key: string) {
+  const normalized = key.toLowerCase();
+  if (normalized === "message_type") {
+    return "chat_message_type";
+  }
+  if (
+    normalized === "from" ||
+    normalized.startsWith("google.") ||
+    normalized.startsWith("gcm.")
+  ) {
+    return null;
+  }
+  return key;
 }
 
 function webAppOrigin(value: string | undefined) {

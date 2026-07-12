@@ -201,6 +201,31 @@ void main() {
     await database.close();
   });
 
+  test('outbox retries after a stalled Supabase operation times out', () async {
+    SharedPreferences.setMockInitialValues({});
+    final database = _testOutboxDatabase();
+    final outbox = OfflineOutboxService(
+      database: database,
+      mediaStore: _TestOutboxMediaStore(),
+      networkOperationTimeout: const Duration(milliseconds: 10),
+      timerFactory: (duration, callback) => _NoopTimer(),
+    );
+    await outbox.enqueue(
+      conversationId: 'conversation-1',
+      senderId: ChatSeed.localUserId,
+      senderName: 'You',
+      body: 'do not stay stuck',
+    );
+
+    await outbox.flush(_HangingOutboxSender());
+
+    expect(outbox.items.single.status, OutboxSendStatus.pending);
+    expect(outbox.items.single.attemptCount, 1);
+    expect(outbox.items.single.lastError, contains('timed out'));
+    await outbox.dispose();
+    await database.close();
+  });
+
   test('outbox disposal waits for an active send to finish', () async {
     SharedPreferences.setMockInitialValues({});
     final database = _testOutboxDatabase();
@@ -1173,6 +1198,18 @@ void main() {
       );
     }
   });
+
+  test('web reserves the root service worker for Firebase messaging', () {
+    final bootstrap = File('web/flutter_bootstrap.js').readAsStringSync();
+    final messagingWorker = File(
+      'web/firebase-messaging-sw.js',
+    ).readAsStringSync();
+
+    expect(bootstrap, contains("register('/firebase-messaging-sw.js')"));
+    expect(bootstrap, isNot(contains('serviceWorkerSettings')));
+    expect(messagingWorker, contains('self.skipWaiting()'));
+    expect(messagingWorker, contains('self.clients.claim()'));
+  });
 }
 
 OutboxDatabase _testOutboxDatabase() {
@@ -1574,6 +1611,11 @@ class _BlockingOutboxSender extends _TestOutboxSender {
       messageId: messageId,
     );
   }
+}
+
+class _HangingOutboxSender extends _TestOutboxSender {
+  @override
+  Future<bool> messageExists(String messageId) => Completer<bool>().future;
 }
 
 class _NoopTimer implements Timer {

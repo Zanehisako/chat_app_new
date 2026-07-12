@@ -320,6 +320,8 @@ class OfflineOutboxService {
     OutboxMediaStore? mediaStore,
     DateTime Function()? clock,
     OutboxTimerFactory? timerFactory,
+    this.networkOperationTimeout = const Duration(seconds: 20),
+    this.mediaOperationTimeout = const Duration(minutes: 2),
   }) : _database = database ?? OutboxDatabase(),
        _ownsDatabase = database == null,
        _legacyMediaStore = mediaStore ?? createOutboxMediaStore(),
@@ -335,6 +337,8 @@ class OfflineOutboxService {
   final OutboxMediaStore _legacyMediaStore;
   final DateTime Function() _clock;
   final OutboxTimerFactory _timerFactory;
+  final Duration networkOperationTimeout;
+  final Duration mediaOperationTimeout;
   final Uuid _uuid = const Uuid();
   final StreamController<List<OutboxMessage>> _controller =
       StreamController<List<OutboxMessage>>.broadcast();
@@ -600,16 +604,22 @@ class OfflineOutboxService {
 
     // The stable outbox id makes a probe safe when Supabase accepted a request
     // but the client lost its response.
-    if (await sender.messageExists(item.id)) {
+    if (await _networkOperation(
+      sender.messageExists(item.id),
+      'Message status check',
+    )) {
       return;
     }
 
     final media = item.media;
     if (media == null) {
-      await sender.sendMessage(
-        conversationId: item.conversationId,
-        messageId: item.id,
-        body: item.body,
+      await _networkOperation(
+        sender.sendMessage(
+          conversationId: item.conversationId,
+          messageId: item.id,
+          body: item.body,
+        ),
+        'Message send',
       );
       return;
     }
@@ -625,23 +635,43 @@ class OfflineOutboxService {
       if (bytes == null || bytes.isEmpty) {
         throw StateError('Queued media is missing local storage.');
       }
-      uploaded = await sender.uploadMediaAttachment(
-        conversationId: item.conversationId,
-        pickedMedia: media.toPicked(bytes),
-        onProgress: (_) {},
-        messageId: item.id,
-        upsert: true,
+      uploaded = await _mediaOperation(
+        sender.uploadMediaAttachment(
+          conversationId: item.conversationId,
+          pickedMedia: media.toPicked(bytes),
+          onProgress: (_) {},
+          messageId: item.id,
+          upsert: true,
+        ),
+        'Media upload',
       );
 
       item = item.copyWith(media: QueuedOutboxMedia.fromUploaded(uploaded));
       await _replace(item);
     }
 
-    await sender.sendMediaMessage(
-      conversationId: item.conversationId,
-      messageId: uploaded.messageId,
-      body: item.body,
-      media: uploaded.media,
+    await _networkOperation(
+      sender.sendMediaMessage(
+        conversationId: item.conversationId,
+        messageId: uploaded.messageId,
+        body: item.body,
+        media: uploaded.media,
+      ),
+      'Media message send',
+    );
+  }
+
+  Future<T> _networkOperation<T>(Future<T> operation, String label) {
+    return operation.timeout(
+      networkOperationTimeout,
+      onTimeout: () => throw TimeoutException('$label timed out.'),
+    );
+  }
+
+  Future<T> _mediaOperation<T>(Future<T> operation, String label) {
+    return operation.timeout(
+      mediaOperationTimeout,
+      onTimeout: () => throw TimeoutException('$label timed out.'),
     );
   }
 

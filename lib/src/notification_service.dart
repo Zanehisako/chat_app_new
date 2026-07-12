@@ -574,6 +574,9 @@ class NotificationService {
       vapidKey: kIsWeb && ChatFirebaseOptions.webVapidKey.isNotEmpty
           ? ChatFirebaseOptions.webVapidKey
           : null,
+      serviceWorkerScriptPath: kIsWeb
+          ? ChatFirebaseOptions.webMessagingServiceWorkerPath
+          : null,
     );
   }
 
