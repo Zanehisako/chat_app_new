@@ -324,7 +324,7 @@ export async function sendFcm(
   if (delivery.platform === "android") {
     message.android = {
       priority: "HIGH",
-      ttl: "86400s",
+      ttl: "2419200s",
       notification: {
         channel_id: "chat_messages",
         sound: "default",
@@ -351,7 +351,7 @@ export async function sendFcm(
     const link = new URL("/", webAppUrl);
     link.searchParams.set("conversation", delivery.conversation_id);
     message.webpush = {
-      headers: { TTL: "86400", Urgency: "high" },
+      headers: { TTL: "2419200", Urgency: "high" },
       notification: { tag: delivery.message_id, renotify: false },
       fcm_options: { link: link.toString() },
     };

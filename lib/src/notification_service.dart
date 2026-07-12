@@ -531,6 +531,7 @@ class NotificationService {
       provider: _FirebasePushTokenProvider(
         isSupported: () => _supportsFcm && _firebaseReady,
         token: _firebaseToken,
+        canShowNotifications: _canShowNotifications,
       ),
       registry: _registryFor(client),
       preferences: SharedPreferencesNotificationPreferenceStore(),
@@ -580,6 +581,38 @@ class NotificationService {
     );
   }
 
+  Future<bool> _canShowNotifications() async {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) {
+      return true;
+    }
+    final android = _localNotifications
+        .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin
+        >();
+    if (android == null) {
+      return true;
+    }
+    try {
+      if (await android.areNotificationsEnabled() == false) {
+        debugPrint('[Notifications] Android app notifications are disabled.');
+        return false;
+      }
+      final channels = await android.getNotificationChannels();
+      for (final channel in channels ?? const <AndroidNotificationChannel>[]) {
+        if (channel.id == _androidChannel.id &&
+            channel.importance == Importance.none) {
+          debugPrint(
+            '[Notifications] Android chat notification channel is disabled.',
+          );
+          return false;
+        }
+      }
+    } catch (error) {
+      debugPrint('[Notifications] Android notification state unavailable.');
+    }
+    return true;
+  }
+
   void _clearRegistrationController() {
     final controller = _registrationController;
     final listener = _registrationListener;
@@ -618,10 +651,12 @@ class _FirebasePushTokenProvider implements PushTokenProvider {
   const _FirebasePushTokenProvider({
     required this._isSupported,
     required this._token,
+    required this._canShowNotifications,
   });
 
   final bool Function() _isSupported;
   final Future<String?> Function() _token;
+  final Future<bool> Function() _canShowNotifications;
 
   @override
   bool get isSupported => _isSupported();
@@ -633,7 +668,7 @@ class _FirebasePushTokenProvider implements PushTokenProvider {
   Future<PushPermissionStatus> permissionStatus() async {
     if (!isSupported) return PushPermissionStatus.unsupported;
     final settings = await FirebaseMessaging.instance.getNotificationSettings();
-    return _permission(settings.authorizationStatus);
+    return _effectivePermission(settings.authorizationStatus);
   }
 
   @override
@@ -644,7 +679,19 @@ class _FirebasePushTokenProvider implements PushTokenProvider {
       badge: true,
       sound: true,
     );
-    return _permission(settings.authorizationStatus);
+    return _effectivePermission(settings.authorizationStatus);
+  }
+
+  Future<PushPermissionStatus> _effectivePermission(
+    AuthorizationStatus status,
+  ) async {
+    final permission = _permission(status);
+    if ((permission == PushPermissionStatus.authorized ||
+            permission == PushPermissionStatus.provisional) &&
+        !await _canShowNotifications()) {
+      return PushPermissionStatus.denied;
+    }
+    return permission;
   }
 
   PushPermissionStatus _permission(AuthorizationStatus status) {

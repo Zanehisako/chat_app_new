@@ -30,7 +30,7 @@ Deno.test("FCM obtains OAuth token and sends an Android notification", async () 
       if (payload.message.android.notification.channel_id !== "chat_messages") {
         throw new Error("Android notification channel was not included.");
       }
-      if (payload.message.android.ttl !== "86400s") {
+      if (payload.message.android.ttl !== "2419200s") {
         throw new Error("Android offline delivery lifetime was not included.");
       }
       if (
@@ -74,7 +74,7 @@ Deno.test("FCM sends web notifications with an offline lifetime", async () => {
       }
       const payload = JSON.parse(String(init?.body));
       if (
-        payload.message.webpush.headers.TTL !== "86400" ||
+        payload.message.webpush.headers.TTL !== "2419200" ||
         payload.message.webpush.headers.Urgency !== "high" ||
         !payload.message.webpush.fcm_options.link.includes(
           delivery("web").conversation_id,
