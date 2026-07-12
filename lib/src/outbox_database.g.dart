@@ -248,6 +248,80 @@ class $OutboxEntriesTable extends OutboxEntries
         type: DriftSqlType.blob,
         requiredDuringInsert: false,
       );
+  static const VerificationMeta _replyToMessageIdMeta = const VerificationMeta(
+    'replyToMessageId',
+  );
+  @override
+  late final GeneratedColumn<String> replyToMessageId = GeneratedColumn<String>(
+    'reply_to_message_id',
+    aliasedName,
+    true,
+    type: DriftSqlType.string,
+    requiredDuringInsert: false,
+  );
+  static const VerificationMeta _replySenderNameMeta = const VerificationMeta(
+    'replySenderName',
+  );
+  @override
+  late final GeneratedColumn<String> replySenderName = GeneratedColumn<String>(
+    'reply_sender_name',
+    aliasedName,
+    true,
+    type: DriftSqlType.string,
+    requiredDuringInsert: false,
+  );
+  static const VerificationMeta _replyPreviewMeta = const VerificationMeta(
+    'replyPreview',
+  );
+  @override
+  late final GeneratedColumn<String> replyPreview = GeneratedColumn<String>(
+    'reply_preview',
+    aliasedName,
+    true,
+    type: DriftSqlType.string,
+    requiredDuringInsert: false,
+  );
+  static const VerificationMeta _replyMessageTypeMeta = const VerificationMeta(
+    'replyMessageType',
+  );
+  @override
+  late final GeneratedColumn<String> replyMessageType = GeneratedColumn<String>(
+    'reply_message_type',
+    aliasedName,
+    true,
+    type: DriftSqlType.string,
+    requiredDuringInsert: false,
+  );
+  static const VerificationMeta _replyIsDeletedMeta = const VerificationMeta(
+    'replyIsDeleted',
+  );
+  @override
+  late final GeneratedColumn<bool> replyIsDeleted = GeneratedColumn<bool>(
+    'reply_is_deleted',
+    aliasedName,
+    false,
+    type: DriftSqlType.bool,
+    requiredDuringInsert: false,
+    defaultConstraints: GeneratedColumn.constraintIsAlways(
+      'CHECK ("reply_is_deleted" IN (0, 1))',
+    ),
+    defaultValue: const Constant(false),
+  );
+  static const VerificationMeta _isForwardedMeta = const VerificationMeta(
+    'isForwarded',
+  );
+  @override
+  late final GeneratedColumn<bool> isForwarded = GeneratedColumn<bool>(
+    'is_forwarded',
+    aliasedName,
+    false,
+    type: DriftSqlType.bool,
+    requiredDuringInsert: false,
+    defaultConstraints: GeneratedColumn.constraintIsAlways(
+      'CHECK ("is_forwarded" IN (0, 1))',
+    ),
+    defaultValue: const Constant(false),
+  );
   static const VerificationMeta _updatedAtMeta = const VerificationMeta(
     'updatedAt',
   );
@@ -283,6 +357,12 @@ class $OutboxEntriesTable extends OutboxEntries
     mediaWaveform,
     mediaOriginalName,
     localMediaBytes,
+    replyToMessageId,
+    replySenderName,
+    replyPreview,
+    replyMessageType,
+    replyIsDeleted,
+    isForwarded,
     updatedAt,
   ];
   @override
@@ -485,6 +565,60 @@ class $OutboxEntriesTable extends OutboxEntries
         ),
       );
     }
+    if (data.containsKey('reply_to_message_id')) {
+      context.handle(
+        _replyToMessageIdMeta,
+        replyToMessageId.isAcceptableOrUnknown(
+          data['reply_to_message_id']!,
+          _replyToMessageIdMeta,
+        ),
+      );
+    }
+    if (data.containsKey('reply_sender_name')) {
+      context.handle(
+        _replySenderNameMeta,
+        replySenderName.isAcceptableOrUnknown(
+          data['reply_sender_name']!,
+          _replySenderNameMeta,
+        ),
+      );
+    }
+    if (data.containsKey('reply_preview')) {
+      context.handle(
+        _replyPreviewMeta,
+        replyPreview.isAcceptableOrUnknown(
+          data['reply_preview']!,
+          _replyPreviewMeta,
+        ),
+      );
+    }
+    if (data.containsKey('reply_message_type')) {
+      context.handle(
+        _replyMessageTypeMeta,
+        replyMessageType.isAcceptableOrUnknown(
+          data['reply_message_type']!,
+          _replyMessageTypeMeta,
+        ),
+      );
+    }
+    if (data.containsKey('reply_is_deleted')) {
+      context.handle(
+        _replyIsDeletedMeta,
+        replyIsDeleted.isAcceptableOrUnknown(
+          data['reply_is_deleted']!,
+          _replyIsDeletedMeta,
+        ),
+      );
+    }
+    if (data.containsKey('is_forwarded')) {
+      context.handle(
+        _isForwardedMeta,
+        isForwarded.isAcceptableOrUnknown(
+          data['is_forwarded']!,
+          _isForwardedMeta,
+        ),
+      );
+    }
     if (data.containsKey('updated_at')) {
       context.handle(
         _updatedAtMeta,
@@ -590,6 +724,30 @@ class $OutboxEntriesTable extends OutboxEntries
         DriftSqlType.blob,
         data['${effectivePrefix}local_media_bytes'],
       ),
+      replyToMessageId: attachedDatabase.typeMapping.read(
+        DriftSqlType.string,
+        data['${effectivePrefix}reply_to_message_id'],
+      ),
+      replySenderName: attachedDatabase.typeMapping.read(
+        DriftSqlType.string,
+        data['${effectivePrefix}reply_sender_name'],
+      ),
+      replyPreview: attachedDatabase.typeMapping.read(
+        DriftSqlType.string,
+        data['${effectivePrefix}reply_preview'],
+      ),
+      replyMessageType: attachedDatabase.typeMapping.read(
+        DriftSqlType.string,
+        data['${effectivePrefix}reply_message_type'],
+      ),
+      replyIsDeleted: attachedDatabase.typeMapping.read(
+        DriftSqlType.bool,
+        data['${effectivePrefix}reply_is_deleted'],
+      )!,
+      isForwarded: attachedDatabase.typeMapping.read(
+        DriftSqlType.bool,
+        data['${effectivePrefix}is_forwarded'],
+      )!,
       updatedAt: attachedDatabase.typeMapping.read(
         DriftSqlType.dateTime,
         data['${effectivePrefix}updated_at'],
@@ -626,6 +784,12 @@ class OutboxEntry extends DataClass implements Insertable<OutboxEntry> {
   final String? mediaWaveform;
   final String? mediaOriginalName;
   final Uint8List? localMediaBytes;
+  final String? replyToMessageId;
+  final String? replySenderName;
+  final String? replyPreview;
+  final String? replyMessageType;
+  final bool replyIsDeleted;
+  final bool isForwarded;
   final DateTime updatedAt;
   const OutboxEntry({
     required this.id,
@@ -650,6 +814,12 @@ class OutboxEntry extends DataClass implements Insertable<OutboxEntry> {
     this.mediaWaveform,
     this.mediaOriginalName,
     this.localMediaBytes,
+    this.replyToMessageId,
+    this.replySenderName,
+    this.replyPreview,
+    this.replyMessageType,
+    required this.replyIsDeleted,
+    required this.isForwarded,
     required this.updatedAt,
   });
   @override
@@ -701,6 +871,20 @@ class OutboxEntry extends DataClass implements Insertable<OutboxEntry> {
     if (!nullToAbsent || localMediaBytes != null) {
       map['local_media_bytes'] = Variable<Uint8List>(localMediaBytes);
     }
+    if (!nullToAbsent || replyToMessageId != null) {
+      map['reply_to_message_id'] = Variable<String>(replyToMessageId);
+    }
+    if (!nullToAbsent || replySenderName != null) {
+      map['reply_sender_name'] = Variable<String>(replySenderName);
+    }
+    if (!nullToAbsent || replyPreview != null) {
+      map['reply_preview'] = Variable<String>(replyPreview);
+    }
+    if (!nullToAbsent || replyMessageType != null) {
+      map['reply_message_type'] = Variable<String>(replyMessageType);
+    }
+    map['reply_is_deleted'] = Variable<bool>(replyIsDeleted);
+    map['is_forwarded'] = Variable<bool>(isForwarded);
     map['updated_at'] = Variable<DateTime>(updatedAt);
     return map;
   }
@@ -753,6 +937,20 @@ class OutboxEntry extends DataClass implements Insertable<OutboxEntry> {
       localMediaBytes: localMediaBytes == null && nullToAbsent
           ? const Value.absent()
           : Value(localMediaBytes),
+      replyToMessageId: replyToMessageId == null && nullToAbsent
+          ? const Value.absent()
+          : Value(replyToMessageId),
+      replySenderName: replySenderName == null && nullToAbsent
+          ? const Value.absent()
+          : Value(replySenderName),
+      replyPreview: replyPreview == null && nullToAbsent
+          ? const Value.absent()
+          : Value(replyPreview),
+      replyMessageType: replyMessageType == null && nullToAbsent
+          ? const Value.absent()
+          : Value(replyMessageType),
+      replyIsDeleted: Value(replyIsDeleted),
+      isForwarded: Value(isForwarded),
       updatedAt: Value(updatedAt),
     );
   }
@@ -787,6 +985,12 @@ class OutboxEntry extends DataClass implements Insertable<OutboxEntry> {
         json['mediaOriginalName'],
       ),
       localMediaBytes: serializer.fromJson<Uint8List?>(json['localMediaBytes']),
+      replyToMessageId: serializer.fromJson<String?>(json['replyToMessageId']),
+      replySenderName: serializer.fromJson<String?>(json['replySenderName']),
+      replyPreview: serializer.fromJson<String?>(json['replyPreview']),
+      replyMessageType: serializer.fromJson<String?>(json['replyMessageType']),
+      replyIsDeleted: serializer.fromJson<bool>(json['replyIsDeleted']),
+      isForwarded: serializer.fromJson<bool>(json['isForwarded']),
       updatedAt: serializer.fromJson<DateTime>(json['updatedAt']),
     );
   }
@@ -816,6 +1020,12 @@ class OutboxEntry extends DataClass implements Insertable<OutboxEntry> {
       'mediaWaveform': serializer.toJson<String?>(mediaWaveform),
       'mediaOriginalName': serializer.toJson<String?>(mediaOriginalName),
       'localMediaBytes': serializer.toJson<Uint8List?>(localMediaBytes),
+      'replyToMessageId': serializer.toJson<String?>(replyToMessageId),
+      'replySenderName': serializer.toJson<String?>(replySenderName),
+      'replyPreview': serializer.toJson<String?>(replyPreview),
+      'replyMessageType': serializer.toJson<String?>(replyMessageType),
+      'replyIsDeleted': serializer.toJson<bool>(replyIsDeleted),
+      'isForwarded': serializer.toJson<bool>(isForwarded),
       'updatedAt': serializer.toJson<DateTime>(updatedAt),
     };
   }
@@ -843,6 +1053,12 @@ class OutboxEntry extends DataClass implements Insertable<OutboxEntry> {
     Value<String?> mediaWaveform = const Value.absent(),
     Value<String?> mediaOriginalName = const Value.absent(),
     Value<Uint8List?> localMediaBytes = const Value.absent(),
+    Value<String?> replyToMessageId = const Value.absent(),
+    Value<String?> replySenderName = const Value.absent(),
+    Value<String?> replyPreview = const Value.absent(),
+    Value<String?> replyMessageType = const Value.absent(),
+    bool? replyIsDeleted,
+    bool? isForwarded,
     DateTime? updatedAt,
   }) => OutboxEntry(
     id: id ?? this.id,
@@ -881,6 +1097,18 @@ class OutboxEntry extends DataClass implements Insertable<OutboxEntry> {
     localMediaBytes: localMediaBytes.present
         ? localMediaBytes.value
         : this.localMediaBytes,
+    replyToMessageId: replyToMessageId.present
+        ? replyToMessageId.value
+        : this.replyToMessageId,
+    replySenderName: replySenderName.present
+        ? replySenderName.value
+        : this.replySenderName,
+    replyPreview: replyPreview.present ? replyPreview.value : this.replyPreview,
+    replyMessageType: replyMessageType.present
+        ? replyMessageType.value
+        : this.replyMessageType,
+    replyIsDeleted: replyIsDeleted ?? this.replyIsDeleted,
+    isForwarded: isForwarded ?? this.isForwarded,
     updatedAt: updatedAt ?? this.updatedAt,
   );
   OutboxEntry copyWithCompanion(OutboxEntriesCompanion data) {
@@ -939,6 +1167,24 @@ class OutboxEntry extends DataClass implements Insertable<OutboxEntry> {
       localMediaBytes: data.localMediaBytes.present
           ? data.localMediaBytes.value
           : this.localMediaBytes,
+      replyToMessageId: data.replyToMessageId.present
+          ? data.replyToMessageId.value
+          : this.replyToMessageId,
+      replySenderName: data.replySenderName.present
+          ? data.replySenderName.value
+          : this.replySenderName,
+      replyPreview: data.replyPreview.present
+          ? data.replyPreview.value
+          : this.replyPreview,
+      replyMessageType: data.replyMessageType.present
+          ? data.replyMessageType.value
+          : this.replyMessageType,
+      replyIsDeleted: data.replyIsDeleted.present
+          ? data.replyIsDeleted.value
+          : this.replyIsDeleted,
+      isForwarded: data.isForwarded.present
+          ? data.isForwarded.value
+          : this.isForwarded,
       updatedAt: data.updatedAt.present ? data.updatedAt.value : this.updatedAt,
     );
   }
@@ -968,6 +1214,12 @@ class OutboxEntry extends DataClass implements Insertable<OutboxEntry> {
           ..write('mediaWaveform: $mediaWaveform, ')
           ..write('mediaOriginalName: $mediaOriginalName, ')
           ..write('localMediaBytes: $localMediaBytes, ')
+          ..write('replyToMessageId: $replyToMessageId, ')
+          ..write('replySenderName: $replySenderName, ')
+          ..write('replyPreview: $replyPreview, ')
+          ..write('replyMessageType: $replyMessageType, ')
+          ..write('replyIsDeleted: $replyIsDeleted, ')
+          ..write('isForwarded: $isForwarded, ')
           ..write('updatedAt: $updatedAt')
           ..write(')'))
         .toString();
@@ -997,6 +1249,12 @@ class OutboxEntry extends DataClass implements Insertable<OutboxEntry> {
     mediaWaveform,
     mediaOriginalName,
     $driftBlobEquality.hash(localMediaBytes),
+    replyToMessageId,
+    replySenderName,
+    replyPreview,
+    replyMessageType,
+    replyIsDeleted,
+    isForwarded,
     updatedAt,
   ]);
   @override
@@ -1028,6 +1286,12 @@ class OutboxEntry extends DataClass implements Insertable<OutboxEntry> {
             other.localMediaBytes,
             this.localMediaBytes,
           ) &&
+          other.replyToMessageId == this.replyToMessageId &&
+          other.replySenderName == this.replySenderName &&
+          other.replyPreview == this.replyPreview &&
+          other.replyMessageType == this.replyMessageType &&
+          other.replyIsDeleted == this.replyIsDeleted &&
+          other.isForwarded == this.isForwarded &&
           other.updatedAt == this.updatedAt);
 }
 
@@ -1054,6 +1318,12 @@ class OutboxEntriesCompanion extends UpdateCompanion<OutboxEntry> {
   final Value<String?> mediaWaveform;
   final Value<String?> mediaOriginalName;
   final Value<Uint8List?> localMediaBytes;
+  final Value<String?> replyToMessageId;
+  final Value<String?> replySenderName;
+  final Value<String?> replyPreview;
+  final Value<String?> replyMessageType;
+  final Value<bool> replyIsDeleted;
+  final Value<bool> isForwarded;
   final Value<DateTime> updatedAt;
   final Value<int> rowid;
   const OutboxEntriesCompanion({
@@ -1079,6 +1349,12 @@ class OutboxEntriesCompanion extends UpdateCompanion<OutboxEntry> {
     this.mediaWaveform = const Value.absent(),
     this.mediaOriginalName = const Value.absent(),
     this.localMediaBytes = const Value.absent(),
+    this.replyToMessageId = const Value.absent(),
+    this.replySenderName = const Value.absent(),
+    this.replyPreview = const Value.absent(),
+    this.replyMessageType = const Value.absent(),
+    this.replyIsDeleted = const Value.absent(),
+    this.isForwarded = const Value.absent(),
     this.updatedAt = const Value.absent(),
     this.rowid = const Value.absent(),
   });
@@ -1105,6 +1381,12 @@ class OutboxEntriesCompanion extends UpdateCompanion<OutboxEntry> {
     this.mediaWaveform = const Value.absent(),
     this.mediaOriginalName = const Value.absent(),
     this.localMediaBytes = const Value.absent(),
+    this.replyToMessageId = const Value.absent(),
+    this.replySenderName = const Value.absent(),
+    this.replyPreview = const Value.absent(),
+    this.replyMessageType = const Value.absent(),
+    this.replyIsDeleted = const Value.absent(),
+    this.isForwarded = const Value.absent(),
     required DateTime updatedAt,
     this.rowid = const Value.absent(),
   }) : id = Value(id),
@@ -1141,6 +1423,12 @@ class OutboxEntriesCompanion extends UpdateCompanion<OutboxEntry> {
     Expression<String>? mediaWaveform,
     Expression<String>? mediaOriginalName,
     Expression<Uint8List>? localMediaBytes,
+    Expression<String>? replyToMessageId,
+    Expression<String>? replySenderName,
+    Expression<String>? replyPreview,
+    Expression<String>? replyMessageType,
+    Expression<bool>? replyIsDeleted,
+    Expression<bool>? isForwarded,
     Expression<DateTime>? updatedAt,
     Expression<int>? rowid,
   }) {
@@ -1167,6 +1455,12 @@ class OutboxEntriesCompanion extends UpdateCompanion<OutboxEntry> {
       if (mediaWaveform != null) 'media_waveform': mediaWaveform,
       if (mediaOriginalName != null) 'media_original_name': mediaOriginalName,
       if (localMediaBytes != null) 'local_media_bytes': localMediaBytes,
+      if (replyToMessageId != null) 'reply_to_message_id': replyToMessageId,
+      if (replySenderName != null) 'reply_sender_name': replySenderName,
+      if (replyPreview != null) 'reply_preview': replyPreview,
+      if (replyMessageType != null) 'reply_message_type': replyMessageType,
+      if (replyIsDeleted != null) 'reply_is_deleted': replyIsDeleted,
+      if (isForwarded != null) 'is_forwarded': isForwarded,
       if (updatedAt != null) 'updated_at': updatedAt,
       if (rowid != null) 'rowid': rowid,
     });
@@ -1195,6 +1489,12 @@ class OutboxEntriesCompanion extends UpdateCompanion<OutboxEntry> {
     Value<String?>? mediaWaveform,
     Value<String?>? mediaOriginalName,
     Value<Uint8List?>? localMediaBytes,
+    Value<String?>? replyToMessageId,
+    Value<String?>? replySenderName,
+    Value<String?>? replyPreview,
+    Value<String?>? replyMessageType,
+    Value<bool>? replyIsDeleted,
+    Value<bool>? isForwarded,
     Value<DateTime>? updatedAt,
     Value<int>? rowid,
   }) {
@@ -1221,6 +1521,12 @@ class OutboxEntriesCompanion extends UpdateCompanion<OutboxEntry> {
       mediaWaveform: mediaWaveform ?? this.mediaWaveform,
       mediaOriginalName: mediaOriginalName ?? this.mediaOriginalName,
       localMediaBytes: localMediaBytes ?? this.localMediaBytes,
+      replyToMessageId: replyToMessageId ?? this.replyToMessageId,
+      replySenderName: replySenderName ?? this.replySenderName,
+      replyPreview: replyPreview ?? this.replyPreview,
+      replyMessageType: replyMessageType ?? this.replyMessageType,
+      replyIsDeleted: replyIsDeleted ?? this.replyIsDeleted,
+      isForwarded: isForwarded ?? this.isForwarded,
       updatedAt: updatedAt ?? this.updatedAt,
       rowid: rowid ?? this.rowid,
     );
@@ -1295,6 +1601,24 @@ class OutboxEntriesCompanion extends UpdateCompanion<OutboxEntry> {
     if (localMediaBytes.present) {
       map['local_media_bytes'] = Variable<Uint8List>(localMediaBytes.value);
     }
+    if (replyToMessageId.present) {
+      map['reply_to_message_id'] = Variable<String>(replyToMessageId.value);
+    }
+    if (replySenderName.present) {
+      map['reply_sender_name'] = Variable<String>(replySenderName.value);
+    }
+    if (replyPreview.present) {
+      map['reply_preview'] = Variable<String>(replyPreview.value);
+    }
+    if (replyMessageType.present) {
+      map['reply_message_type'] = Variable<String>(replyMessageType.value);
+    }
+    if (replyIsDeleted.present) {
+      map['reply_is_deleted'] = Variable<bool>(replyIsDeleted.value);
+    }
+    if (isForwarded.present) {
+      map['is_forwarded'] = Variable<bool>(isForwarded.value);
+    }
     if (updatedAt.present) {
       map['updated_at'] = Variable<DateTime>(updatedAt.value);
     }
@@ -1329,6 +1653,12 @@ class OutboxEntriesCompanion extends UpdateCompanion<OutboxEntry> {
           ..write('mediaWaveform: $mediaWaveform, ')
           ..write('mediaOriginalName: $mediaOriginalName, ')
           ..write('localMediaBytes: $localMediaBytes, ')
+          ..write('replyToMessageId: $replyToMessageId, ')
+          ..write('replySenderName: $replySenderName, ')
+          ..write('replyPreview: $replyPreview, ')
+          ..write('replyMessageType: $replyMessageType, ')
+          ..write('replyIsDeleted: $replyIsDeleted, ')
+          ..write('isForwarded: $isForwarded, ')
           ..write('updatedAt: $updatedAt, ')
           ..write('rowid: $rowid')
           ..write(')'))
@@ -1371,6 +1701,12 @@ typedef $$OutboxEntriesTableCreateCompanionBuilder =
       Value<String?> mediaWaveform,
       Value<String?> mediaOriginalName,
       Value<Uint8List?> localMediaBytes,
+      Value<String?> replyToMessageId,
+      Value<String?> replySenderName,
+      Value<String?> replyPreview,
+      Value<String?> replyMessageType,
+      Value<bool> replyIsDeleted,
+      Value<bool> isForwarded,
       required DateTime updatedAt,
       Value<int> rowid,
     });
@@ -1398,6 +1734,12 @@ typedef $$OutboxEntriesTableUpdateCompanionBuilder =
       Value<String?> mediaWaveform,
       Value<String?> mediaOriginalName,
       Value<Uint8List?> localMediaBytes,
+      Value<String?> replyToMessageId,
+      Value<String?> replySenderName,
+      Value<String?> replyPreview,
+      Value<String?> replyMessageType,
+      Value<bool> replyIsDeleted,
+      Value<bool> isForwarded,
       Value<DateTime> updatedAt,
       Value<int> rowid,
     });
@@ -1518,6 +1860,36 @@ class $$OutboxEntriesTableFilterComposer
 
   ColumnFilters<Uint8List> get localMediaBytes => $composableBuilder(
     column: $table.localMediaBytes,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get replyToMessageId => $composableBuilder(
+    column: $table.replyToMessageId,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get replySenderName => $composableBuilder(
+    column: $table.replySenderName,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get replyPreview => $composableBuilder(
+    column: $table.replyPreview,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get replyMessageType => $composableBuilder(
+    column: $table.replyMessageType,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<bool> get replyIsDeleted => $composableBuilder(
+    column: $table.replyIsDeleted,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<bool> get isForwarded => $composableBuilder(
+    column: $table.isForwarded,
     builder: (column) => ColumnFilters(column),
   );
 
@@ -1646,6 +2018,36 @@ class $$OutboxEntriesTableOrderingComposer
     builder: (column) => ColumnOrderings(column),
   );
 
+  ColumnOrderings<String> get replyToMessageId => $composableBuilder(
+    column: $table.replyToMessageId,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<String> get replySenderName => $composableBuilder(
+    column: $table.replySenderName,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<String> get replyPreview => $composableBuilder(
+    column: $table.replyPreview,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<String> get replyMessageType => $composableBuilder(
+    column: $table.replyMessageType,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<bool> get replyIsDeleted => $composableBuilder(
+    column: $table.replyIsDeleted,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<bool> get isForwarded => $composableBuilder(
+    column: $table.isForwarded,
+    builder: (column) => ColumnOrderings(column),
+  );
+
   ColumnOrderings<DateTime> get updatedAt => $composableBuilder(
     column: $table.updatedAt,
     builder: (column) => ColumnOrderings(column),
@@ -1759,6 +2161,36 @@ class $$OutboxEntriesTableAnnotationComposer
     builder: (column) => column,
   );
 
+  GeneratedColumn<String> get replyToMessageId => $composableBuilder(
+    column: $table.replyToMessageId,
+    builder: (column) => column,
+  );
+
+  GeneratedColumn<String> get replySenderName => $composableBuilder(
+    column: $table.replySenderName,
+    builder: (column) => column,
+  );
+
+  GeneratedColumn<String> get replyPreview => $composableBuilder(
+    column: $table.replyPreview,
+    builder: (column) => column,
+  );
+
+  GeneratedColumn<String> get replyMessageType => $composableBuilder(
+    column: $table.replyMessageType,
+    builder: (column) => column,
+  );
+
+  GeneratedColumn<bool> get replyIsDeleted => $composableBuilder(
+    column: $table.replyIsDeleted,
+    builder: (column) => column,
+  );
+
+  GeneratedColumn<bool> get isForwarded => $composableBuilder(
+    column: $table.isForwarded,
+    builder: (column) => column,
+  );
+
   GeneratedColumn<DateTime> get updatedAt =>
       $composableBuilder(column: $table.updatedAt, builder: (column) => column);
 }
@@ -1818,6 +2250,12 @@ class $$OutboxEntriesTableTableManager
                 Value<String?> mediaWaveform = const Value.absent(),
                 Value<String?> mediaOriginalName = const Value.absent(),
                 Value<Uint8List?> localMediaBytes = const Value.absent(),
+                Value<String?> replyToMessageId = const Value.absent(),
+                Value<String?> replySenderName = const Value.absent(),
+                Value<String?> replyPreview = const Value.absent(),
+                Value<String?> replyMessageType = const Value.absent(),
+                Value<bool> replyIsDeleted = const Value.absent(),
+                Value<bool> isForwarded = const Value.absent(),
                 Value<DateTime> updatedAt = const Value.absent(),
                 Value<int> rowid = const Value.absent(),
               }) => OutboxEntriesCompanion(
@@ -1843,6 +2281,12 @@ class $$OutboxEntriesTableTableManager
                 mediaWaveform: mediaWaveform,
                 mediaOriginalName: mediaOriginalName,
                 localMediaBytes: localMediaBytes,
+                replyToMessageId: replyToMessageId,
+                replySenderName: replySenderName,
+                replyPreview: replyPreview,
+                replyMessageType: replyMessageType,
+                replyIsDeleted: replyIsDeleted,
+                isForwarded: isForwarded,
                 updatedAt: updatedAt,
                 rowid: rowid,
               ),
@@ -1870,6 +2314,12 @@ class $$OutboxEntriesTableTableManager
                 Value<String?> mediaWaveform = const Value.absent(),
                 Value<String?> mediaOriginalName = const Value.absent(),
                 Value<Uint8List?> localMediaBytes = const Value.absent(),
+                Value<String?> replyToMessageId = const Value.absent(),
+                Value<String?> replySenderName = const Value.absent(),
+                Value<String?> replyPreview = const Value.absent(),
+                Value<String?> replyMessageType = const Value.absent(),
+                Value<bool> replyIsDeleted = const Value.absent(),
+                Value<bool> isForwarded = const Value.absent(),
                 required DateTime updatedAt,
                 Value<int> rowid = const Value.absent(),
               }) => OutboxEntriesCompanion.insert(
@@ -1895,6 +2345,12 @@ class $$OutboxEntriesTableTableManager
                 mediaWaveform: mediaWaveform,
                 mediaOriginalName: mediaOriginalName,
                 localMediaBytes: localMediaBytes,
+                replyToMessageId: replyToMessageId,
+                replySenderName: replySenderName,
+                replyPreview: replyPreview,
+                replyMessageType: replyMessageType,
+                replyIsDeleted: replyIsDeleted,
+                isForwarded: isForwarded,
                 updatedAt: updatedAt,
                 rowid: rowid,
               ),

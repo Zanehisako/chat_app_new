@@ -27,6 +27,13 @@ class OutboxEntries extends Table {
   TextColumn get mediaWaveform => text().nullable()();
   TextColumn get mediaOriginalName => text().nullable()();
   BlobColumn get localMediaBytes => blob().nullable()();
+  TextColumn get replyToMessageId => text().nullable()();
+  TextColumn get replySenderName => text().nullable()();
+  TextColumn get replyPreview => text().nullable()();
+  TextColumn get replyMessageType => text().nullable()();
+  BoolColumn get replyIsDeleted =>
+      boolean().withDefault(const Constant(false))();
+  BoolColumn get isForwarded => boolean().withDefault(const Constant(false))();
   DateTimeColumn get updatedAt => dateTime()();
 
   @override
@@ -41,7 +48,7 @@ class OutboxDatabase extends _$OutboxDatabase {
   OutboxDatabase.forTesting(super.executor);
 
   @override
-  int get schemaVersion => 2;
+  int get schemaVersion => 3;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -78,6 +85,13 @@ class OutboxDatabase extends _$OutboxDatabase {
         ''');
         await customStatement('DROP TABLE outbox_entries_v1');
         await _createIndexes();
+      } else if (from < 3) {
+        await migrator.addColumn(outboxEntries, outboxEntries.replyToMessageId);
+        await migrator.addColumn(outboxEntries, outboxEntries.replySenderName);
+        await migrator.addColumn(outboxEntries, outboxEntries.replyPreview);
+        await migrator.addColumn(outboxEntries, outboxEntries.replyMessageType);
+        await migrator.addColumn(outboxEntries, outboxEntries.replyIsDeleted);
+        await migrator.addColumn(outboxEntries, outboxEntries.isForwarded);
       }
     },
   );

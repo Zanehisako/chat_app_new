@@ -4,8 +4,10 @@ import 'dart:math' as math;
 
 import 'package:camera/camera.dart' as camera;
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:emoji_picker_flutter/emoji_picker_flutter.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:realtime_calls/realtime_calls.dart';
 import 'package:record/record.dart';
@@ -93,6 +95,7 @@ class _ChatHomePageState extends State<ChatHomePage>
   final List<ChatThread> _startedThreads = [];
   final List<ChatThread> _refreshedThreads = [];
   final List<ChatMessage> _localMessages = [];
+  List<ChatThread> _availableThreads = const [];
   final List<int> _voiceBytes = [];
   final List<double> _voiceLevels = [];
   final Map<String, ChatUser> _profileOverridesByUser = {};
@@ -131,6 +134,8 @@ class _ChatHomePageState extends State<ChatHomePage>
   String? _voiceRecordingFilePath;
   String? _activeTypingConversationId;
   String? _activeConversationId;
+  ChatMessage? _replyingTo;
+  ChatMessage? _editingMessage;
   String? _pendingNotificationConversationId;
   String _query = '';
   bool _isSending = false;
@@ -635,6 +640,7 @@ class _ChatHomePageState extends State<ChatHomePage>
         final threads = _threadsWithActivity(
           _mergeThreads(snapshot.data ?? const []),
         );
+        _availableThreads = threads;
         _scheduleNotificationRouteResolution(threads);
         _syncTypingSubscriptions(threads);
         final selectedThread = _selectedThreadFor(threads);
@@ -758,6 +764,19 @@ class _ChatHomePageState extends State<ChatHomePage>
       showBackButton: showBackButton,
       onBackToInbox: _showCompactInbox,
       onSend: () => _sendMessage(thread),
+      replyingTo: _replyingTo?.threadId == thread.id ? _replyingTo : null,
+      editingMessage: _editingMessage?.threadId == thread.id
+          ? _editingMessage
+          : null,
+      onCancelComposerAction: _cancelComposerAction,
+      onReply: _startReply,
+      onEdit: _startEdit,
+      onDelete: _deleteMessage,
+      onReact: _showReactionPicker,
+      onToggleReaction: (message, emoji) =>
+          _toggleMessageReaction(message, emoji),
+      onForward: _forwardMessage,
+      onCopy: _copyMessage,
       onAttachMedia: (source) => _stageMediaAttachment(thread, source),
       onToggleVoiceRecording: () => _toggleVoiceRecording(thread),
       onRemoveAttachment: _removeStagedAttachment,
@@ -829,6 +848,9 @@ class _ChatHomePageState extends State<ChatHomePage>
     }
     setState(() {
       _selectedThread = thread;
+      _replyingTo = null;
+      _editingMessage = null;
+      _messageController.clear();
     });
   }
 
@@ -843,6 +865,9 @@ class _ChatHomePageState extends State<ChatHomePage>
     setState(() {
       _selectedThread = thread;
       _isCompactConversationOpen = true;
+      _replyingTo = null;
+      _editingMessage = null;
+      _messageController.clear();
     });
   }
 
@@ -1635,6 +1660,16 @@ class _ChatHomePageState extends State<ChatHomePage>
 
   Future<void> _sendMessage(ChatThread selectedThread) async {
     final text = _messageController.text.trim();
+    final editing = _editingMessage?.threadId == selectedThread.id
+        ? _editingMessage
+        : null;
+    if (editing != null) {
+      await _submitMessageEdit(editing, text);
+      return;
+    }
+    final replyTo = _replyingTo?.threadId == selectedThread.id
+        ? _replyingTo
+        : null;
     final stagedAttachment =
         _stagedAttachment?.conversationId == selectedThread.id
         ? _stagedAttachment
@@ -1656,6 +1691,7 @@ class _ChatHomePageState extends State<ChatHomePage>
         selectedThread: selectedThread,
         text: text,
         stagedAttachment: stagedAttachment,
+        replyTo: replyTo,
       );
       return;
     }
@@ -1686,9 +1722,13 @@ class _ChatHomePageState extends State<ChatHomePage>
                 ? ChatMessageType.text
                 : ChatMessageType.image,
             media: uploadedMedia?.media,
+            replyTo: replyTo == null
+                ? null
+                : MessageReplyPreview.fromMessage(replyTo),
           ),
         );
         _stagedAttachment = null;
+        _replyingTo = null;
       });
       return;
     }
@@ -1703,6 +1743,7 @@ class _ChatHomePageState extends State<ChatHomePage>
         await widget.repository.sendMessage(
           conversationId: selectedThread.id,
           body: text,
+          replyToMessageId: replyTo?.id,
         );
       } else {
         await widget.repository.sendMediaMessage(
@@ -1710,11 +1751,13 @@ class _ChatHomePageState extends State<ChatHomePage>
           messageId: uploadedMedia.messageId,
           body: text,
           media: uploadedMedia.media,
+          replyToMessageId: replyTo?.id,
         );
       }
       if (mounted && uploadedMedia != null) {
         setState(() {
           _stagedAttachment = null;
+          _replyingTo = null;
         });
       }
     } catch (_) {
@@ -1739,6 +1782,7 @@ class _ChatHomePageState extends State<ChatHomePage>
     required ChatThread selectedThread,
     required String text,
     required _StagedMediaAttachment? stagedAttachment,
+    ChatMessage? replyTo,
   }) async {
     final activeOutbox = await _ensureOfflineOutbox();
     if (activeOutbox == null) {
@@ -1761,11 +1805,15 @@ class _ChatHomePageState extends State<ChatHomePage>
             ? stagedAttachment?.pickedMedia
             : null,
         uploadedMedia: stagedAttachment?.uploadedMedia,
+        replyTo: replyTo == null
+            ? null
+            : MessageReplyPreview.fromMessage(replyTo),
       );
       if (mounted) {
         setState(() {
           _messageController.clear();
           _stagedAttachment = null;
+          _replyingTo = null;
         });
         FocusScope.of(context).unfocus();
       }
@@ -1786,6 +1834,268 @@ class _ChatHomePageState extends State<ChatHomePage>
         });
       }
     }
+  }
+
+  void _startReply(ChatMessage message) {
+    setState(() {
+      _replyingTo = message;
+      _editingMessage = null;
+    });
+  }
+
+  void _startEdit(ChatMessage message) {
+    setState(() {
+      _editingMessage = message;
+      _replyingTo = null;
+      _messageController
+        ..text = message.body
+        ..selection = TextSelection.collapsed(offset: message.body.length);
+    });
+  }
+
+  void _cancelComposerAction() {
+    setState(() {
+      final wasEditing = _editingMessage != null;
+      _replyingTo = null;
+      _editingMessage = null;
+      if (wasEditing) {
+        _messageController.clear();
+      }
+    });
+  }
+
+  Future<void> _submitMessageEdit(ChatMessage message, String body) async {
+    if (message.messageType == ChatMessageType.text && body.isEmpty) {
+      _showMessageActionError('Text messages cannot be empty.');
+      return;
+    }
+    try {
+      if (widget.repository.isConnected) {
+        await widget.repository.editMessage(messageId: message.id, body: body);
+      } else {
+        _replaceLocalMessage(
+          message.copyWith(body: body, editedAt: DateTime.now()),
+        );
+      }
+      if (!mounted) return;
+      setState(() {
+        _editingMessage = null;
+        _messageController.clear();
+      });
+    } catch (error) {
+      _showMessageActionError('Message not edited: ${_shortError(error)}');
+    }
+  }
+
+  Future<void> _deleteMessage(ChatMessage message) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Delete message?'),
+        content: const Text('This message will be deleted for everyone.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    try {
+      if (widget.repository.isConnected) {
+        await widget.repository.deleteMessage(message);
+      } else {
+        _replaceLocalMessage(
+          message.copyWith(
+            body: '',
+            messageType: ChatMessageType.text,
+            deletedAt: DateTime.now(),
+            reactions: const [],
+            clearMedia: true,
+            clearReply: true,
+          ),
+        );
+      }
+      if (_editingMessage?.id == message.id || _replyingTo?.id == message.id) {
+        _cancelComposerAction();
+      }
+    } catch (error) {
+      _showMessageActionError('Message not deleted: ${_shortError(error)}');
+    }
+  }
+
+  Future<void> _toggleMessageReaction(ChatMessage message, String emoji) async {
+    try {
+      if (widget.repository.isConnected) {
+        await widget.repository.toggleMessageReaction(
+          messageId: message.id,
+          emoji: emoji,
+        );
+        return;
+      }
+      final reactions = [...message.reactions];
+      final index = reactions.indexWhere((reaction) => reaction.emoji == emoji);
+      if (index == -1) {
+        reactions.add(
+          MessageReactionSummary(emoji: emoji, count: 1, reactedByMe: true),
+        );
+      } else {
+        final reaction = reactions[index];
+        if (reaction.reactedByMe && reaction.count == 1) {
+          reactions.removeAt(index);
+        } else {
+          reactions[index] = MessageReactionSummary(
+            emoji: emoji,
+            count: reaction.count + (reaction.reactedByMe ? -1 : 1),
+            reactedByMe: !reaction.reactedByMe,
+          );
+        }
+      }
+      _replaceLocalMessage(message.copyWith(reactions: reactions));
+    } catch (error) {
+      _showMessageActionError('Reaction not updated: ${_shortError(error)}');
+    }
+  }
+
+  Future<void> _showReactionPicker(ChatMessage message) async {
+    const quick = ['👍', '❤️', '😂', '😮', '😢', '🙏'];
+    final selected = await showModalBottomSheet<String>(
+      context: context,
+      isScrollControlled: true,
+      builder: (context) => SafeArea(
+        child: SizedBox(
+          height: math.min(430, MediaQuery.sizeOf(context).height * 0.72),
+          child: Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.all(12),
+                child: Wrap(
+                  spacing: 8,
+                  children: quick
+                      .map(
+                        (emoji) => ActionChip(
+                          label: Text(
+                            emoji,
+                            style: const TextStyle(fontSize: 22),
+                          ),
+                          onPressed: () => Navigator.pop(context, emoji),
+                        ),
+                      )
+                      .toList(),
+                ),
+              ),
+              const Divider(height: 1),
+              Expanded(
+                child: EmojiPicker(
+                  onEmojiSelected: (_, emoji) =>
+                      Navigator.pop(context, emoji.emoji),
+                  config: const Config(height: 330),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    if (selected != null) {
+      await _toggleMessageReaction(message, selected);
+    }
+  }
+
+  Future<void> _copyMessage(ChatMessage message) async {
+    await Clipboard.setData(ClipboardData(text: message.body));
+    if (!mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('Message copied.')));
+  }
+
+  Future<void> _forwardMessage(ChatMessage message) async {
+    final destination = await showDialog<ChatThread>(
+      context: context,
+      builder: (context) => SimpleDialog(
+        title: const Text('Forward to'),
+        children: _availableThreads
+            .map(
+              (thread) => SimpleDialogOption(
+                onPressed: () => Navigator.pop(context, thread),
+                child: ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: _Avatar(thread: thread, size: 40),
+                  title: Text(thread.title),
+                ),
+              ),
+            )
+            .toList(),
+      ),
+    );
+    if (destination == null) return;
+
+    try {
+      if (!widget.repository.isConnected) {
+        setState(() {
+          _localMessages.add(
+            ChatMessage(
+              id: 'local-forward-${DateTime.now().microsecondsSinceEpoch}',
+              threadId: destination.id,
+              senderId: ChatSeed.localUserId,
+              senderName: 'You',
+              body: message.body,
+              createdAt: DateTime.now(),
+              isMine: true,
+              isDelivered: false,
+              isRead: false,
+              messageType: message.messageType,
+              media: message.media,
+              isForwarded: true,
+            ),
+          );
+        });
+      } else {
+        final outbox = await _ensureOfflineOutbox();
+        if (outbox == null) {
+          throw StateError('The signed-in account is not ready.');
+        }
+        final pickedMedia = message.media == null
+            ? null
+            : await widget.repository.mediaForForward(message.media!);
+        await outbox.enqueue(
+          conversationId: destination.id,
+          senderId: widget.repository.localUserId,
+          senderName: widget.repository.localSenderName,
+          body: message.body,
+          pickedMedia: pickedMedia,
+          isForwarded: true,
+        );
+        await _refreshOutboxMessages(outbox);
+        await _flushOutbox();
+      }
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Forwarded to ${destination.title}.')),
+      );
+    } catch (error) {
+      _showMessageActionError('Message not forwarded: ${_shortError(error)}');
+    }
+  }
+
+  void _replaceLocalMessage(ChatMessage message) {
+    setState(() {
+      _localMessages.removeWhere((item) => item.id == message.id);
+      _localMessages.add(message);
+    });
+  }
+
+  void _showMessageActionError(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 }
 
@@ -2683,6 +2993,16 @@ class _ConversationPane extends StatelessWidget {
     required this.onStartVideoCall,
     required this.onOpenProfile,
     required this.onSignOut,
+    required this.replyingTo,
+    required this.editingMessage,
+    required this.onCancelComposerAction,
+    required this.onReply,
+    required this.onEdit,
+    required this.onDelete,
+    required this.onReact,
+    required this.onToggleReaction,
+    required this.onForward,
+    required this.onCopy,
   });
 
   final ChatThread thread;
@@ -2707,6 +3027,16 @@ class _ConversationPane extends StatelessWidget {
   final VoidCallback onStartVideoCall;
   final VoidCallback onOpenProfile;
   final VoidCallback onSignOut;
+  final ChatMessage? replyingTo;
+  final ChatMessage? editingMessage;
+  final VoidCallback onCancelComposerAction;
+  final ValueChanged<ChatMessage> onReply;
+  final ValueChanged<ChatMessage> onEdit;
+  final Future<void> Function(ChatMessage) onDelete;
+  final Future<void> Function(ChatMessage) onReact;
+  final Future<void> Function(ChatMessage, String) onToggleReaction;
+  final Future<void> Function(ChatMessage) onForward;
+  final Future<void> Function(ChatMessage) onCopy;
 
   @override
   Widget build(BuildContext context) {
@@ -2796,15 +3126,12 @@ class _ConversationPane extends StatelessWidget {
             builder: (context, snapshot) {
               final remoteMessages =
                   snapshot.data ?? ChatSeed.messagesFor(thread.id);
-              final remoteIds = remoteMessages
-                  .map((message) => message.id)
-                  .toSet();
-              final messages = [
-                ...remoteMessages,
-                ...localMessages.where(
-                  (message) => !remoteIds.contains(message.id),
-                ),
-              ]..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+              final messagesById = <String, ChatMessage>{
+                for (final message in remoteMessages) message.id: message,
+                for (final message in localMessages) message.id: message,
+              };
+              final messages = messagesById.values.toList()
+                ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
 
               if (repository.isConnected && messages.isNotEmpty) {
                 unawaited(repository.markConversationRead(thread.id));
@@ -2822,6 +3149,13 @@ class _ConversationPane extends StatelessWidget {
                     message: messages[index],
                     repository: repository,
                     onRetry: () => onRetryOutboxMessage(messages[index].id),
+                    onReply: onReply,
+                    onEdit: onEdit,
+                    onDelete: onDelete,
+                    onReact: onReact,
+                    onToggleReaction: onToggleReaction,
+                    onForward: onForward,
+                    onCopy: onCopy,
                   );
                 },
               );
@@ -2835,6 +3169,9 @@ class _ConversationPane extends StatelessWidget {
           voiceRecordingElapsed: voiceRecordingElapsed,
           voiceRecordingLevels: voiceRecordingLevels,
           stagedAttachment: stagedAttachment,
+          replyingTo: replyingTo,
+          editingMessage: editingMessage,
+          onCancelComposerAction: onCancelComposerAction,
           onAttachMedia: onAttachMedia,
           onToggleVoiceRecording: onToggleVoiceRecording,
           onRemoveAttachment: onRemoveAttachment,
@@ -2846,6 +3183,8 @@ class _ConversationPane extends StatelessWidget {
     );
   }
 }
+
+enum _MessageAction { reply, react, edit, delete, forward, copy }
 
 class _IncomingCallOverlay extends StatelessWidget {
   const _IncomingCallOverlay({
@@ -3085,11 +3424,25 @@ class _MessageBubble extends StatelessWidget {
     required this.message,
     required this.repository,
     required this.onRetry,
+    required this.onReply,
+    required this.onEdit,
+    required this.onDelete,
+    required this.onReact,
+    required this.onToggleReaction,
+    required this.onForward,
+    required this.onCopy,
   });
 
   final ChatMessage message;
   final ChatRepository repository;
   final Future<void> Function() onRetry;
+  final ValueChanged<ChatMessage> onReply;
+  final ValueChanged<ChatMessage> onEdit;
+  final Future<void> Function(ChatMessage) onDelete;
+  final Future<void> Function(ChatMessage) onReact;
+  final Future<void> Function(ChatMessage, String) onToggleReaction;
+  final Future<void> Function(ChatMessage) onForward;
+  final Future<void> Function(ChatMessage) onCopy;
 
   @override
   Widget build(BuildContext context) {
@@ -3108,95 +3461,325 @@ class _MessageBubble extends StatelessWidget {
         ? theme.colorScheme.onPrimary
         : theme.colorScheme.onSurface;
 
+    final bubble = DecoratedBox(
+      decoration: BoxDecoration(
+        color: bubbleColor,
+        borderRadius: BorderRadius.only(
+          topLeft: const Radius.circular(8),
+          topRight: const Radius.circular(8),
+          bottomLeft: Radius.circular(isMine ? 8 : 2),
+          bottomRight: Radius.circular(isMine ? 2 : 8),
+        ),
+      ),
+      child: Padding(
+        padding: EdgeInsets.fromLTRB(
+          media == null ? 14 : 6,
+          media == null ? 10 : 6,
+          media == null ? 14 : 6,
+          8,
+        ),
+        child: Column(
+          crossAxisAlignment: isMine
+              ? CrossAxisAlignment.end
+              : CrossAxisAlignment.start,
+          children: [
+            if (!isMine) ...[
+              Text(
+                message.senderName,
+                style: theme.textTheme.labelMedium?.copyWith(
+                  color: textColor.withValues(alpha: 0.74),
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 4),
+            ],
+            if (message.isForwarded && !message.isDeleted)
+              _MessageFlag(
+                icon: Icons.forward,
+                label: 'Forwarded',
+                color: textColor.withValues(alpha: 0.72),
+              ),
+            if (message.replyTo case final reply?) ...[
+              _ReplyPreviewCard(reply: reply, color: textColor),
+              const SizedBox(height: 8),
+            ],
+            if (message.isDeleted)
+              Text(
+                'Message deleted',
+                style: theme.textTheme.bodyLarge?.copyWith(
+                  color: textColor.withValues(alpha: 0.72),
+                  fontStyle: FontStyle.italic,
+                ),
+              )
+            else ...[
+              if (media != null) ...[
+                _MessageMediaPreview(
+                  message: message,
+                  media: media,
+                  repository: repository,
+                ),
+                if (hasText) const SizedBox(height: 8),
+              ],
+              if (hasText)
+                Padding(
+                  padding: EdgeInsets.symmetric(
+                    horizontal: media == null ? 0 : 8,
+                  ),
+                  child: Text(
+                    message.body,
+                    style: theme.textTheme.bodyLarge?.copyWith(
+                      color: textColor,
+                      height: 1.25,
+                    ),
+                  ),
+                ),
+            ],
+            const SizedBox(height: 6),
+            Padding(
+              padding: EdgeInsets.symmetric(horizontal: media == null ? 0 : 8),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (message.isEdited) ...[
+                    Text(
+                      'Edited',
+                      style: theme.textTheme.labelSmall?.copyWith(
+                        color: textColor.withValues(alpha: 0.72),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                  ],
+                  Text(
+                    _formatTime(message.createdAt),
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      color: textColor.withValues(alpha: 0.72),
+                    ),
+                  ),
+                  if (isMine) ...[
+                    const SizedBox(width: 6),
+                    _ReceiptIcon(
+                      message: message,
+                      fallbackColor: textColor.withValues(alpha: 0.72),
+                      onRetry: onRetry,
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+
     return Align(
       alignment: isMine ? Alignment.centerRight : Alignment.centerLeft,
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 520),
         child: Padding(
           padding: const EdgeInsets.only(bottom: 10),
-          child: DecoratedBox(
-            decoration: BoxDecoration(
-              color: bubbleColor,
-              borderRadius: BorderRadius.only(
-                topLeft: const Radius.circular(8),
-                topRight: const Radius.circular(8),
-                bottomLeft: Radius.circular(isMine ? 8 : 2),
-                bottomRight: Radius.circular(isMine ? 2 : 8),
+          child: Column(
+            crossAxisAlignment: isMine
+                ? CrossAxisAlignment.end
+                : CrossAxisAlignment.start,
+            children: [
+              GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onLongPress: message.isDeleted
+                    ? null
+                    : () => _showActions(context),
+                onSecondaryTapDown: message.isDeleted
+                    ? null
+                    : (_) => _showActions(context),
+                child: bubble,
               ),
-            ),
-            child: Padding(
-              padding: EdgeInsets.fromLTRB(
-                media == null ? 14 : 6,
-                media == null ? 10 : 6,
-                media == null ? 14 : 6,
-                8,
-              ),
-              child: Column(
-                crossAxisAlignment: isMine
-                    ? CrossAxisAlignment.end
-                    : CrossAxisAlignment.start,
-                children: [
-                  if (!isMine) ...[
-                    Text(
-                      message.senderName,
-                      style: theme.textTheme.labelMedium?.copyWith(
-                        color: textColor.withValues(alpha: 0.74),
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                    const SizedBox(height: 4),
-                  ],
-                  if (media != null) ...[
-                    _MessageMediaPreview(
-                      message: message,
-                      media: media,
-                      repository: repository,
-                    ),
-                    if (hasText) const SizedBox(height: 8),
-                  ],
-                  if (hasText)
-                    Padding(
-                      padding: EdgeInsets.symmetric(
-                        horizontal: media == null ? 0 : 8,
-                      ),
-                      child: Text(
-                        message.body,
-                        style: theme.textTheme.bodyLarge?.copyWith(
-                          color: textColor,
-                          height: 1.25,
-                        ),
-                      ),
-                    ),
-                  const SizedBox(height: 6),
-                  Padding(
-                    padding: EdgeInsets.symmetric(
-                      horizontal: media == null ? 0 : 8,
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Text(
-                          _formatTime(message.createdAt),
-                          style: theme.textTheme.labelSmall?.copyWith(
-                            color: textColor.withValues(alpha: 0.72),
+              if (message.reactions.isNotEmpty) ...[
+                const SizedBox(height: 4),
+                Wrap(
+                  spacing: 4,
+                  runSpacing: 4,
+                  children: message.reactions
+                      .map(
+                        (reaction) => ActionChip(
+                          visualDensity: VisualDensity.compact,
+                          backgroundColor: reaction.reactedByMe
+                              ? theme.colorScheme.primaryContainer
+                              : theme.colorScheme.surfaceContainerHighest,
+                          label: Text('${reaction.emoji} ${reaction.count}'),
+                          onPressed: () => unawaited(
+                            onToggleReaction(message, reaction.emoji),
                           ),
                         ),
-                        if (isMine) ...[
-                          const SizedBox(width: 6),
-                          _ReceiptIcon(
-                            message: message,
-                            fallbackColor: textColor.withValues(alpha: 0.72),
-                            onRetry: onRetry,
-                          ),
-                        ],
-                      ],
-                    ),
-                  ),
-                ],
-              ),
-            ),
+                      )
+                      .toList(),
+                ),
+              ],
+            ],
           ),
         ),
+      ),
+    );
+  }
+
+  Future<void> _showActions(BuildContext context) async {
+    final sent = message.sendState == ChatMessageSendState.sent;
+    final action = await showModalBottomSheet<_MessageAction>(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Wrap(
+          children: [
+            if (sent) ...[
+              _MessageActionTile(
+                icon: Icons.reply,
+                label: 'Reply',
+                action: _MessageAction.reply,
+              ),
+              _MessageActionTile(
+                icon: Icons.add_reaction_outlined,
+                label: 'React',
+                action: _MessageAction.react,
+              ),
+              _MessageActionTile(
+                icon: Icons.forward,
+                label: 'Forward',
+                action: _MessageAction.forward,
+              ),
+            ],
+            if (message.body.trim().isNotEmpty)
+              _MessageActionTile(
+                icon: Icons.copy_outlined,
+                label: 'Copy',
+                action: _MessageAction.copy,
+              ),
+            if (message.isMine && sent) ...[
+              _MessageActionTile(
+                icon: Icons.edit_outlined,
+                label: 'Edit',
+                action: _MessageAction.edit,
+              ),
+              _MessageActionTile(
+                icon: Icons.delete_outline,
+                label: 'Delete',
+                action: _MessageAction.delete,
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+    if (action == null) return;
+    switch (action) {
+      case _MessageAction.reply:
+        onReply(message);
+        return;
+      case _MessageAction.react:
+        await onReact(message);
+        return;
+      case _MessageAction.edit:
+        onEdit(message);
+        return;
+      case _MessageAction.delete:
+        await onDelete(message);
+        return;
+      case _MessageAction.forward:
+        await onForward(message);
+        return;
+      case _MessageAction.copy:
+        await onCopy(message);
+        return;
+    }
+  }
+}
+
+class _MessageActionTile extends StatelessWidget {
+  const _MessageActionTile({
+    required this.icon,
+    required this.label,
+    required this.action,
+  });
+
+  final IconData icon;
+  final String label;
+  final _MessageAction action;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListTile(
+      leading: Icon(icon),
+      title: Text(label),
+      onTap: () => Navigator.pop(context, action),
+    );
+  }
+}
+
+class _MessageFlag extends StatelessWidget {
+  const _MessageFlag({
+    required this.icon,
+    required this.label,
+    required this.color,
+  });
+
+  final IconData icon;
+  final String label;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 14, color: color),
+          const SizedBox(width: 4),
+          Text(
+            label,
+            style: Theme.of(
+              context,
+            ).textTheme.labelSmall?.copyWith(color: color),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ReplyPreviewCard extends StatelessWidget {
+  const _ReplyPreviewCard({required this.reply, required this.color});
+
+  final MessageReplyPreview reply;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.10),
+        borderRadius: BorderRadius.circular(6),
+        border: Border(left: BorderSide(color: color, width: 3)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            reply.senderName,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: Theme.of(context).textTheme.labelMedium?.copyWith(
+              color: color,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          Text(
+            reply.preview,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: Theme.of(
+              context,
+            ).textTheme.bodySmall?.copyWith(color: color),
+          ),
+        ],
       ),
     );
   }
@@ -4069,6 +4652,9 @@ class _MessageComposer extends StatelessWidget {
     required this.voiceRecordingElapsed,
     required this.voiceRecordingLevels,
     required this.stagedAttachment,
+    required this.replyingTo,
+    required this.editingMessage,
+    required this.onCancelComposerAction,
     required this.onAttachMedia,
     required this.onToggleVoiceRecording,
     required this.onRemoveAttachment,
@@ -4083,6 +4669,9 @@ class _MessageComposer extends StatelessWidget {
   final Duration voiceRecordingElapsed;
   final List<double> voiceRecordingLevels;
   final _StagedMediaAttachment? stagedAttachment;
+  final ChatMessage? replyingTo;
+  final ChatMessage? editingMessage;
+  final VoidCallback onCancelComposerAction;
   final ValueChanged<ChatMediaSource> onAttachMedia;
   final VoidCallback onToggleVoiceRecording;
   final Future<void> Function() onRemoveAttachment;
@@ -4107,6 +4696,14 @@ class _MessageComposer extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            if (replyingTo != null || editingMessage != null) ...[
+              _ComposerActionCard(
+                message: editingMessage ?? replyingTo!,
+                isEditing: editingMessage != null,
+                onCancel: onCancelComposerAction,
+              ),
+              const SizedBox(height: 10),
+            ],
             if (stagedAttachment != null) ...[
               _StagedAttachmentCard(
                 attachment: stagedAttachment!,
@@ -4213,6 +4810,65 @@ class _MessageComposer extends StatelessWidget {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class _ComposerActionCard extends StatelessWidget {
+  const _ComposerActionCard({
+    required this.message,
+    required this.isEditing,
+    required this.onCancel,
+  });
+
+  final ChatMessage message;
+  final bool isEditing;
+  final VoidCallback onCancel;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(12, 8, 4, 8),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(8),
+        border: Border(
+          left: BorderSide(color: theme.colorScheme.primary, width: 3),
+        ),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  isEditing
+                      ? 'Editing message'
+                      : 'Replying to ${message.senderName}',
+                  style: theme.textTheme.labelLarge?.copyWith(
+                    color: theme.colorScheme.primary,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                Text(
+                  message.actionPreview,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.bodySmall,
+                ),
+              ],
+            ),
+          ),
+          IconButton(
+            tooltip: 'Cancel',
+            onPressed: onCancel,
+            icon: const Icon(Icons.close),
+          ),
+        ],
       ),
     );
   }

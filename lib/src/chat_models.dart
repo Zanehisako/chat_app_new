@@ -420,6 +420,44 @@ class UploadedChatMedia {
   final ChatMedia media;
 }
 
+class MessageReplyPreview {
+  const MessageReplyPreview({
+    required this.messageId,
+    required this.senderName,
+    required this.preview,
+    required this.messageType,
+    this.isDeleted = false,
+  });
+
+  final String messageId;
+  final String senderName;
+  final String preview;
+  final ChatMessageType messageType;
+  final bool isDeleted;
+
+  factory MessageReplyPreview.fromMessage(ChatMessage message) {
+    return MessageReplyPreview(
+      messageId: message.id,
+      senderName: message.senderName,
+      preview: message.actionPreview,
+      messageType: message.messageType,
+      isDeleted: message.isDeleted,
+    );
+  }
+}
+
+class MessageReactionSummary {
+  const MessageReactionSummary({
+    required this.emoji,
+    required this.count,
+    required this.reactedByMe,
+  });
+
+  final String emoji;
+  final int count;
+  final bool reactedByMe;
+}
+
 class ChatMessage {
   const ChatMessage({
     required this.id,
@@ -435,6 +473,11 @@ class ChatMessage {
     this.media,
     this.sendState = ChatMessageSendState.sent,
     this.sendError,
+    this.replyTo,
+    this.reactions = const [],
+    this.isForwarded = false,
+    this.editedAt,
+    this.deletedAt,
   });
 
   final String id;
@@ -450,20 +493,81 @@ class ChatMessage {
   final ChatMedia? media;
   final ChatMessageSendState sendState;
   final String? sendError;
+  final MessageReplyPreview? replyTo;
+  final List<MessageReactionSummary> reactions;
+  final bool isForwarded;
+  final DateTime? editedAt;
+  final DateTime? deletedAt;
 
   bool get hasMedia => media != null && messageType != ChatMessageType.text;
+  bool get isDeleted => deletedAt != null;
+  bool get isEdited => editedAt != null && !isDeleted;
+
+  String get actionPreview {
+    if (isDeleted) {
+      return 'Message deleted';
+    }
+    final text = body.trim();
+    if (text.isNotEmpty) {
+      return text;
+    }
+    return switch (messageType) {
+      ChatMessageType.image => 'Photo',
+      ChatMessageType.gif => 'GIF',
+      ChatMessageType.voice => 'Voice message',
+      ChatMessageType.call => 'Call event',
+      ChatMessageType.text => 'Message',
+    };
+  }
+
+  ChatMessage copyWith({
+    String? body,
+    ChatMessageType? messageType,
+    ChatMedia? media,
+    MessageReplyPreview? replyTo,
+    List<MessageReactionSummary>? reactions,
+    bool? isForwarded,
+    DateTime? editedAt,
+    DateTime? deletedAt,
+    bool clearReply = false,
+    bool clearMedia = false,
+  }) {
+    return ChatMessage(
+      id: id,
+      threadId: threadId,
+      senderId: senderId,
+      senderName: senderName,
+      body: body ?? this.body,
+      createdAt: createdAt,
+      isMine: isMine,
+      isDelivered: isDelivered,
+      isRead: isRead,
+      messageType: messageType ?? this.messageType,
+      media: clearMedia ? null : media ?? this.media,
+      sendState: sendState,
+      sendError: sendError,
+      replyTo: clearReply ? null : replyTo ?? this.replyTo,
+      reactions: reactions ?? this.reactions,
+      isForwarded: isForwarded ?? this.isForwarded,
+      editedAt: editedAt ?? this.editedAt,
+      deletedAt: deletedAt ?? this.deletedAt,
+    );
+  }
 
   factory ChatMessage.fromSupabase(
     Map<String, dynamic> row, {
     required String localUserId,
     MessageReceipt? receipt,
+    MessageReplyPreview? replyTo,
+    List<MessageReactionSummary> reactions = const [],
   }) {
     final senderId = row['sender_id']?.toString() ?? '';
     final isMine = senderId == localUserId;
     final isRead = isMine && (receipt?.isRead ?? false);
     final isDelivered = isMine && ((receipt?.isDelivered ?? false) || isRead);
+    final deletedAt = _readOptionalTimestamp(row['deleted_at']);
     final mediaPath = row['media_path']?.toString();
-    final media = mediaPath == null || mediaPath.isEmpty
+    final media = deletedAt != null || mediaPath == null || mediaPath.isEmpty
         ? null
         : ChatMedia.fromSupabase(row);
     final messageType = ChatMessageType.fromValue(
@@ -479,15 +583,50 @@ class ChatMessage {
           '',
       senderId: senderId,
       senderName: row['sender_name']?.toString() ?? 'Unknown',
-      body: row['body']?.toString() ?? '',
+      body: deletedAt == null ? row['body']?.toString() ?? '' : '',
       createdAt: _readRequiredTimestamp(row['created_at']),
       isMine: isMine,
       isDelivered: isDelivered,
       isRead: isRead,
       messageType: messageType,
       media: media,
+      replyTo: deletedAt == null ? replyTo : null,
+      reactions: deletedAt == null ? reactions : const [],
+      isForwarded: row['is_forwarded'] == true,
+      editedAt: _readOptionalTimestamp(row['edited_at']),
+      deletedAt: deletedAt,
     );
   }
+}
+
+List<MessageReactionSummary> summarizeMessageReactions(
+  Iterable<Map<String, dynamic>> rows, {
+  required String localUserId,
+}) {
+  final counts = <String, int>{};
+  final mine = <String>{};
+  for (final row in rows) {
+    final emoji = row['emoji']?.toString() ?? '';
+    if (emoji.isEmpty) {
+      continue;
+    }
+    counts[emoji] = (counts[emoji] ?? 0) + 1;
+    if (row['user_id']?.toString() == localUserId) {
+      mine.add(emoji);
+    }
+  }
+
+  final summaries = counts.entries
+      .map(
+        (entry) => MessageReactionSummary(
+          emoji: entry.key,
+          count: entry.value,
+          reactedByMe: mine.contains(entry.key),
+        ),
+      )
+      .toList();
+  summaries.sort((left, right) => left.emoji.compareTo(right.emoji));
+  return List.unmodifiable(summaries);
 }
 
 int _readInt(Object? value) {

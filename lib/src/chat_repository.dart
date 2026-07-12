@@ -977,25 +977,48 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
     final controller = StreamController<List<ChatMessage>>();
     final messagesById = <String, Map<String, dynamic>>{};
     var receiptsByMessageId = <String, MessageReceipt>{};
+    var reactionRows = <Map<String, dynamic>>[];
     StreamSubscription<List<Map<String, dynamic>>>? messagesSubscription;
     StreamSubscription<List<Map<String, dynamic>>>? receiptsSubscription;
+    StreamSubscription<List<Map<String, dynamic>>>? reactionsSubscription;
 
     void emitMessages() {
       if (controller.isClosed) {
         return;
       }
 
-      final messages =
-          messagesById.values
-              .map(
-                (row) => ChatMessage.fromSupabase(
-                  row,
-                  localUserId: user.id,
-                  receipt: receiptsByMessageId[row['id']?.toString()],
-                ),
-              )
-              .toList()
-            ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+      final baseMessages = <String, ChatMessage>{
+        for (final row in messagesById.values)
+          row['id']?.toString() ?? '': ChatMessage.fromSupabase(
+            row,
+            localUserId: user.id,
+            receipt: receiptsByMessageId[row['id']?.toString()],
+          ),
+      };
+      final reactionsByMessageId = <String, List<Map<String, dynamic>>>{};
+      for (final row in reactionRows) {
+        reactionsByMessageId
+            .putIfAbsent(row['message_id']?.toString() ?? '', () => [])
+            .add(row);
+      }
+
+      final messages = messagesById.values.map((row) {
+        final messageId = row['id']?.toString() ?? '';
+        final replyId = row['reply_to_message_id']?.toString();
+        final replyMessage = replyId == null ? null : baseMessages[replyId];
+        return ChatMessage.fromSupabase(
+          row,
+          localUserId: user.id,
+          receipt: receiptsByMessageId[messageId],
+          replyTo: replyMessage == null
+              ? null
+              : MessageReplyPreview.fromMessage(replyMessage),
+          reactions: summarizeMessageReactions(
+            reactionsByMessageId[messageId] ?? const [],
+            localUserId: user.id,
+          ),
+        );
+      }).toList()..sort((a, b) => a.createdAt.compareTo(b.createdAt));
 
       controller.add(messages);
     }
@@ -1028,9 +1051,19 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
           emitMessages();
         }, onError: controller.addError);
 
+    reactionsSubscription = supabase
+        .from('message_reactions')
+        .stream(primaryKey: ['message_id', 'user_id', 'emoji'])
+        .eq('conversation_id', conversationId)
+        .listen((rows) {
+          reactionRows = rows;
+          emitMessages();
+        }, onError: controller.addError);
+
     controller.onCancel = () async {
       await messagesSubscription?.cancel();
       await receiptsSubscription?.cancel();
+      await reactionsSubscription?.cancel();
     };
 
     return controller.stream;
@@ -1071,7 +1104,9 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
       channel.subscribe((status, error) {
         if (status == RealtimeSubscribeStatus.channelError &&
             !controller.isClosed) {
-          controller.addError(error ?? StateError('Incoming message watch failed.'));
+          controller.addError(
+            error ?? StateError('Incoming message watch failed.'),
+          );
         }
       });
     };
@@ -1101,6 +1136,8 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
     required String conversationId,
     required String body,
     String? messageId,
+    String? replyToMessageId,
+    bool isForwarded = false,
   }) async {
     final trimmed = body.trim();
     final supabase = client;
@@ -1118,6 +1155,8 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
       'sender_id': user.id,
       'sender_name': localSenderName,
       'body': trimmed,
+      'reply_to_message_id': replyToMessageId,
+      'is_forwarded': isForwarded,
     };
     if (messageId != null) {
       row['id'] = messageId;
@@ -1131,6 +1170,8 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
     required String messageId,
     required String body,
     required ChatMedia media,
+    String? replyToMessageId,
+    bool isForwarded = false,
   }) async {
     final supabase = client;
     if (supabase == null) {
@@ -1148,6 +1189,8 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
       'sender_id': user.id,
       'sender_name': localSenderName,
       'body': body.trim(),
+      'reply_to_message_id': replyToMessageId,
+      'is_forwarded': isForwarded,
       'message_type': media.isVoice
           ? ChatMessageType.voice.value
           : media.isGif
@@ -1163,6 +1206,73 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
       'media_waveform': media.waveform.isEmpty ? null : media.waveform,
       'media_original_name': media.originalName,
     });
+  }
+
+  Future<void> editMessage({
+    required String messageId,
+    required String body,
+  }) async {
+    final supabase = client;
+    if (supabase == null) {
+      return;
+    }
+    await supabase.rpc(
+      'edit_message',
+      params: {'target_message_id': messageId, 'new_body': body},
+    );
+  }
+
+  Future<void> deleteMessage(ChatMessage message) async {
+    final supabase = client;
+    if (supabase == null) {
+      return;
+    }
+    final result = await supabase.rpc(
+      'delete_message',
+      params: {'target_message_id': message.id},
+    );
+    if (result is! List || result.isEmpty || result.first is! Map) {
+      return;
+    }
+    final row = Map<String, dynamic>.from(result.first as Map);
+    final bucket = row['media_bucket']?.toString();
+    final path = row['media_path']?.toString();
+    if (bucket == null || bucket.isEmpty || path == null || path.isEmpty) {
+      return;
+    }
+    try {
+      await supabase.storage.from(bucket).remove([path]);
+    } catch (error) {
+      debugPrint('[Message delete] Orphaned media cleanup failed: $error');
+    }
+  }
+
+  Future<void> toggleMessageReaction({
+    required String messageId,
+    required String emoji,
+  }) async {
+    final supabase = client;
+    if (supabase == null) {
+      return;
+    }
+    await supabase.rpc(
+      'toggle_message_reaction',
+      params: {'target_message_id': messageId, 'selected_emoji': emoji},
+    );
+  }
+
+  Future<PickedChatMedia> mediaForForward(ChatMedia media) async {
+    final bytes = await mediaBytes(media);
+    return PickedChatMedia(
+      bytes: bytes,
+      originalName: media.originalName ?? 'forwarded-media',
+      mimeType: media.mimeType,
+      sizeBytes: bytes.length,
+      width: media.width,
+      height: media.height,
+      duration: media.duration,
+      waveform: media.waveform,
+    );
   }
 
   Future<void> disposeRealtime() async {

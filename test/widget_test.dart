@@ -71,6 +71,43 @@ void main() {
     await database.close();
   });
 
+  test(
+    'outbox preserves reply and forwarding metadata through retry',
+    () async {
+      SharedPreferences.setMockInitialValues({});
+      final database = _testOutboxDatabase();
+      final firstOutbox = OfflineOutboxService(database: database);
+      await firstOutbox.enqueue(
+        conversationId: 'conversation-1',
+        senderId: ChatSeed.localUserId,
+        senderName: 'You',
+        body: 'Forwarded reply',
+        replyTo: const MessageReplyPreview(
+          messageId: 'source-message',
+          senderName: 'Mina',
+          preview: 'Original message',
+          messageType: ChatMessageType.text,
+        ),
+        isForwarded: true,
+      );
+      await firstOutbox.dispose();
+
+      final reloaded = OfflineOutboxService(database: database);
+      await reloaded.initialize();
+      final localMessage = (await reloaded.localMessages()).single;
+      expect(localMessage.replyTo?.messageId, 'source-message');
+      expect(localMessage.isForwarded, isTrue);
+
+      final sender = _TestOutboxSender();
+      await reloaded.start(sender);
+      expect(sender.lastReplyToMessageId, 'source-message');
+      expect(sender.lastIsForwarded, isTrue);
+
+      await reloaded.dispose();
+      await database.close();
+    },
+  );
+
   test('outbox retryNow makes a failed item pending again', () async {
     final failed = OutboxMessage(
       id: 'failed-message',
@@ -1020,6 +1057,31 @@ void main() {
     expect(textMessage.messageType, ChatMessageType.text);
     expect(textMessage.media, isNull);
     expect(textMessage.body, 'Legacy text');
+
+    final deletedMessage = ChatMessage.fromSupabase({
+      'id': 'm5',
+      'conversation_id': 'conversation-1',
+      'sender_id': 'user-2',
+      'sender_name': 'You',
+      'body': 'Content that must not render',
+      'created_at': DateTime.utc(2026).toIso8601String(),
+      'deleted_at': DateTime.utc(2026, 1, 2).toIso8601String(),
+      'media_path': 'conversation-1/user-2/private.png',
+    }, localUserId: 'user-2');
+    expect(deletedMessage.isDeleted, isTrue);
+    expect(deletedMessage.body, isEmpty);
+    expect(deletedMessage.media, isNull);
+
+    final reactions = summarizeMessageReactions([
+      {'emoji': '👍', 'user_id': 'user-1'},
+      {'emoji': '👍', 'user_id': 'user-2'},
+      {'emoji': '❤️', 'user_id': 'user-1'},
+    ], localUserId: 'user-2');
+    expect(reactions.firstWhere((item) => item.emoji == '👍').count, 2);
+    expect(
+      reactions.firstWhere((item) => item.emoji == '👍').reactedByMe,
+      isTrue,
+    );
   });
 
   test('builds Supabase media upload URL with bucket and encoded path', () {
@@ -1473,6 +1535,8 @@ class _MediaChatRepository extends _MessagesChatRepository {
     required String messageId,
     required String body,
     required ChatMedia media,
+    String? replyToMessageId,
+    bool isForwarded = false,
   }) async {
     sentBody = body;
     sentMedia = media;
@@ -1517,6 +1581,8 @@ class _TestOutboxSender implements OutboxMessageSender {
   final List<String> sentMediaMessageIds = [];
   bool shouldFail;
   bool failMediaSendAfterUpload;
+  String? lastReplyToMessageId;
+  bool? lastIsForwarded;
 
   @override
   bool get isOutboxReady => true;
@@ -1559,8 +1625,12 @@ class _TestOutboxSender implements OutboxMessageSender {
     required String conversationId,
     required String body,
     String? messageId,
+    String? replyToMessageId,
+    bool isForwarded = false,
   }) async {
     _throwIfConfigured();
+    lastReplyToMessageId = replyToMessageId;
+    lastIsForwarded = isForwarded;
     sentTextMessageIds.add(messageId!);
   }
 
@@ -1570,8 +1640,12 @@ class _TestOutboxSender implements OutboxMessageSender {
     required String messageId,
     required String body,
     required ChatMedia media,
+    String? replyToMessageId,
+    bool isForwarded = false,
   }) async {
     _throwIfConfigured();
+    lastReplyToMessageId = replyToMessageId;
+    lastIsForwarded = isForwarded;
     if (failMediaSendAfterUpload) {
       throw StateError('message insert failed');
     }
@@ -1600,6 +1674,8 @@ class _BlockingOutboxSender extends _TestOutboxSender {
     required String conversationId,
     required String body,
     String? messageId,
+    String? replyToMessageId,
+    bool isForwarded = false,
   }) async {
     if (!started.isCompleted) {
       started.complete();
@@ -1609,6 +1685,8 @@ class _BlockingOutboxSender extends _TestOutboxSender {
       conversationId: conversationId,
       body: body,
       messageId: messageId,
+      replyToMessageId: replyToMessageId,
+      isForwarded: isForwarded,
     );
   }
 }

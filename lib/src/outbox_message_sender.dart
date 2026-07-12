@@ -17,6 +17,8 @@ abstract interface class OutboxMessageSender {
     required String conversationId,
     required String body,
     String? messageId,
+    String? replyToMessageId,
+    bool isForwarded = false,
   });
 
   Future<void> sendMediaMessage({
@@ -24,6 +26,8 @@ abstract interface class OutboxMessageSender {
     required String messageId,
     required String body,
     required ChatMedia media,
+    String? replyToMessageId,
+    bool isForwarded = false,
   });
 }
 

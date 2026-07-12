@@ -64,6 +64,8 @@ class OutboxMessage {
     this.nextAttemptAt,
     this.lastError,
     this.media,
+    this.replyTo,
+    this.isForwarded = false,
   });
 
   final String id;
@@ -77,6 +79,8 @@ class OutboxMessage {
   final DateTime? nextAttemptAt;
   final String? lastError;
   final QueuedOutboxMedia? media;
+  final MessageReplyPreview? replyTo;
+  final bool isForwarded;
 
   bool isDueAt(DateTime now) {
     if (status == OutboxSendStatus.failed) {
@@ -111,6 +115,8 @@ class OutboxMessage {
           : nextAttemptAt ?? this.nextAttemptAt,
       lastError: clearLastError ? null : lastError ?? this.lastError,
       media: media ?? this.media,
+      replyTo: replyTo,
+      isForwarded: isForwarded,
     );
   }
 
@@ -127,6 +133,16 @@ class OutboxMessage {
       'nextAttemptAt': nextAttemptAt?.toIso8601String(),
       'lastError': lastError,
       'media': media?.toJson(),
+      'replyTo': replyTo == null
+          ? null
+          : {
+              'messageId': replyTo!.messageId,
+              'senderName': replyTo!.senderName,
+              'preview': replyTo!.preview,
+              'messageType': replyTo!.messageType.value,
+              'isDeleted': replyTo!.isDeleted,
+            },
+      'isForwarded': isForwarded,
     };
   }
 
@@ -137,6 +153,9 @@ class OutboxMessage {
       orElse: () => OutboxSendStatus.pending,
     );
 
+    final replyJson = json['replyTo'] is Map
+        ? Map<String, dynamic>.from(json['replyTo'] as Map)
+        : null;
     return OutboxMessage(
       id: json['id']?.toString() ?? const Uuid().v4(),
       conversationId: json['conversationId']?.toString() ?? '',
@@ -157,6 +176,18 @@ class OutboxMessage {
               Map<String, dynamic>.from(json['media'] as Map),
             )
           : null,
+      replyTo: replyJson == null
+          ? null
+          : MessageReplyPreview(
+              messageId: replyJson['messageId']?.toString() ?? '',
+              senderName: replyJson['senderName']?.toString() ?? 'Unknown',
+              preview: replyJson['preview']?.toString() ?? 'Message',
+              messageType: ChatMessageType.fromValue(
+                replyJson['messageType']?.toString(),
+              ),
+              isDeleted: replyJson['isDeleted'] == true,
+            ),
+      isForwarded: json['isForwarded'] == true,
     );
   }
 }
@@ -402,6 +433,8 @@ class OfflineOutboxService {
     required String body,
     PickedChatMedia? pickedMedia,
     UploadedChatMedia? uploadedMedia,
+    MessageReplyPreview? replyTo,
+    bool isForwarded = false,
   }) async {
     if (_disposed) {
       throw StateError('The offline outbox is already disposed.');
@@ -432,6 +465,8 @@ class OfflineOutboxService {
       status: OutboxSendStatus.pending,
       attemptCount: 0,
       media: media,
+      replyTo: replyTo,
+      isForwarded: isForwarded,
     );
     await _persistItem(item, localMediaBytes: pickedMedia?.bytes);
     _items.add(item);
@@ -533,6 +568,8 @@ class OfflineOutboxService {
               OutboxSendStatus.failed => ChatMessageSendState.failed,
             },
             sendError: item.lastError,
+            replyTo: item.replyTo,
+            isForwarded: item.isForwarded,
           );
         })
         .toList(growable: false);
@@ -618,6 +655,8 @@ class OfflineOutboxService {
           conversationId: item.conversationId,
           messageId: item.id,
           body: item.body,
+          replyToMessageId: item.replyTo?.messageId,
+          isForwarded: item.isForwarded,
         ),
         'Message send',
       );
@@ -656,6 +695,8 @@ class OfflineOutboxService {
         messageId: uploaded.messageId,
         body: item.body,
         media: uploaded.media,
+        replyToMessageId: item.replyTo?.messageId,
+        isForwarded: item.isForwarded,
       ),
       'Media message send',
     );
@@ -754,6 +795,12 @@ class OfflineOutboxService {
                   ? null
                   : Uint8List.fromList(localMediaBytes),
             ),
+            replyToMessageId: Value(item.replyTo?.messageId),
+            replySenderName: Value(item.replyTo?.senderName),
+            replyPreview: Value(item.replyTo?.preview),
+            replyMessageType: Value(item.replyTo?.messageType.value),
+            replyIsDeleted: Value(item.replyTo?.isDeleted ?? false),
+            isForwarded: Value(item.isForwarded),
             updatedAt: _clock().toUtc(),
           ),
         );
@@ -895,6 +942,16 @@ class OfflineOutboxService {
       nextAttemptAt: entry.nextAttemptAt,
       lastError: entry.lastError,
       media: media,
+      replyTo: entry.replyToMessageId == null
+          ? null
+          : MessageReplyPreview(
+              messageId: entry.replyToMessageId!,
+              senderName: entry.replySenderName ?? 'Unknown',
+              preview: entry.replyPreview ?? 'Message',
+              messageType: ChatMessageType.fromValue(entry.replyMessageType),
+              isDeleted: entry.replyIsDeleted,
+            ),
+      isForwarded: entry.isForwarded,
     );
   }
 
