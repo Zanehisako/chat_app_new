@@ -1,0 +1,21 @@
+# Copy to livekit.yaml and replace every CHANGE_ME value before starting.
+port: 7880
+bind_addresses:
+  - 0.0.0.0
+
+rtc:
+  # The VM's public address is discovered by LiveKit when use_external_ip is true.
+  use_external_ip: true
+  port_range_start: 50000
+  port_range_end: 60000
+
+turn:
+  enabled: true
+  udp_port: 3478
+
+# Redis is harmless for a single node and is required when this grows to multiple nodes.
+redis:
+  address: 127.0.0.1:6379
+
+keys:
+  CHANGE_ME_API_KEY: CHANGE_ME_API_SECRET

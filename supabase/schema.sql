@@ -74,6 +74,8 @@ create table if not exists public.messages (
   media_duration_ms integer,
   media_waveform jsonb,
   media_original_name text,
+  group_call_session_id uuid,
+  call_event text,
   created_at timestamptz not null default now()
 );
 
@@ -89,12 +91,19 @@ alter table public.messages
   add column if not exists media_height integer,
   add column if not exists media_duration_ms integer,
   add column if not exists media_waveform jsonb,
-  add column if not exists media_original_name text;
+  add column if not exists media_original_name text,
+  add column if not exists group_call_session_id uuid,
+  add column if not exists call_event text;
 
 alter table public.messages
   drop constraint if exists messages_message_type_check,
   add constraint messages_message_type_check
   check (message_type in ('text', 'image', 'gif', 'voice', 'call'));
+
+alter table public.messages
+  drop constraint if exists messages_call_event_check,
+  add constraint messages_call_event_check
+  check (call_event is null or call_event in ('started', 'ended', 'failed'));
 
 alter table public.messages
   drop constraint if exists messages_media_payload_check,
@@ -833,6 +842,7 @@ create table if not exists public.push_notification_jobs (
   title text not null,
   body text not null,
   data jsonb not null default '{}'::jsonb,
+  expires_at timestamptz,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   constraint push_notification_jobs_message_recipient_key unique (message_id, recipient_id)
@@ -1111,6 +1121,11 @@ end;
 $$;
 
 notify pgrst, 'reload schema';
+
+-- Group-call tables, lifecycle RPCs, and LiveKit control dispatch are defined
+-- in supabase/migrations/20260713200000_group_calls.sql and
+-- supabase/migrations/20260713210000_group_call_cloud_dispatch.sql. Migrations
+-- remain the authoritative deployment path for these objects.
 
 -- Message actions: replies, reactions, editing, soft deletion, and forwarding.
 alter table public.messages

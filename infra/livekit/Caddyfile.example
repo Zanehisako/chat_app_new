@@ -1,0 +1,3 @@
+livekit.example.com {
+  reverse_proxy host.docker.internal:7880
+}

@@ -49,3 +49,9 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Self-hosted LiveKit secrets and generated deployment files
+infra/livekit/.env
+infra/livekit/livekit.yaml
+infra/livekit/Caddyfile
+infra/livekit/certs/

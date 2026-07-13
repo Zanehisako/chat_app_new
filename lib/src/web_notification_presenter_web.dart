@@ -8,6 +8,8 @@ class WebNotificationPresenter {
     required String body,
     String? conversationId,
     String? messageId,
+    String? type,
+    String? callId,
   }) async {
     if (web.Notification.permission != 'granted') {
       return false;
@@ -22,6 +24,12 @@ class WebNotificationPresenter {
       final queryParameters = <String, String>{};
       if (conversationId != null && conversationId.trim().isNotEmpty) {
         queryParameters['conversation'] = conversationId.trim();
+      }
+      if (type != null && type.trim().isNotEmpty) {
+        queryParameters['type'] = type.trim();
+      }
+      if (callId != null && callId.trim().isNotEmpty) {
+        queryParameters['call_id'] = callId.trim();
       }
       final link = Uri.parse(web.window.location.origin)
           .replace(

@@ -32,10 +32,17 @@ Future<void> chatAppFirebaseMessagingBackgroundHandler(
 }
 
 class NotificationRoute {
-  const NotificationRoute({required this.conversationId, this.messageId});
+  const NotificationRoute({
+    required this.conversationId,
+    this.messageId,
+    this.kind = 'message',
+    this.callId,
+  });
 
   final String conversationId;
   final String? messageId;
+  final String kind;
+  final String? callId;
 
   static NotificationRoute? fromData(Map<String, dynamic> data) {
     final conversationId =
@@ -46,9 +53,15 @@ class NotificationRoute {
       return null;
     }
     final messageId = data['message_id']?.toString().trim();
+    final kind = data['type']?.toString().trim().isNotEmpty == true
+        ? data['type']!.toString().trim()
+        : 'message';
+    final callId = data['call_id']?.toString().trim();
     return NotificationRoute(
       conversationId: conversationId,
       messageId: messageId == null || messageId.isEmpty ? null : messageId,
+      kind: kind,
+      callId: callId == null || callId.isEmpty ? null : callId,
     );
   }
 }
@@ -77,6 +90,12 @@ class NotificationService {
     'Chat messages',
     description: 'New direct messages and call updates.',
     importance: Importance.high,
+  );
+  static const _androidCallChannel = AndroidNotificationChannel(
+    'chat_calls',
+    'Group calls',
+    description: 'Invitations to join an active group call.',
+    importance: Importance.max,
   );
 
   final FlutterLocalNotificationsPlugin _localNotifications =
@@ -116,7 +135,13 @@ class NotificationService {
     if (kIsWeb) {
       final conversationId = Uri.base.queryParameters['conversation'];
       if (conversationId != null && conversationId.trim().isNotEmpty) {
-        _emitRoute({'conversation_id': conversationId});
+        final type = Uri.base.queryParameters['type'];
+        final callId = Uri.base.queryParameters['call_id'];
+        _emitRoute({
+          'conversation_id': conversationId,
+          if (type != null && type.isNotEmpty) 'type': type,
+          if (callId != null && callId.isNotEmpty) 'call_id': callId,
+        });
       }
     }
     if (WindowsPushService.isAvailable) {
@@ -310,6 +335,11 @@ class NotificationService {
             AndroidFlutterLocalNotificationsPlugin
           >()
           ?.createNotificationChannel(_androidChannel);
+      await _localNotifications
+          .resolvePlatformSpecificImplementation<
+            AndroidFlutterLocalNotificationsPlugin
+          >()
+          ?.createNotificationChannel(_androidCallChannel);
 
       _localReady = true;
     } catch (error) {
@@ -352,6 +382,8 @@ class NotificationService {
         body: body,
         conversationId: message.data['conversation_id']?.toString(),
         messageId: message.data['message_id']?.toString(),
+        type: message.data['type']?.toString(),
+        callId: message.data['call_id']?.toString(),
       );
       if (!shown) {
         debugPrint('[Notifications] Foreground web notification not shown.');
@@ -391,17 +423,21 @@ class NotificationService {
     }
     final id = DateTime.now().millisecondsSinceEpoch.remainder(2147483647);
 
+    final isGroupCall = data['type']?.toString() == 'group_call';
     await _localNotifications.show(
       id: id,
       title: title,
       body: body,
-      notificationDetails: const NotificationDetails(
+      notificationDetails: NotificationDetails(
         android: AndroidNotificationDetails(
-          'chat_messages',
-          'Chat messages',
-          channelDescription: 'New direct messages and call updates.',
-          importance: Importance.high,
+          isGroupCall ? _androidCallChannel.id : _androidChannel.id,
+          isGroupCall ? _androidCallChannel.name : _androidChannel.name,
+          channelDescription: isGroupCall
+              ? _androidCallChannel.description
+              : _androidChannel.description,
+          importance: isGroupCall ? Importance.max : Importance.high,
           priority: Priority.high,
+          category: isGroupCall ? AndroidNotificationCategory.call : null,
         ),
         iOS: DarwinNotificationDetails(),
         macOS: DarwinNotificationDetails(),

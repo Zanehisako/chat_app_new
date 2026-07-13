@@ -78,6 +78,15 @@ export function createDispatchHandler(dependencies: DispatchDependencies = {}) {
       ? Math.min(Math.max(Math.floor(requestedBatchSize), 1), 100)
       : 25;
 
+    const { error: expiryError } = await supabase.rpc(
+      "drop_expired_group_call_notifications",
+    );
+    if (expiryError) {
+      return json({
+        error: `Could not drop expired call notifications: ${expiryError.message}`,
+      }, 500);
+    }
+
     const { error: emptyJobError } = await supabase.rpc(
       "drop_empty_push_notification_jobs",
     );
@@ -321,21 +330,29 @@ export async function sendFcm(
       body: delivery.body,
     }),
   };
+  const isGroupCall = delivery.data.type === "group_call";
   if (delivery.platform === "android") {
     message.android = {
       priority: "HIGH",
-      ttl: "2419200s",
+      ttl: isGroupCall ? "300s" : "2419200s",
       notification: {
-        channel_id: "chat_messages",
+        channel_id: isGroupCall ? "chat_calls" : "chat_messages",
         sound: "default",
-        tag: delivery.message_id,
+        tag: isGroupCall
+          ? String(delivery.data.call_id ?? delivery.message_id)
+          : delivery.message_id,
       },
     };
   } else if (delivery.platform === "ios" || delivery.platform === "macos") {
     message.apns = {
       headers: {
         "apns-priority": "10",
-        "apns-collapse-id": delivery.message_id,
+        "apns-collapse-id": isGroupCall
+          ? String(delivery.data.call_id ?? delivery.message_id)
+          : delivery.message_id,
+        ...(isGroupCall
+          ? { "apns-expiration": String(Math.floor(Date.now() / 1000) + 300) }
+          : {}),
       },
       payload: { aps: { sound: "default" } },
     };
@@ -350,9 +367,18 @@ export async function sendFcm(
     }
     const link = new URL("/", webAppUrl);
     link.searchParams.set("conversation", delivery.conversation_id);
+    if (isGroupCall) {
+      link.searchParams.set("type", "group_call");
+      link.searchParams.set("call_id", String(delivery.data.call_id ?? ""));
+    }
     message.webpush = {
-      headers: { TTL: "2419200", Urgency: "high" },
-      notification: { tag: delivery.message_id, renotify: false },
+      headers: { TTL: isGroupCall ? "300" : "2419200", Urgency: "high" },
+      notification: {
+        tag: isGroupCall
+          ? String(delivery.data.call_id ?? delivery.message_id)
+          : delivery.message_id,
+        renotify: false,
+      },
       fcm_options: { link: link.toString() },
     };
   }
@@ -406,11 +432,17 @@ async function sendWns(
     return { ok: false, invalidToken: true, error: "Invalid WNS channel URI" };
   }
 
-  const launch = new URLSearchParams({
-    type: "message",
+  const isGroupCall = delivery.data.type === "group_call";
+  const launchParams: Record<string, string> = {
+    type: isGroupCall ? "group_call" : "message",
     conversation_id: delivery.conversation_id,
     message_id: delivery.message_id,
-  }).toString();
+  };
+  if (isGroupCall) {
+    launchParams.call_id = String(delivery.data.call_id ?? "");
+    launchParams.is_video = String(delivery.data.is_video ?? false);
+  }
+  const launch = new URLSearchParams(launchParams).toString();
   const response = await fetchImpl(url, {
     method: "POST",
     headers: {

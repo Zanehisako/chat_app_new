@@ -4,6 +4,8 @@ class WebNotificationPresenter {
     required String body,
     String? conversationId,
     String? messageId,
+    String? type,
+    String? callId,
   }) async {
     return false;
   }

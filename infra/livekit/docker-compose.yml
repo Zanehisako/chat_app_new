@@ -1,0 +1,54 @@
+services:
+  livekit:
+    image: ${LIVEKIT_IMAGE:?Set LIVEKIT_IMAGE to a pinned livekit/livekit-server image}
+    command: ["--config", "/etc/livekit.yaml"]
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--bind", "127.0.0.1", "--protected-mode", "yes"]
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+  group-call-control-worker:
+    profiles: ["control-worker"]
+    image: curlimages/curl:8.11.1
+    restart: unless-stopped
+    environment:
+      GROUP_CALL_CONTROL_URL: ${GROUP_CALL_CONTROL_URL:-}
+      GROUP_CALL_CONTROL_SECRET: ${GROUP_CALL_CONTROL_SECRET:-}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        test -n "$$GROUP_CALL_CONTROL_URL" &&
+        test -n "$$GROUP_CALL_CONTROL_SECRET" ||
+        (echo "Set GROUP_CALL_CONTROL_URL and GROUP_CALL_CONTROL_SECRET" >&2; exit 1);
+        while true; do
+        curl --fail --silent --show-error --request POST
+        --header "x-dispatch-secret: $$GROUP_CALL_CONTROL_SECRET"
+        "$$GROUP_CALL_CONTROL_URL" || true;
+        sleep 5;
+        done
+
+volumes:
+  redis-data:
+  caddy-data:
+  caddy-config:

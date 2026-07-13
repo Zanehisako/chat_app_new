@@ -14,6 +14,7 @@ import 'package:record/record.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'call_signaling.dart';
+import 'group_call_signaling.dart';
 import 'chat_models.dart';
 import 'connectivity_service.dart';
 import 'chat_repository.dart';
@@ -129,12 +130,20 @@ class _ChatHomePageState extends State<ChatHomePage>
   StreamSubscription<Map<String, UserPresence>>? _presenceSubscription;
   StreamSubscription<CallInvite>? _incomingCallSubscription;
   StreamSubscription<CallSnapshot?>? _callSnapshotSubscription;
+  StreamSubscription<GroupCallInvite>? _groupCallInviteSubscription;
+  StreamSubscription<GroupCallSnapshot?>? _groupCallSnapshotSubscription;
   StreamSubscription<Uint8List>? _voiceDataSubscription;
   StreamSubscription<Amplitude>? _voiceAmplitudeSubscription;
   Completer<void>? _voiceStreamDone;
   CallClient? _callClient;
   CallInvite? _incomingCallInvite;
   CallSnapshot? _callSnapshot;
+  GroupCallClient? _groupCallClient;
+  SupabaseGroupCallGateway? _groupCallGateway;
+  GroupCallInvite? _incomingGroupCallInvite;
+  GroupCallSnapshot? _groupCallSnapshot;
+  final Map<String, GroupCallSessionSummary> _activeGroupCalls = {};
+  Timer? _groupCallRefreshTimer;
   Timer? _typingStopTimer;
   Timer? _voiceRecordingTimer;
   Timer? _clearEndedCallTimer;
@@ -287,9 +296,41 @@ class _ChatHomePageState extends State<ChatHomePage>
       signaling: SupabaseCallSignaling(client: client),
     );
     _callClient = callClient;
+    final groupGateway = SupabaseGroupCallGateway(client: client);
+    final groupClient = GroupCallClient(gateway: groupGateway);
+    _groupCallGateway = groupGateway;
+    _groupCallClient = groupClient;
+    _groupCallInviteSubscription = groupGateway.watchIncomingInvites().listen(
+      (invite) {
+        if (!mounted ||
+            _groupCallSnapshot != null ||
+            _callSnapshot != null ||
+            _incomingCallInvite != null) {
+          return;
+        }
+        setState(() => _incomingGroupCallInvite = invite);
+      },
+      onError: (Object error, StackTrace stackTrace) {
+        debugPrint('[Group call invite watch] $error\n$stackTrace');
+      },
+    );
+    _groupCallSnapshotSubscription = groupClient.snapshots.listen((snapshot) {
+      if (!mounted) return;
+      setState(() {
+        _groupCallSnapshot = snapshot;
+        if (snapshot != null) _incomingGroupCallInvite = null;
+      });
+    });
+    _groupCallRefreshTimer = Timer.periodic(
+      const Duration(seconds: 5),
+      (_) => unawaited(_refreshActiveGroupCalls()),
+    );
     _incomingCallSubscription = callClient.watchIncomingInvites().listen(
       (invite) {
-        if (!mounted || _callSnapshot != null) {
+        if (!mounted ||
+            _callSnapshot != null ||
+            _groupCallSnapshot != null ||
+            _incomingGroupCallInvite != null) {
           return;
         }
         debugPrint(
@@ -535,6 +576,9 @@ class _ChatHomePageState extends State<ChatHomePage>
       _pendingNotificationConversationId = route.conversationId;
       _isCompactConversationOpen = true;
     });
+    if (route.kind == 'group_call') {
+      unawaited(_refreshActiveGroupCalls());
+    }
   }
 
   void _scheduleNotificationRouteResolution(List<ChatThread> threads) {
@@ -569,14 +613,49 @@ class _ChatHomePageState extends State<ChatHomePage>
     final incomingSubscription = _incomingCallSubscription;
     final snapshotSubscription = _callSnapshotSubscription;
     final callClient = _callClient;
+    final groupInviteSubscription = _groupCallInviteSubscription;
+    final groupSnapshotSubscription = _groupCallSnapshotSubscription;
+    final groupClient = _groupCallClient;
     _incomingCallSubscription = null;
     _callSnapshotSubscription = null;
     _callClient = null;
+    _groupCallInviteSubscription = null;
+    _groupCallSnapshotSubscription = null;
+    _groupCallClient = null;
+    _groupCallGateway = null;
+    _incomingGroupCallInvite = null;
+    _groupCallSnapshot = null;
+    _groupCallRefreshTimer?.cancel();
+    _groupCallRefreshTimer = null;
     _incomingCallInvite = null;
     _callSnapshot = null;
     await incomingSubscription?.cancel();
     await snapshotSubscription?.cancel();
+    await groupInviteSubscription?.cancel();
+    await groupSnapshotSubscription?.cancel();
     await callClient?.dispose();
+    await groupClient?.dispose();
+  }
+
+  Future<void> _refreshActiveGroupCalls() async {
+    final gateway = _groupCallGateway;
+    if (gateway == null || !mounted) return;
+    final groupThreads = _availableThreads.where((thread) => thread.isGroup);
+    final next = <String, GroupCallSessionSummary>{};
+    for (final thread in groupThreads) {
+      try {
+        final summary = await gateway.activeCallForConversation(thread.id);
+        if (summary != null) next[thread.id] = summary;
+      } catch (error) {
+        debugPrint('[Group call refresh] $error');
+      }
+    }
+    if (!mounted) return;
+    setState(() {
+      _activeGroupCalls
+        ..clear()
+        ..addAll(next);
+    });
   }
 
   void _syncTypingSubscriptions(List<ChatThread> threads) {
@@ -717,6 +796,21 @@ class _ChatHomePageState extends State<ChatHomePage>
                     onSwitchCamera: _switchCallCamera,
                     onHangUp: _hangUpCall,
                   ),
+                if (_incomingGroupCallInvite case final invite?)
+                  _IncomingGroupCallOverlay(
+                    invite: invite,
+                    onJoin: () => _joinGroupCall(invite.callId),
+                    onDecline: () => _declineGroupCall(invite.callId),
+                  ),
+                if (_groupCallSnapshot case final snapshot?)
+                  _ActiveGroupCallOverlay(
+                    snapshot: snapshot,
+                    onToggleMute: () => _toggleGroupMute(snapshot),
+                    onToggleCamera: () => _toggleGroupCamera(snapshot),
+                    onSwitchCamera: () =>
+                        unawaited(_groupCallClient?.switchCamera()),
+                    onLeave: _leaveGroupCall,
+                  ),
               ],
             );
           },
@@ -837,6 +931,10 @@ class _ChatHomePageState extends State<ChatHomePage>
       onComposerChanged: (value) => _handleComposerChanged(thread, value),
       onStartAudioCall: () => _startCall(thread, isVideo: false),
       onStartVideoCall: () => _startCall(thread, isVideo: true),
+      onStartGroupAudioCall: () => _startGroupCall(thread, isVideo: false),
+      onStartGroupVideoCall: () => _startGroupCall(thread, isVideo: true),
+      activeGroupCall: _activeGroupCalls[thread.id],
+      onJoinGroupCall: _joinGroupCall,
       onOpenGroupDetails: () => _openGroupDetails(thread),
       onOpenProfile: _openProfile,
       onSignOut: _requestSignOut,
@@ -1225,6 +1323,78 @@ class _ChatHomePageState extends State<ChatHomePage>
     } catch (error, stackTrace) {
       _logCallFailure('Call start failed', error, stackTrace);
       _showCallError('Could not start the call.');
+    }
+  }
+
+  Future<void> _startGroupCall(
+    ChatThread thread, {
+    required bool isVideo,
+  }) async {
+    final groupClient = _groupCallClient;
+    if (groupClient == null ||
+        !widget.repository.isConnected ||
+        !thread.isGroup) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Group calls require a signed-in group.')),
+      );
+      return;
+    }
+    try {
+      await groupClient.start(conversationId: thread.id, isVideo: isVideo);
+    } on CallException catch (error, stackTrace) {
+      debugPrint('[Group call start failed] $error\n$stackTrace');
+      _showCallError(error.message);
+    } catch (error, stackTrace) {
+      debugPrint('[Group call start failed] $error\n$stackTrace');
+      _showCallError('Could not start the group call.');
+    }
+  }
+
+  Future<void> _joinGroupCall(String callId) async {
+    final groupClient = _groupCallClient;
+    if (groupClient == null) return;
+    setState(() => _incomingGroupCallInvite = null);
+    try {
+      await groupClient.join(callId: callId);
+    } on CallException catch (error, stackTrace) {
+      debugPrint('[Group call join failed] $error\n$stackTrace');
+      _showCallError(error.message);
+    } catch (error, stackTrace) {
+      debugPrint('[Group call join failed] $error\n$stackTrace');
+      _showCallError('Could not join the group call.');
+    }
+  }
+
+  Future<void> _declineGroupCall(String callId) async {
+    final gateway = _groupCallGateway;
+    if (gateway == null) return;
+    setState(() => _incomingGroupCallInvite = null);
+    try {
+      await gateway.decline(callId: callId);
+    } catch (error) {
+      debugPrint('[Group call decline failed] $error');
+    }
+  }
+
+  Future<void> _leaveGroupCall() async {
+    await _groupCallClient?.leave();
+  }
+
+  void _toggleGroupMute(GroupCallSnapshot snapshot) {
+    final localParticipants = snapshot.participants
+        .where((item) => item.isLocal)
+        .toList();
+    final local = localParticipants.isEmpty ? null : localParticipants.first;
+    if (local != null) unawaited(_groupCallClient?.setMuted(!local.isMuted));
+  }
+
+  void _toggleGroupCamera(GroupCallSnapshot snapshot) {
+    final localParticipants = snapshot.participants
+        .where((item) => item.isLocal)
+        .toList();
+    final local = localParticipants.isEmpty ? null : localParticipants.first;
+    if (local != null) {
+      unawaited(_groupCallClient?.setCameraEnabled(!local.isCameraEnabled));
     }
   }
 
@@ -3673,6 +3843,10 @@ class _ConversationPane extends StatelessWidget {
     required this.onComposerChanged,
     required this.onStartAudioCall,
     required this.onStartVideoCall,
+    required this.onStartGroupAudioCall,
+    required this.onStartGroupVideoCall,
+    required this.activeGroupCall,
+    required this.onJoinGroupCall,
     required this.onOpenGroupDetails,
     required this.onOpenProfile,
     required this.onSignOut,
@@ -3708,6 +3882,10 @@ class _ConversationPane extends StatelessWidget {
   final ValueChanged<String> onComposerChanged;
   final VoidCallback onStartAudioCall;
   final VoidCallback onStartVideoCall;
+  final VoidCallback onStartGroupAudioCall;
+  final VoidCallback onStartGroupVideoCall;
+  final GroupCallSessionSummary? activeGroupCall;
+  final Future<void> Function(String callId) onJoinGroupCall;
   final VoidCallback onOpenGroupDetails;
   final VoidCallback onOpenProfile;
   final VoidCallback onSignOut;
@@ -3791,13 +3969,23 @@ class _ConversationPane extends StatelessWidget {
                   ],
                 ),
               ),
-              if (thread.isGroup)
+              if (thread.isGroup) ...[
+                IconButton(
+                  tooltip: 'Start voice group call',
+                  onPressed: onStartGroupAudioCall,
+                  icon: const Icon(Icons.call_outlined),
+                ),
+                IconButton(
+                  tooltip: 'Start video group call',
+                  onPressed: onStartGroupVideoCall,
+                  icon: const Icon(Icons.videocam_outlined),
+                ),
                 IconButton(
                   tooltip: 'Group info',
                   onPressed: onOpenGroupDetails,
                   icon: const Icon(Icons.group_outlined),
-                )
-              else ...[
+                ),
+              ] else ...[
                 IconButton(
                   tooltip: 'Call',
                   onPressed: onStartAudioCall,
@@ -3812,6 +4000,24 @@ class _ConversationPane extends StatelessWidget {
             ],
           ),
         ),
+        if (thread.isGroup && activeGroupCall != null)
+          MaterialBanner(
+            padding: const EdgeInsets.fromLTRB(16, 8, 8, 8),
+            leading: Icon(
+              activeGroupCall!.isVideo ? Icons.videocam : Icons.call,
+              color: Theme.of(context).colorScheme.primary,
+            ),
+            content: Text(
+              '${activeGroupCall!.title} · ${activeGroupCall!.participantCount} '
+              '${activeGroupCall!.participantCount == 1 ? 'person' : 'people'} active',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => onJoinGroupCall(activeGroupCall!.callId),
+                child: const Text('Join'),
+              ),
+            ],
+          ),
         Expanded(
           child: StreamBuilder<List<ChatMessage>>(
             stream: repository.watchMessages(thread.id),
@@ -3877,6 +4083,319 @@ class _ConversationPane extends StatelessWidget {
 }
 
 enum _MessageAction { reply, react, edit, delete, forward, copy }
+
+class _IncomingGroupCallOverlay extends StatelessWidget {
+  const _IncomingGroupCallOverlay({
+    required this.invite,
+    required this.onJoin,
+    required this.onDecline,
+  });
+
+  final GroupCallInvite invite;
+  final VoidCallback onJoin;
+  final VoidCallback onDecline;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Positioned.fill(
+      child: ColoredBox(
+        color: Colors.black.withValues(alpha: 0.45),
+        child: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 380),
+            child: Card(
+              child: Padding(
+                padding: const EdgeInsets.all(20),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    CircleAvatar(
+                      radius: 34,
+                      backgroundColor: theme.colorScheme.primaryContainer,
+                      child: Icon(
+                        invite.isVideo ? Icons.videocam : Icons.call,
+                        color: theme.colorScheme.onPrimaryContainer,
+                        size: 32,
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    Text(
+                      invite.title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.titleLarge?.copyWith(
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      '${invite.callerName} started a '
+                      '${invite.isVideo ? 'video' : 'voice'} call',
+                      textAlign: TextAlign.center,
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                    const SizedBox(height: 22),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        FilledButton.tonal(
+                          onPressed: onDecline,
+                          child: const Text('Not now'),
+                        ),
+                        const SizedBox(width: 12),
+                        FilledButton.icon(
+                          onPressed: onJoin,
+                          icon: const Icon(Icons.call),
+                          label: const Text('Join'),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ActiveGroupCallOverlay extends StatelessWidget {
+  const _ActiveGroupCallOverlay({
+    required this.snapshot,
+    required this.onToggleMute,
+    required this.onToggleCamera,
+    required this.onSwitchCamera,
+    required this.onLeave,
+  });
+
+  final GroupCallSnapshot snapshot;
+  final VoidCallback onToggleMute;
+  final VoidCallback onToggleCamera;
+  final VoidCallback onSwitchCamera;
+  final VoidCallback onLeave;
+
+  @override
+  Widget build(BuildContext context) {
+    final isVideo = snapshot.credentials.isVideo;
+    return Positioned.fill(
+      child: Material(
+        color: const Color(0xFF0B1112),
+        child: SafeArea(
+          child: Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(18, 14, 18, 10),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        snapshot.credentials.title,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 20,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                    ),
+                    Text(
+                      '${snapshot.participants.length} connected',
+                      style: const TextStyle(color: Colors.white70),
+                    ),
+                  ],
+                ),
+              ),
+              Expanded(
+                child: snapshot.participants.isEmpty
+                    ? const Center(
+                        child: Text(
+                          'Waiting for others…',
+                          style: TextStyle(color: Colors.white70),
+                        ),
+                      )
+                    : GridView.builder(
+                        padding: const EdgeInsets.all(12),
+                        gridDelegate:
+                            const SliverGridDelegateWithMaxCrossAxisExtent(
+                              maxCrossAxisExtent: 360,
+                              mainAxisSpacing: 10,
+                              crossAxisSpacing: 10,
+                              childAspectRatio: 1.25,
+                            ),
+                        itemCount: snapshot.participants.length,
+                        itemBuilder: (context, index) =>
+                            _GroupCallParticipantTile(
+                              participant: snapshot.participants[index],
+                              showVideo: isVideo,
+                            ),
+                      ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    _CallActionButton(
+                      icon: _localIsMuted ? Icons.mic_off : Icons.mic,
+                      label: _localIsMuted ? 'Unmute' : 'Mute',
+                      onPressed: onToggleMute,
+                    ),
+                    if (isVideo) ...[
+                      const SizedBox(width: 12),
+                      _CallActionButton(
+                        icon: _localCameraEnabled
+                            ? Icons.videocam
+                            : Icons.videocam_off,
+                        label: _localCameraEnabled ? 'Camera' : 'Camera off',
+                        onPressed: onToggleCamera,
+                      ),
+                      const SizedBox(width: 12),
+                      _CallActionButton(
+                        icon: Icons.cameraswitch,
+                        label: 'Flip',
+                        onPressed: onSwitchCamera,
+                      ),
+                    ],
+                    const SizedBox(width: 12),
+                    _CallActionButton(
+                      icon: Icons.call_end,
+                      label: 'Leave',
+                      color: Colors.redAccent,
+                      onPressed: onLeave,
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  bool get _localIsMuted {
+    final local = snapshot.participants.where((item) => item.isLocal).toList();
+    return local.isNotEmpty && local.first.isMuted;
+  }
+
+  bool get _localCameraEnabled {
+    final local = snapshot.participants.where((item) => item.isLocal).toList();
+    return local.isNotEmpty && local.first.isCameraEnabled;
+  }
+}
+
+class _GroupCallParticipantTile extends StatelessWidget {
+  const _GroupCallParticipantTile({
+    required this.participant,
+    required this.showVideo,
+  });
+
+  final GroupCallParticipant participant;
+  final bool showVideo;
+
+  @override
+  Widget build(BuildContext context) {
+    final track = participant.videoTrack;
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(16),
+      child: ColoredBox(
+        color: const Color(0xFF182526),
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            if (showVideo && track != null)
+              VideoTrackRenderer(track)
+            else
+              Center(
+                child: CircleAvatar(
+                  radius: 34,
+                  backgroundColor: Colors.white24,
+                  child: Text(
+                    _initials(participant.displayName),
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 24,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ),
+              ),
+            Positioned(
+              left: 10,
+              right: 10,
+              bottom: 10,
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      participant.displayName,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                  if (participant.isMuted)
+                    const Icon(Icons.mic_off, color: Colors.white, size: 18),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _initials(String name) {
+    final parts = name
+        .trim()
+        .split(RegExp(r'\s+'))
+        .where((part) => part.isNotEmpty);
+    final value = parts.map((part) => part.characters.first).take(2).join();
+    return value.isEmpty ? '?' : value.toUpperCase();
+  }
+}
+
+class _CallActionButton extends StatelessWidget {
+  const _CallActionButton({
+    required this.icon,
+    required this.label,
+    required this.onPressed,
+    this.color,
+  });
+
+  final IconData icon;
+  final String label;
+  final VoidCallback onPressed;
+  final Color? color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        IconButton.filled(
+          onPressed: onPressed,
+          style: IconButton.styleFrom(
+            backgroundColor: color ?? Colors.white24,
+            foregroundColor: Colors.white,
+          ),
+          icon: Icon(icon),
+        ),
+        Text(
+          label,
+          style: const TextStyle(color: Colors.white70, fontSize: 11),
+        ),
+      ],
+    );
+  }
+}
 
 class _IncomingCallOverlay extends StatelessWidget {
   const _IncomingCallOverlay({

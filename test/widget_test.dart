@@ -715,7 +715,7 @@ void main() {
     expect(find.text('Calls require a signed-in direct chat.'), findsOneWidget);
   });
 
-  testWidgets('creates a local group and hides direct call controls', (
+  testWidgets('creates a local group with group call controls', (
     WidgetTester tester,
   ) async {
     tester.view.physicalSize = const Size(1000, 900);
@@ -748,9 +748,13 @@ void main() {
 
     expect(find.text('Launch Team'), findsWidgets);
     expect(find.byTooltip('Group info'), findsOneWidget);
-    expect(find.byTooltip('Call'), findsNothing);
-    expect(find.byTooltip('Video'), findsNothing);
+    expect(find.byTooltip('Start voice group call'), findsOneWidget);
+    expect(find.byTooltip('Start video group call'), findsOneWidget);
     expect(find.text('3 members'), findsOneWidget);
+
+    await tester.tap(find.byTooltip('Start voice group call'));
+    await tester.pump();
+    expect(find.text('Group calls require a signed-in group.'), findsOneWidget);
 
     await tester.tap(find.byTooltip('Group info'));
     await tester.pumpAndSettle();

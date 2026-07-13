@@ -57,6 +57,16 @@ Calls are foreground, in-app 1:1 audio/video sessions in direct conversations.
 The app uses the local reusable package at `packages/realtime_calls`, with
 Supabase carrying only call signaling. Audio/video media flows through WebRTC.
 
+Group conversations use LiveKit as an SFU. Any active group member can start or
+join one room (up to 50 members); Supabase authorizes the room, records
+start/end history, sends short-lived invitations, and disconnects members who
+leave the group. LiveKit Cloud is the default online backend. Direct calls
+remain on the existing P2P path.
+
+Cloud, local-development, and optional self-hosting setup are documented in
+[`infra/livekit/`](infra/livekit/). LiveKit credentials belong only in Supabase
+Edge Function secrets; never put them in this repository.
+
 Apply the call migration with the same Supabase workflow:
 
 ```sh

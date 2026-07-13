@@ -2,3 +2,9 @@ project_id = "chat_app"
 
 [functions.notification-dispatch]
 verify_jwt = false
+
+[functions.livekit-webhook]
+verify_jwt = false
+
+[functions.group-call-control]
+verify_jwt = false

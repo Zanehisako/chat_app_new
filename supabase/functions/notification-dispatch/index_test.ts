@@ -43,7 +43,7 @@ Deno.test("dispatcher completes an authenticated empty batch", async () => {
     headers: { "x-dispatch-secret": secret },
   }));
   if (response.status !== 200 || rpcCalls.join(",") !==
-      "drop_empty_push_notification_jobs,claim_push_notification_deliveries") {
+      "drop_expired_group_call_notifications,drop_empty_push_notification_jobs,claim_push_notification_deliveries") {
     throw new Error("Dispatcher did not run the expected authenticated claim path.");
   }
 });
