@@ -2,7 +2,8 @@ class WebNotificationPresenter {
   Future<bool> show({
     required String title,
     required String body,
-    required void Function() onClick,
+    String? conversationId,
+    String? messageId,
   }) async {
     return false;
   }

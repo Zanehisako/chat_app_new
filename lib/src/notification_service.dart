@@ -286,7 +286,7 @@ class NotificationService {
   }
 
   Future<void> _initializeLocalNotifications() async {
-    if (_localReady) {
+    if (kIsWeb || _localReady) {
       return;
     }
     try {
@@ -347,11 +347,15 @@ class NotificationService {
         'New message';
     final body = notification?.body ?? message.data['body']?.toString() ?? '';
     if (kIsWeb) {
-      await _webNotifications.show(
+      final shown = await _webNotifications.show(
         title: title,
         body: body,
-        onClick: () => _emitRoute(message.data),
+        conversationId: message.data['conversation_id']?.toString(),
+        messageId: message.data['message_id']?.toString(),
       );
+      if (!shown) {
+        debugPrint('[Notifications] Foreground web notification not shown.');
+      }
       return;
     }
     await _showLocalMessage(title: title, body: body, data: message.data);
