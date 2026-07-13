@@ -41,6 +41,18 @@ class ChatHomePage extends StatefulWidget {
 
 enum _AttachmentUploadState { uploading, uploaded, failed }
 
+enum _ThreadStatusFilter { all, unread, sent, delivered, read }
+
+extension on _ThreadStatusFilter {
+  String get label => switch (this) {
+    _ThreadStatusFilter.all => 'All',
+    _ThreadStatusFilter.unread => 'Unread',
+    _ThreadStatusFilter.sent => 'Sent',
+    _ThreadStatusFilter.delivered => 'Delivered',
+    _ThreadStatusFilter.read => 'Read',
+  };
+}
+
 const _voiceSampleRate = 16000;
 const _voiceChannelCount = 1;
 
@@ -93,7 +105,6 @@ class _ChatHomePageState extends State<ChatHomePage>
   final _searchController = TextEditingController();
   final AudioRecorder _voiceRecorder = AudioRecorder();
   final List<ChatThread> _startedThreads = [];
-  final List<ChatThread> _refreshedThreads = [];
   final List<ChatMessage> _localMessages = [];
   List<ChatThread> _availableThreads = const [];
   final List<int> _voiceBytes = [];
@@ -138,6 +149,7 @@ class _ChatHomePageState extends State<ChatHomePage>
   ChatMessage? _editingMessage;
   String? _pendingNotificationConversationId;
   String _query = '';
+  _ThreadStatusFilter _statusFilter = _ThreadStatusFilter.all;
   bool _isSending = false;
   bool _isRecordingVoice = false;
   bool _isVoiceRecordingFileBacked = false;
@@ -153,6 +165,7 @@ class _ChatHomePageState extends State<ChatHomePage>
     _ownsOutboxDatabase = widget.outboxDatabase == null;
     WidgetsBinding.instance.addObserver(this);
     _threadsStream = widget.repository.watchThreads();
+    unawaited(_acknowledgePendingMessagesDelivered());
     _subscribePresence();
     _configureCalls();
     unawaited(_ensureOfflineOutbox());
@@ -175,12 +188,12 @@ class _ChatHomePageState extends State<ChatHomePage>
       _outboxMessages = [];
       _selectedThread = null;
       _startedThreads.clear();
-      _refreshedThreads.clear();
       _profileOverridesByUser.clear();
       _profileRefreshesInFlight.clear();
       _knownIncomingMessageIds.clear();
       _knownIncomingMessageOrder.clear();
       _activeConversationId = null;
+      unawaited(_acknowledgePendingMessagesDelivered());
       _subscribePresence();
       _configureCalls();
       _scheduleOutboxReconfiguration();
@@ -223,6 +236,7 @@ class _ChatHomePageState extends State<ChatHomePage>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       unawaited(_flushOutbox(ignoreBackoff: true));
+      unawaited(_acknowledgePendingMessagesDelivered());
       unawaited(
         NotificationService.instance.refreshRegistration(
           client: widget.repository.client,
@@ -233,6 +247,17 @@ class _ChatHomePageState extends State<ChatHomePage>
         state == AppLifecycleState.paused ||
         state == AppLifecycleState.detached) {
       unawaited(widget.repository.updateLastSeen());
+    }
+  }
+
+  Future<void> _acknowledgePendingMessagesDelivered() async {
+    try {
+      await widget.repository.markPendingMessagesDelivered();
+    } catch (error, stackTrace) {
+      debugPrint(
+        '[Receipts] Could not acknowledge pending deliveries: '
+        '$error\n$stackTrace',
+      );
     }
   }
 
@@ -704,16 +729,20 @@ class _ChatHomePageState extends State<ChatHomePage>
     List<ChatThread> threads,
     ChatThread? selectedThread,
   ) {
+    final filteredThreads = _filteredThreads(threads);
     return Row(
       children: [
         SizedBox(
           width: 360,
           child: _ThreadList(
-            threads: _filteredThreads(threads),
+            threads: filteredThreads,
             selectedThread: selectedThread,
             isConnected: widget.repository.isConnected,
             searchController: _searchController,
             onSearchChanged: _setQuery,
+            statusFilter: _statusFilter,
+            onStatusFilterChanged: _setStatusFilter,
+            emptyMessage: _emptyThreadListMessage(threads),
             onThreadSelected: _selectThread,
             onNewChat: _openNewChat,
             onNewGroup: _openNewGroup,
@@ -740,12 +769,16 @@ class _ChatHomePageState extends State<ChatHomePage>
     ChatThread? selectedThread,
   ) {
     if (!_isCompactConversationOpen) {
+      final filteredThreads = _filteredThreads(threads);
       return _ThreadList(
-        threads: _filteredThreads(threads),
+        threads: filteredThreads,
         selectedThread: selectedThread,
         isConnected: widget.repository.isConnected,
         searchController: _searchController,
         onSearchChanged: _setQuery,
+        statusFilter: _statusFilter,
+        onStatusFilterChanged: _setStatusFilter,
+        emptyMessage: _emptyThreadListMessage(threads),
         onThreadSelected: _selectCompactThread,
         onNewChat: _openNewChat,
         onNewGroup: _openNewGroup,
@@ -812,11 +845,17 @@ class _ChatHomePageState extends State<ChatHomePage>
 
   List<ChatThread> _filteredThreads(List<ChatThread> threads) {
     final normalizedQuery = _query.trim().toLowerCase();
-    if (normalizedQuery.isEmpty) {
-      return threads;
-    }
-
     return threads.where((thread) {
+      final statusMatches = switch (_statusFilter) {
+        _ThreadStatusFilter.all => true,
+        _ThreadStatusFilter.unread => thread.status == ChatThreadStatus.unread,
+        _ThreadStatusFilter.sent => thread.status == ChatThreadStatus.sent,
+        _ThreadStatusFilter.delivered =>
+          thread.status == ChatThreadStatus.delivered,
+        _ThreadStatusFilter.read => thread.status == ChatThreadStatus.read,
+      };
+      if (!statusMatches) return false;
+      if (normalizedQuery.isEmpty) return true;
       return thread.title.toLowerCase().contains(normalizedQuery) ||
           thread.displaySubtitle.toLowerCase().contains(normalizedQuery);
     }).toList();
@@ -824,16 +863,67 @@ class _ChatHomePageState extends State<ChatHomePage>
 
   List<ChatThread> _mergeThreads(List<ChatThread> threads) {
     final merged = {for (final thread in threads) thread.id: thread};
-
-    for (final thread in _refreshedThreads) {
-      merged[thread.id] = thread;
-    }
-
     for (final thread in _startedThreads) {
       merged.putIfAbsent(thread.id, () => thread);
     }
 
-    return merged.values.toList();
+    final latestLocalMessages = <String, ChatMessage>{};
+    for (final message in [..._localMessages, ..._outboxMessages]) {
+      final existing = latestLocalMessages[message.threadId];
+      if (existing == null || message.createdAt.isAfter(existing.createdAt)) {
+        latestLocalMessages[message.threadId] = message;
+      }
+    }
+
+    final mergedThreads = merged.values.map((thread) {
+      final localMessage = latestLocalMessages[thread.id];
+      final latestServerMessageAt = thread.latestMessageAt;
+      if (localMessage == null ||
+          (latestServerMessageAt != null &&
+              !localMessage.createdAt.isAfter(latestServerMessageAt))) {
+        return thread;
+      }
+
+      return thread.copyWith(
+        subtitle: _threadPreviewForLocalMessage(thread, localMessage),
+        lastActive: relativeTimeLabel(localMessage.createdAt),
+        latestMessageAt: localMessage.createdAt,
+        status: thread.unreadCount > 0
+            ? ChatThreadStatus.unread
+            : ChatThreadStatus.none,
+      );
+    }).toList();
+
+    mergedThreads.sort((a, b) {
+      final aTime = a.latestMessageAt;
+      final bTime = b.latestMessageAt;
+      if (aTime == null && bTime == null) return 0;
+      if (aTime == null) return 1;
+      if (bTime == null) return -1;
+      return bTime.compareTo(aTime);
+    });
+    return mergedThreads;
+  }
+
+  String _threadPreviewForLocalMessage(ChatThread thread, ChatMessage message) {
+    final preview = message.actionPreview;
+    if (thread.isGroup) {
+      return '${message.isMine ? 'You' : message.senderName}: $preview';
+    }
+    return message.isMine ? 'You: $preview' : preview;
+  }
+
+  String _emptyThreadListMessage(List<ChatThread> threads) {
+    if (threads.isEmpty) return 'No conversations yet.';
+    if (_query.trim().isNotEmpty) return 'No conversations match your search.';
+    return 'No ${_statusFilter.label.toLowerCase()} conversations.';
+  }
+
+  Stream<List<ChatThread>> _watchThreadsStartingWith(
+    List<ChatThread> initialThreads,
+  ) async* {
+    yield initialThreads;
+    yield* widget.repository.watchThreads();
   }
 
   ChatThread? _selectedThreadFor(List<ChatThread> threads) {
@@ -855,6 +945,12 @@ class _ChatHomePageState extends State<ChatHomePage>
   void _setQuery(String value) {
     setState(() {
       _query = value;
+    });
+  }
+
+  void _setStatusFilter(_ThreadStatusFilter value) {
+    setState(() {
+      _statusFilter = value;
     });
   }
 
@@ -943,12 +1039,14 @@ class _ChatHomePageState extends State<ChatHomePage>
     if (!mounted || result == null) return;
 
     if (result.leftGroup) {
+      final remainingThreads = _availableThreads
+          .where((item) => item.id != thread.id)
+          .toList();
       setState(() {
         _startedThreads.removeWhere((item) => item.id == thread.id);
-        _refreshedThreads.removeWhere((item) => item.id == thread.id);
         _selectedThread = null;
         _isCompactConversationOpen = false;
-        _threadsStream = widget.repository.watchThreads();
+        _threadsStream = _watchThreadsStartingWith(remainingThreads);
       });
       return;
     }
@@ -960,11 +1058,12 @@ class _ChatHomePageState extends State<ChatHomePage>
       activityLabel:
           '${result.memberCount} ${result.memberCount == 1 ? 'member' : 'members'}',
     );
+    final updatedThreads = _availableThreads
+        .map((item) => item.id == updated.id ? updated : item)
+        .toList();
     setState(() {
-      _refreshedThreads.removeWhere((item) => item.id == thread.id);
-      _refreshedThreads.insert(0, updated);
       _selectedThread = updated;
-      _threadsStream = widget.repository.watchThreads();
+      _threadsStream = _watchThreadsStartingWith(updatedThreads);
     });
   }
 
@@ -1050,10 +1149,7 @@ class _ChatHomePageState extends State<ChatHomePage>
       }
 
       setState(() {
-        _refreshedThreads
-          ..clear()
-          ..addAll(threads);
-        _threadsStream = widget.repository.watchThreads();
+        _threadsStream = _watchThreadsStartingWith(threads);
       });
 
       final selectedThread = _selectedThread;
@@ -3240,6 +3336,9 @@ class _ThreadList extends StatelessWidget {
     required this.isConnected,
     required this.searchController,
     required this.onSearchChanged,
+    required this.statusFilter,
+    required this.onStatusFilterChanged,
+    required this.emptyMessage,
     required this.onThreadSelected,
     required this.onNewChat,
     required this.onNewGroup,
@@ -3253,6 +3352,9 @@ class _ThreadList extends StatelessWidget {
   final bool isConnected;
   final TextEditingController searchController;
   final ValueChanged<String> onSearchChanged;
+  final _ThreadStatusFilter statusFilter;
+  final ValueChanged<_ThreadStatusFilter> onStatusFilterChanged;
+  final String emptyMessage;
   final ValueChanged<ChatThread> onThreadSelected;
   final VoidCallback onNewChat;
   final VoidCallback onNewGroup;
@@ -3314,6 +3416,24 @@ class _ThreadList extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 12),
+            SizedBox(
+              height: 36,
+              child: ListView.separated(
+                scrollDirection: Axis.horizontal,
+                itemCount: _ThreadStatusFilter.values.length,
+                separatorBuilder: (_, _) => const SizedBox(width: 8),
+                itemBuilder: (context, index) {
+                  final filter = _ThreadStatusFilter.values[index];
+                  return ChoiceChip(
+                    key: Key('thread-status-filter-${filter.name}'),
+                    label: Text(filter.label),
+                    selected: filter == statusFilter,
+                    onSelected: (_) => onStatusFilterChanged(filter),
+                  );
+                },
+              ),
+            ),
+            const SizedBox(height: 12),
             _BackendStatusPill(isConnected: isConnected),
             const SizedBox(height: 16),
             Expanded(
@@ -3322,8 +3442,11 @@ class _ThreadList extends StatelessWidget {
                 child: threads.isEmpty
                     ? ListView(
                         physics: const AlwaysScrollableScrollPhysics(),
-                        children: const [
-                          SizedBox(height: 280, child: _EmptyThreadList()),
+                        children: [
+                          SizedBox(
+                            height: 280,
+                            child: _EmptyThreadList(message: emptyMessage),
+                          ),
                         ],
                       )
                     : ListView.separated(
@@ -3349,7 +3472,9 @@ class _ThreadList extends StatelessWidget {
 }
 
 class _EmptyThreadList extends StatelessWidget {
-  const _EmptyThreadList();
+  const _EmptyThreadList({required this.message});
+
+  final String message;
 
   @override
   Widget build(BuildContext context) {
@@ -3359,7 +3484,7 @@ class _EmptyThreadList extends StatelessWidget {
       child: Padding(
         padding: const EdgeInsets.all(24),
         child: Text(
-          'No conversations yet.',
+          message,
           textAlign: TextAlign.center,
           style: theme.textTheme.bodyMedium?.copyWith(
             color: theme.colorScheme.onSurfaceVariant,
@@ -3490,7 +3615,10 @@ class _ThreadTile extends StatelessWidget {
                       ),
                       if (thread.unreadCount > 0) ...[
                         const SizedBox(width: 8),
-                        _UnreadBadge(count: thread.unreadCount),
+                        _UnreadBadge(
+                          key: Key('unread-badge-${thread.id}'),
+                          count: thread.unreadCount,
+                        ),
                       ],
                     ],
                   ),
@@ -5631,24 +5759,25 @@ class _Avatar extends StatelessWidget {
 }
 
 class _UnreadBadge extends StatelessWidget {
-  const _UnreadBadge({required this.count});
+  const _UnreadBadge({super.key, required this.count});
 
   final int count;
 
   @override
   Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
     return Container(
       constraints: const BoxConstraints(minWidth: 22, minHeight: 22),
       alignment: Alignment.center,
       padding: const EdgeInsets.symmetric(horizontal: 7),
       decoration: BoxDecoration(
-        color: Theme.of(context).colorScheme.primary,
+        color: colorScheme.error,
         borderRadius: BorderRadius.circular(11),
       ),
       child: Text(
-        '$count',
+        count > 99 ? '99+' : '$count',
         style: Theme.of(context).textTheme.labelSmall?.copyWith(
-          color: Theme.of(context).colorScheme.onPrimary,
+          color: colorScheme.onError,
           fontWeight: FontWeight.w800,
         ),
       ),

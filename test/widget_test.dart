@@ -509,6 +509,147 @@ void main() {
     expect(find.byKey(const Key('message-status-sent')), findsOneWidget);
   });
 
+  testWidgets('filters conversation summaries and renders red unread counts', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(700, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    final repository = _ThreadSummaryChatRepository();
+    final threads = [
+      _summaryThread(
+        id: 'unread-thread',
+        title: 'Maria unread',
+        subtitle: 'Samira: Please review this',
+        status: ChatThreadStatus.unread,
+        unreadCount: 3,
+      ),
+      _summaryThread(
+        id: 'sent-thread',
+        title: 'Sent thread',
+        subtitle: 'You: Waiting for delivery',
+        status: ChatThreadStatus.sent,
+      ),
+      _summaryThread(
+        id: 'delivered-thread',
+        title: 'Delivered thread',
+        subtitle: 'You: Delivered update',
+        status: ChatThreadStatus.delivered,
+      ),
+      _summaryThread(
+        id: 'read-thread',
+        title: 'Read thread',
+        subtitle: 'You: Read update',
+        status: ChatThreadStatus.read,
+      ),
+    ];
+
+    await tester.pumpWidget(
+      MaterialApp(home: ChatHomePage(repository: repository)),
+    );
+    repository.emitThreads(threads);
+    await tester.pumpAndSettle();
+
+    expect(find.text('Samira: Please review this'), findsOneWidget);
+    expect(find.byKey(const Key('unread-badge-unread-thread')), findsOneWidget);
+    expect(find.text('3'), findsOneWidget);
+    final badgeFinder = find.byKey(const Key('unread-badge-unread-thread'));
+    final badge = tester.widget<Container>(
+      find.descendant(of: badgeFinder, matching: find.byType(Container)).first,
+    );
+    final decoration = badge.decoration! as BoxDecoration;
+    expect(
+      decoration.color,
+      Theme.of(tester.element(badgeFinder)).colorScheme.error,
+    );
+
+    for (final filter in [
+      ('unread', 'Maria unread', 'Sent thread'),
+      ('sent', 'Sent thread', 'Delivered thread'),
+      ('delivered', 'Delivered thread', 'Read thread'),
+      ('read', 'Read thread', 'Maria unread'),
+    ]) {
+      await tester.tap(find.byKey(Key('thread-status-filter-${filter.$1}')));
+      await tester.pumpAndSettle();
+      expect(find.text(filter.$2), findsOneWidget);
+      expect(find.text(filter.$3), findsNothing);
+    }
+
+    await tester.tap(find.byKey(const Key('thread-status-filter-unread')));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField), 'maria');
+    await tester.pumpAndSettle();
+    expect(find.text('Maria unread'), findsOneWidget);
+
+    await tester.enterText(find.byType(TextField), 'missing');
+    await tester.pumpAndSettle();
+    expect(find.text('No conversations match your search.'), findsOneWidget);
+
+    await repository.dispose();
+  });
+
+  testWidgets('clears the unread badge after an opened thread is read', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(700, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    final unreadThread = _summaryThread(
+      id: 'receipt-thread',
+      title: 'Receipt thread',
+      subtitle: 'Please read me',
+      status: ChatThreadStatus.unread,
+      unreadCount: 2,
+    );
+    final repository = _ThreadSummaryChatRepository(
+      messages: [
+        ChatMessage(
+          id: 'incoming-message',
+          threadId: unreadThread.id,
+          senderId: 'peer',
+          senderName: 'Peer',
+          body: 'Please read me',
+          createdAt: DateTime(2026, 7, 13, 12),
+          isMine: false,
+          isDelivered: false,
+          isRead: false,
+        ),
+      ],
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(home: ChatHomePage(repository: repository)),
+    );
+    repository.emitThreads([unreadThread]);
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const Key('unread-badge-receipt-thread')),
+      findsOneWidget,
+    );
+
+    await tester.tap(find.text('Receipt thread'));
+    await tester.pumpAndSettle();
+    expect(repository.markReadCount, greaterThanOrEqualTo(1));
+
+    repository.emitThreads([
+      unreadThread.copyWith(unreadCount: 0, status: ChatThreadStatus.read),
+    ]);
+    await tester.pumpAndSettle();
+    await tester.tap(find.byTooltip('Back to chats'));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('unread-badge-receipt-thread')), findsNothing);
+
+    await repository.dispose();
+  });
+
   testWidgets('shows typing, online, and active since status priority', (
     WidgetTester tester,
   ) async {
@@ -956,7 +1097,15 @@ void main() {
 
     expect(find.text('Old Peer'), findsOneWidget);
 
-    await tester.drag(find.byType(ListView).first, const Offset(0, 320));
+    await tester.drag(
+      find
+          .descendant(
+            of: find.byType(RefreshIndicator),
+            matching: find.byType(ListView),
+          )
+          .first,
+      const Offset(0, 320),
+    );
     await tester.pump();
     await tester.pumpAndSettle();
 
@@ -1764,7 +1913,9 @@ class _RefreshingChatRepository extends ChatRepository {
 
   @override
   Stream<List<ChatThread>> watchThreads() {
-    return Stream.value([_testThread('Old Peer')]);
+    return Stream.value([
+      _testThread(threadFetchCount == 0 ? 'Old Peer' : 'Refreshed Peer'),
+    ]);
   }
 
   @override
@@ -1792,6 +1943,55 @@ class _RefreshingChatRepository extends ChatRepository {
   @override
   Stream<List<ChatMessage>> watchMessages(String conversationId) {
     return Stream.value(const []);
+  }
+
+  @override
+  Future<void> updateLastSeen() async {}
+
+  @override
+  Future<void> disposeRealtime() async {}
+}
+
+class _ThreadSummaryChatRepository extends ChatRepository {
+  _ThreadSummaryChatRepository({this.messages = const []});
+
+  final StreamController<List<ChatThread>> _threads =
+      StreamController<List<ChatThread>>.broadcast();
+  final List<ChatMessage> messages;
+  int markReadCount = 0;
+
+  @override
+  bool get isConnected => true;
+
+  void emitThreads(List<ChatThread> threads) {
+    _threads.add(threads);
+  }
+
+  Future<void> dispose() => _threads.close();
+
+  @override
+  Stream<List<ChatThread>> watchThreads() => _threads.stream;
+
+  @override
+  Stream<Map<String, UserPresence>> watchPresenceForThreads() {
+    return Stream.value(const {});
+  }
+
+  @override
+  Stream<TypingState> watchConversationTyping(String conversationId) {
+    return Stream.value(TypingState.idle(conversationId));
+  }
+
+  @override
+  Stream<List<ChatMessage>> watchMessages(String conversationId) {
+    return Stream.value(
+      messages.where((message) => message.threadId == conversationId).toList(),
+    );
+  }
+
+  @override
+  Future<void> markConversationRead(String conversationId) async {
+    markReadCount += 1;
   }
 
   @override
@@ -1835,7 +2035,7 @@ ChatThread _testThread(String title) {
   return ChatThread(
     id: 'conversation-1',
     title: title,
-    subtitle: 'Latest messages are synced.',
+    subtitle: 'Old message preview',
     avatarLabel: 'OP',
     accentColor: Colors.teal,
     lastActive: 'Now',
@@ -1843,5 +2043,27 @@ ChatThread _testThread(String title) {
     isOnline: false,
     activityLabel: 'Offline',
     peerUserId: 'peer-1',
+  );
+}
+
+ChatThread _summaryThread({
+  required String id,
+  required String title,
+  required String subtitle,
+  required ChatThreadStatus status,
+  int unreadCount = 0,
+}) {
+  return ChatThread(
+    id: id,
+    title: title,
+    subtitle: subtitle,
+    avatarLabel: title.substring(0, 1).toUpperCase(),
+    accentColor: Colors.teal,
+    lastActive: 'Now',
+    unreadCount: unreadCount,
+    isOnline: false,
+    activityLabel: 'Offline',
+    status: status,
+    latestMessageAt: DateTime(2026, 7, 13, 12),
   );
 }

@@ -243,19 +243,9 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
     final controller = StreamController<List<ChatThread>>();
     StreamSubscription<List<Map<String, dynamic>>>? conversationsSubscription;
     StreamSubscription<List<Map<String, dynamic>>>? membershipSubscription;
+    RealtimeChannel? summaryUpdatesChannel;
     var requestId = 0;
-
-    Future<void> emitRows(List<Map<String, dynamic>> rows) async {
-      final currentRequest = ++requestId;
-      try {
-        final threads = await _threadsFromConversationRows(rows);
-        if (!controller.isClosed && currentRequest == requestId) {
-          controller.add(threads);
-        }
-      } catch (error, stackTrace) {
-        if (!controller.isClosed) controller.addError(error, stackTrace);
-      }
-    }
+    Timer? refreshTimer;
 
     Future<void> refreshVisibleThreads() async {
       final currentRequest = ++requestId;
@@ -269,21 +259,79 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
       }
     }
 
+    void scheduleRefresh() {
+      refreshTimer?.cancel();
+      refreshTimer = Timer(const Duration(milliseconds: 40), () {
+        refreshTimer = null;
+        unawaited(refreshVisibleThreads());
+      });
+    }
+
+    void acknowledgePendingReceipt(PostgresChangePayload payload) {
+      if (payload.eventType != PostgresChangeEvent.insert ||
+          payload.newRecord['user_id']?.toString() != user.id) {
+        return;
+      }
+      final conversationId =
+          payload.newRecord['conversation_id']?.toString() ?? '';
+      if (conversationId.isEmpty) {
+        return;
+      }
+
+      unawaited(
+        markConversationDelivered(conversationId).catchError((_) {
+          // A later app-resume acknowledgement will retry transient failures.
+        }),
+      );
+    }
+
     controller.onListen = () {
       conversationsSubscription = supabase
           .from('conversations')
           .stream(primaryKey: ['id'])
           .order('last_message_at')
-          .listen(emitRows, onError: controller.addError);
+          .listen((_) => scheduleRefresh(), onError: controller.addError);
       membershipSubscription = supabase
           .from('conversation_members')
           .stream(primaryKey: ['conversation_id', 'user_id'])
           .eq('user_id', user.id)
-          .listen((_) => refreshVisibleThreads(), onError: controller.addError);
+          .listen((_) => scheduleRefresh(), onError: controller.addError);
+      final channel = supabase
+          .channel('thread-summary-updates-${user.id}-${_uuid.v4()}')
+          .onPostgresChanges(
+            event: PostgresChangeEvent.all,
+            schema: 'public',
+            table: 'messages',
+            callback: (_) => scheduleRefresh(),
+          )
+          .onPostgresChanges(
+            event: PostgresChangeEvent.all,
+            schema: 'public',
+            table: 'message_receipts',
+            callback: (payload) {
+              acknowledgePendingReceipt(payload);
+              scheduleRefresh();
+            },
+          );
+      summaryUpdatesChannel = channel;
+      channel.subscribe((status, error) {
+        if (status == RealtimeSubscribeStatus.channelError &&
+            !controller.isClosed) {
+          controller.addError(
+            error ?? StateError('Conversation summary watch failed.'),
+          );
+        }
+      });
+      scheduleRefresh();
     };
     controller.onCancel = () async {
+      refreshTimer?.cancel();
       await conversationsSubscription?.cancel();
       await membershipSubscription?.cancel();
+      final channel = summaryUpdatesChannel;
+      if (channel != null) {
+        await supabase.removeChannel(channel);
+      }
     };
     return controller.stream;
   }
@@ -298,8 +346,14 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
       return const [];
     }
 
-    final rows = await supabase.from('conversations').select();
-    return _threadsFromConversationRows(List<Map<String, dynamic>>.from(rows));
+    final rowsFuture = supabase.from('conversations').select();
+    final summariesFuture = _conversationSummaries(supabase);
+    final rows = await rowsFuture;
+    final summaries = await summariesFuture;
+    return _threadsFromConversationRows(
+      List<Map<String, dynamic>>.from(rows),
+      summaries: summaries,
+    );
   }
 
   Stream<Map<String, UserPresence>> watchPresenceForThreads() {
@@ -459,6 +513,20 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
         .isFilter('delivered_at', null);
   }
 
+  Future<void> markPendingMessagesDelivered() async {
+    final supabase = client;
+    final user = supabase?.auth.currentUser;
+    if (supabase == null || user == null) {
+      return;
+    }
+
+    await supabase
+        .from('message_receipts')
+        .update({'delivered_at': DateTime.now().toUtc().toIso8601String()})
+        .eq('user_id', user.id)
+        .isFilter('delivered_at', null);
+  }
+
   Future<void> markConversationRead(String conversationId) async {
     final supabase = client;
     final user = supabase?.auth.currentUser;
@@ -535,11 +603,7 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
   Future<ChatThread> startDirectConversation(ChatUser peer) async {
     final supabase = client;
     if (supabase == null) {
-      return _threadFromPeer(
-        conversationId: 'direct-${peer.id}',
-        peer: peer,
-        hasMessages: false,
-      );
+      return _threadFromPeer(conversationId: 'direct-${peer.id}', peer: peer);
     }
 
     final currentUser = supabase.auth.currentUser;
@@ -561,7 +625,7 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
         .maybeSingle();
 
     if (existing != null) {
-      return _threadFromConversation(existing, peer);
+      return _threadFromDirectConversation(supabase, existing, peer);
     }
 
     try {
@@ -571,7 +635,7 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
           .select()
           .single();
 
-      return _threadFromConversation(created, peer);
+      return _threadFromDirectConversation(supabase, created, peer);
     } on PostgrestException {
       final raced = await supabase
           .from('conversations')
@@ -580,7 +644,7 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
           .eq('user_two_id', userTwoId)
           .single();
 
-      return _threadFromConversation(raced, peer);
+      return _threadFromDirectConversation(supabase, raced, peer);
     }
   }
 
@@ -1618,16 +1682,55 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
     return TypingState.idle(conversationId);
   }
 
-  Future<List<ChatThread>> _threadsFromConversationRows(
-    List<Map<String, dynamic>> rows,
+  Future<Map<String, _ConversationSummary>> _conversationSummaries(
+    SupabaseClient supabase,
   ) async {
+    final result = await supabase.rpc('get_conversation_summaries');
+    if (result is! List) {
+      throw StateError('Conversation summaries returned an invalid response.');
+    }
+
+    final summaries = <String, _ConversationSummary>{};
+    for (final row in result) {
+      if (row is! Map) {
+        continue;
+      }
+      final summary = _ConversationSummary.fromSupabase(
+        Map<String, dynamic>.from(row),
+      );
+      if (summary.conversationId.isNotEmpty) {
+        summaries[summary.conversationId] = summary;
+      }
+    }
+    return summaries;
+  }
+
+  Future<ChatThread> _threadFromDirectConversation(
+    SupabaseClient supabase,
+    Map<String, dynamic> row,
+    ChatUser peer,
+  ) async {
+    final summaries = await _conversationSummaries(supabase);
+    return _threadFromConversation(
+      row,
+      peer,
+      summary: summaries[row['id']?.toString()],
+    );
+  }
+
+  Future<List<ChatThread>> _threadsFromConversationRows(
+    List<Map<String, dynamic>> rows, {
+    required Map<String, _ConversationSummary> summaries,
+  }) async {
     rows.sort((a, b) {
+      final aSummary = summaries[a['id']?.toString()];
+      final bSummary = summaries[b['id']?.toString()];
       final aTime =
-          _readTimestamp(a['last_message_at']) ??
+          aSummary?.latestMessageAt ??
           _readTimestamp(a['created_at']) ??
           DateTime.fromMillisecondsSinceEpoch(0);
       final bTime =
-          _readTimestamp(b['last_message_at']) ??
+          bSummary?.latestMessageAt ??
           _readTimestamp(b['created_at']) ??
           DateTime.fromMillisecondsSinceEpoch(0);
       return bTime.compareTo(aTime);
@@ -1653,15 +1756,23 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
                 .inFilter('conversation_id', groupIds),
           );
 
+    final membershipsByConversationId = <String, List<Map<String, dynamic>>>{};
+    for (final membership in groupMemberships) {
+      final conversationId = membership['conversation_id']?.toString() ?? '';
+      if (conversationId.isNotEmpty) {
+        membershipsByConversationId
+            .putIfAbsent(conversationId, () => [])
+            .add(membership);
+      }
+    }
+
     return rows.map((row) {
+      final conversationId = row['id']?.toString() ?? '';
+      final summary = summaries[conversationId];
       if (row['conversation_type'] == 'group') {
-        final conversationId = row['id']?.toString() ?? '';
-        final memberships = groupMemberships
-            .where(
-              (membership) =>
-                  membership['conversation_id']?.toString() == conversationId,
-            )
-            .toList();
+        final memberships =
+            membershipsByConversationId[conversationId] ??
+            const <Map<String, dynamic>>[];
         return _threadFromGroup(
           row: row,
           memberCount: memberships.length,
@@ -1670,12 +1781,13 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
                 membership['user_id']?.toString() == localUserId &&
                 membership['role'] == 'admin',
           ),
+          summary: summary,
         );
       }
       final peerId = _peerUserIdFor(row) ?? '';
       final peer =
           profiles[peerId] ?? ChatUser(id: peerId, displayName: 'Unknown user');
-      return _threadFromConversation(row, peer);
+      return _threadFromConversation(row, peer, summary: summary);
     }).toList();
   }
 
@@ -1710,14 +1822,18 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
     return null;
   }
 
-  ChatThread _threadFromConversation(Map<String, dynamic> row, ChatUser peer) {
+  ChatThread _threadFromConversation(
+    Map<String, dynamic> row,
+    ChatUser peer, {
+    _ConversationSummary? summary,
+  }) {
     final lastMessageAt = _readTimestamp(row['last_message_at']);
 
     return _threadFromPeer(
       conversationId: row['id']?.toString() ?? '',
       peer: peer,
-      hasMessages: lastMessageAt != null,
       lastMessageAt: lastMessageAt,
+      summary: summary,
     );
   }
 
@@ -1725,46 +1841,57 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
     required Map<String, dynamic> row,
     required int memberCount,
     required bool isAdmin,
+    _ConversationSummary? summary,
   }) {
-    final lastMessageAt = _readTimestamp(row['last_message_at']);
+    final fallbackLastMessageAt = _readTimestamp(row['last_message_at']);
+    final lastMessageAt = summary == null
+        ? fallbackLastMessageAt
+        : summary.latestMessageAt;
     final title = row['title']?.toString().trim();
     final displayTitle = title == null || title.isEmpty ? 'Group' : title;
     return ChatThread(
       id: row['id']?.toString() ?? '',
       title: displayTitle,
-      subtitle: lastMessageAt == null
-          ? 'No messages yet'
-          : 'Latest messages are synced.',
+      subtitle:
+          summary?.preview(isGroup: true, localUserId: localUserId) ??
+          'No messages yet',
       avatarLabel: _avatarLabelFor(displayTitle),
       accentColor: _accentColorFor(row['id']?.toString() ?? displayTitle),
       lastActive: lastMessageAt == null
           ? 'New'
           : relativeTimeLabel(lastMessageAt),
-      unreadCount: 0,
+      unreadCount: summary?.unreadCount ?? 0,
       isOnline: false,
       activityLabel: '$memberCount ${memberCount == 1 ? 'member' : 'members'}',
       conversationType: ChatConversationType.group,
       memberCount: memberCount,
       isAdmin: isAdmin,
+      latestMessageAt: lastMessageAt,
+      status: summary?.threadStatus ?? ChatThreadStatus.none,
     );
   }
 
   ChatThread _threadFromPeer({
     required String conversationId,
     required ChatUser peer,
-    required bool hasMessages,
     DateTime? lastMessageAt,
+    _ConversationSummary? summary,
   }) {
+    final latestMessageAt = summary == null
+        ? lastMessageAt
+        : summary.latestMessageAt;
     return ChatThread(
       id: conversationId,
       title: peer.displayName,
-      subtitle: hasMessages ? 'Latest messages are synced.' : 'No messages yet',
+      subtitle:
+          summary?.preview(isGroup: false, localUserId: localUserId) ??
+          'No messages yet',
       avatarLabel: peer.avatarLabel,
       accentColor: _accentColorFor(peer.id),
-      lastActive: lastMessageAt == null
+      lastActive: latestMessageAt == null
           ? 'New'
-          : relativeTimeLabel(lastMessageAt),
-      unreadCount: 0,
+          : relativeTimeLabel(latestMessageAt),
+      unreadCount: summary?.unreadCount ?? 0,
       isOnline: false,
       activityLabel: activityLabelFor(
         isOnline: false,
@@ -1772,7 +1899,81 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
       ),
       peerUserId: peer.id,
       peerLastSeenAt: peer.lastSeenAt,
+      latestMessageAt: latestMessageAt,
+      status: summary?.threadStatus ?? ChatThreadStatus.none,
     );
+  }
+}
+
+class _ConversationSummary {
+  const _ConversationSummary({
+    required this.conversationId,
+    required this.latestMessageId,
+    required this.latestMessageSenderId,
+    required this.latestMessageSenderName,
+    required this.latestMessageBody,
+    required this.latestMessageType,
+    required this.latestMessageDeletedAt,
+    required this.latestMessageAt,
+    required this.unreadCount,
+    required this.status,
+    required this.latestOutgoingStatus,
+  });
+
+  factory _ConversationSummary.fromSupabase(Map<String, dynamic> row) {
+    return _ConversationSummary(
+      conversationId: row['conversation_id']?.toString() ?? '',
+      latestMessageId: _summaryText(row['latest_message_id']),
+      latestMessageSenderId: _summaryText(row['latest_message_sender_id']),
+      latestMessageSenderName: _summaryText(row['latest_message_sender_name']),
+      latestMessageBody: _summaryText(row['latest_message_body']),
+      latestMessageType: _summaryText(row['latest_message_type']),
+      latestMessageDeletedAt: _readTimestamp(row['latest_message_deleted_at']),
+      latestMessageAt: _readTimestamp(row['latest_message_at']),
+      unreadCount: _summaryInt(row['unread_count']),
+      status: _threadStatusFromValue(row['status']),
+      latestOutgoingStatus: _threadStatusFromValue(
+        row['latest_outgoing_status'],
+      ),
+    );
+  }
+
+  final String conversationId;
+  final String? latestMessageId;
+  final String? latestMessageSenderId;
+  final String? latestMessageSenderName;
+  final String? latestMessageBody;
+  final String? latestMessageType;
+  final DateTime? latestMessageDeletedAt;
+  final DateTime? latestMessageAt;
+  final int unreadCount;
+  final ChatThreadStatus status;
+  final ChatThreadStatus latestOutgoingStatus;
+
+  bool get hasLatestMessage => latestMessageId != null;
+
+  ChatThreadStatus get threadStatus {
+    if (unreadCount > 0) {
+      return ChatThreadStatus.unread;
+    }
+    return status == ChatThreadStatus.none ? latestOutgoingStatus : status;
+  }
+
+  String? preview({required bool isGroup, required String localUserId}) {
+    if (!hasLatestMessage) {
+      return null;
+    }
+
+    final messagePreview = latestMessageDeletedAt == null
+        ? _previewForMessage(latestMessageBody, latestMessageType)
+        : 'Message deleted';
+    if (latestMessageSenderId == localUserId) {
+      return 'You: $messagePreview';
+    }
+    if (isGroup) {
+      return '${latestMessageSenderName ?? 'Someone'}: $messagePreview';
+    }
+    return messagePreview;
   }
 }
 
@@ -1780,6 +1981,43 @@ bool _matchesUser(ChatUser user, String query) {
   return user.id.toLowerCase().contains(query) ||
       user.displayName.toLowerCase().contains(query) ||
       (user.email?.toLowerCase().contains(query) ?? false);
+}
+
+String _previewForMessage(String? body, String? messageType) {
+  final text = body?.trim();
+  if (text != null && text.isNotEmpty) {
+    return text;
+  }
+
+  return switch (ChatMessageType.fromValue(messageType)) {
+    ChatMessageType.image => 'Photo',
+    ChatMessageType.gif => 'GIF',
+    ChatMessageType.voice => 'Voice message',
+    ChatMessageType.call => 'Call event',
+    ChatMessageType.text => 'Message',
+  };
+}
+
+ChatThreadStatus _threadStatusFromValue(Object? value) {
+  return switch (value?.toString().trim().toLowerCase()) {
+    'unread' => ChatThreadStatus.unread,
+    'sent' => ChatThreadStatus.sent,
+    'delivered' => ChatThreadStatus.delivered,
+    'read' => ChatThreadStatus.read,
+    _ => ChatThreadStatus.none,
+  };
+}
+
+int _summaryInt(Object? value) {
+  if (value is num) {
+    return value.toInt();
+  }
+  return int.tryParse(value?.toString() ?? '') ?? 0;
+}
+
+String? _summaryText(Object? value) {
+  final text = value?.toString().trim();
+  return text == null || text.isEmpty ? null : text;
 }
 
 MessageReceipt? _aggregateReceipts(List<MessageReceipt>? receipts) {

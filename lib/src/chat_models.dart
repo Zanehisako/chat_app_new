@@ -67,6 +67,8 @@ class MessageReceipt {
 
 enum ChatConversationType { direct, group }
 
+enum ChatThreadStatus { none, unread, sent, delivered, read }
+
 class ChatThread {
   const ChatThread({
     required this.id,
@@ -85,6 +87,8 @@ class ChatThread {
     this.isAdmin = false,
     this.isTyping = false,
     this.typingUserName,
+    this.latestMessageAt,
+    this.status = ChatThreadStatus.none,
   });
 
   final String id;
@@ -103,6 +107,8 @@ class ChatThread {
   final bool isAdmin;
   final bool isTyping;
   final String? typingUserName;
+  final DateTime? latestMessageAt;
+  final ChatThreadStatus status;
 
   bool get isGroup => conversationType == ChatConversationType.group;
 
@@ -128,6 +134,8 @@ class ChatThread {
     bool? isAdmin,
     bool? isTyping,
     String? typingUserName,
+    DateTime? latestMessageAt,
+    ChatThreadStatus? status,
   }) {
     final nextIsTyping = isTyping ?? this.isTyping;
 
@@ -150,6 +158,8 @@ class ChatThread {
       typingUserName: nextIsTyping
           ? typingUserName ?? this.typingUserName
           : null,
+      latestMessageAt: latestMessageAt ?? this.latestMessageAt,
+      status: status ?? this.status,
     );
   }
 }
@@ -764,6 +774,7 @@ class ChatSeed {
       isAdmin: true,
       isTyping: true,
       typingUserName: 'Samira',
+      status: ChatThreadStatus.unread,
     ),
     ChatThread(
       id: 'product',
@@ -776,6 +787,7 @@ class ChatSeed {
       isOnline: true,
       activityLabel: 'Online',
       peerUserId: 'alex',
+      status: ChatThreadStatus.sent,
     ),
     ChatThread(
       id: 'maria',
@@ -788,6 +800,7 @@ class ChatSeed {
       isOnline: false,
       activityLabel: 'Active since 1h ago',
       peerUserId: 'maria',
+      status: ChatThreadStatus.unread,
     ),
     ChatThread(
       id: 'ops',
@@ -800,6 +813,7 @@ class ChatSeed {
       isOnline: false,
       activityLabel: 'Active since 4h ago',
       peerUserId: 'nadir',
+      status: ChatThreadStatus.delivered,
     ),
   ];
 
