@@ -468,10 +468,20 @@ class _ChatHomePageState extends State<ChatHomePage>
     if (_knownIncomingMessageOrder.length > _maxKnownIncomingMessageIds) {
       _knownIncomingMessageIds.remove(_knownIncomingMessageOrder.removeFirst());
     }
+    ChatThread? thread;
+    for (final candidate in _availableThreads) {
+      if (candidate.id == message.threadId) {
+        thread = candidate;
+        break;
+      }
+    }
+    final isGroup = thread?.isGroup ?? false;
     unawaited(
       NotificationService.instance.showAppRunningMessage(
-        title: message.senderName,
-        body: _notificationPreview(message),
+        title: isGroup ? thread!.title : message.senderName,
+        body: isGroup
+            ? '${message.senderName}: ${_notificationPreview(message)}'
+            : _notificationPreview(message),
         conversationId: message.threadId,
         messageId: message.id,
       ),
@@ -589,10 +599,17 @@ class _ChatHomePageState extends State<ChatHomePage>
           : _presenceByUser[profiledThread.peerUserId];
       final typing = _typingByConversation[profiledThread.id];
       final isTyping = typing?.isTyping ?? profiledThread.isTyping;
-      final isOnline = presence?.isOnline ?? profiledThread.isOnline;
+      final isOnline = profiledThread.isGroup
+          ? false
+          : presence?.isOnline ?? profiledThread.isOnline;
       final lastSeenAt = presence?.lastSeenAt ?? profiledThread.peerLastSeenAt;
       final activityLabel = isTyping
-          ? 'Typing...'
+          ? profiledThread.isGroup &&
+                    (typing?.displayName.trim().isNotEmpty ?? false)
+                ? '${typing!.displayName} is typing...'
+                : 'Typing...'
+          : profiledThread.isGroup
+          ? '${profiledThread.memberCount} ${profiledThread.memberCount == 1 ? 'member' : 'members'}'
           : isOnline
           ? 'Online'
           : activityLabelFor(isOnline: false, lastSeenAt: lastSeenAt);
@@ -699,6 +716,7 @@ class _ChatHomePageState extends State<ChatHomePage>
             onSearchChanged: _setQuery,
             onThreadSelected: _selectThread,
             onNewChat: _openNewChat,
+            onNewGroup: _openNewGroup,
             onOpenProfile: _openProfile,
             onRefresh: _refreshConversations,
             onSignOut: _requestSignOut,
@@ -730,6 +748,7 @@ class _ChatHomePageState extends State<ChatHomePage>
         onSearchChanged: _setQuery,
         onThreadSelected: _selectCompactThread,
         onNewChat: _openNewChat,
+        onNewGroup: _openNewGroup,
         onOpenProfile: _openProfile,
         onRefresh: _refreshConversations,
         onSignOut: _requestSignOut,
@@ -785,6 +804,7 @@ class _ChatHomePageState extends State<ChatHomePage>
       onComposerChanged: (value) => _handleComposerChanged(thread, value),
       onStartAudioCall: () => _startCall(thread, isVideo: false),
       onStartVideoCall: () => _startCall(thread, isVideo: true),
+      onOpenGroupDetails: () => _openGroupDetails(thread),
       onOpenProfile: _openProfile,
       onSignOut: _requestSignOut,
     );
@@ -882,6 +902,70 @@ class _ChatHomePageState extends State<ChatHomePage>
     }
 
     await _startChatWith(user);
+  }
+
+  Future<void> _openNewGroup() async {
+    final draft = await showDialog<_NewGroupDraft>(
+      context: context,
+      builder: (context) => _NewGroupDialog(repository: widget.repository),
+    );
+    if (draft == null || !mounted) return;
+
+    try {
+      final thread = await widget.repository.createGroupConversation(
+        name: draft.name,
+        members: draft.members,
+      );
+      if (!mounted) return;
+      setState(() {
+        _startedThreads.removeWhere((item) => item.id == thread.id);
+        _startedThreads.insert(0, thread);
+        _selectedThread = thread;
+        _isCompactConversationOpen = true;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Could not create group: ${_shortError(error)}'),
+        ),
+      );
+    }
+  }
+
+  Future<void> _openGroupDetails(ChatThread thread) async {
+    if (!thread.isGroup) return;
+    final result = await showDialog<_GroupDetailsResult>(
+      context: context,
+      builder: (context) =>
+          _GroupDetailsDialog(repository: widget.repository, thread: thread),
+    );
+    if (!mounted || result == null) return;
+
+    if (result.leftGroup) {
+      setState(() {
+        _startedThreads.removeWhere((item) => item.id == thread.id);
+        _refreshedThreads.removeWhere((item) => item.id == thread.id);
+        _selectedThread = null;
+        _isCompactConversationOpen = false;
+        _threadsStream = widget.repository.watchThreads();
+      });
+      return;
+    }
+
+    final updated = thread.copyWith(
+      title: result.name,
+      avatarLabel: _groupAvatarLabel(result.name),
+      memberCount: result.memberCount,
+      activityLabel:
+          '${result.memberCount} ${result.memberCount == 1 ? 'member' : 'members'}',
+    );
+    setState(() {
+      _refreshedThreads.removeWhere((item) => item.id == thread.id);
+      _refreshedThreads.insert(0, updated);
+      _selectedThread = updated;
+      _threadsStream = widget.repository.watchThreads();
+    });
   }
 
   Future<void> _startChatWith(ChatUser user) async {
@@ -2100,9 +2184,15 @@ class _ChatHomePageState extends State<ChatHomePage>
 }
 
 class _NewChatDialog extends StatefulWidget {
-  const _NewChatDialog({required this.repository});
+  const _NewChatDialog({
+    required this.repository,
+    this.title = 'New message',
+    this.excludedUserIds = const {},
+  });
 
   final ChatRepository repository;
+  final String title;
+  final Set<String> excludedUserIds;
 
   @override
   State<_NewChatDialog> createState() => _NewChatDialogState();
@@ -2129,11 +2219,11 @@ class _NewChatDialogState extends State<_NewChatDialog> {
     final theme = Theme.of(context);
 
     return AlertDialog(
-      title: const Row(
+      title: Row(
         children: [
-          Icon(Icons.edit_square),
-          SizedBox(width: 10),
-          Text('New message'),
+          const Icon(Icons.edit_square),
+          const SizedBox(width: 10),
+          Text(widget.title),
         ],
       ),
       content: SizedBox(
@@ -2241,7 +2331,9 @@ class _NewChatDialogState extends State<_NewChatDialog> {
     final requestId = ++_requestId;
 
     try {
-      final users = await widget.repository.searchUsers(query);
+      final users = (await widget.repository.searchUsers(
+        query,
+      )).where((user) => !widget.excludedUserIds.contains(user.id)).toList();
       if (!mounted || requestId != _requestId) {
         return;
       }
@@ -2259,6 +2351,461 @@ class _NewChatDialogState extends State<_NewChatDialog> {
         _error = 'Could not search users.';
         _isLoading = false;
       });
+    }
+  }
+}
+
+class _NewGroupDraft {
+  const _NewGroupDraft({required this.name, required this.members});
+
+  final String name;
+  final List<ChatUser> members;
+}
+
+class _NewGroupDialog extends StatefulWidget {
+  const _NewGroupDialog({required this.repository});
+
+  final ChatRepository repository;
+
+  @override
+  State<_NewGroupDialog> createState() => _NewGroupDialogState();
+}
+
+class _NewGroupDialogState extends State<_NewGroupDialog> {
+  final _nameController = TextEditingController();
+  final _searchController = TextEditingController();
+  final Map<String, ChatUser> _selectedUsers = {};
+  Timer? _debounce;
+  List<ChatUser> _users = const [];
+  String? _error;
+  bool _isLoading = false;
+  int _requestId = 0;
+
+  @override
+  void dispose() {
+    _debounce?.cancel();
+    _nameController.dispose();
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final canCreate =
+        _nameController.text.trim().isNotEmpty &&
+        _nameController.text.trim().length <= 80 &&
+        _selectedUsers.length >= 2 &&
+        _selectedUsers.length <= 49;
+    return AlertDialog(
+      title: const Row(
+        children: [
+          Icon(Icons.group_add_outlined),
+          SizedBox(width: 10),
+          Text('New group'),
+        ],
+      ),
+      content: SizedBox(
+        width: 480,
+        height: 520,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            TextField(
+              key: const Key('new-group-name'),
+              controller: _nameController,
+              autofocus: true,
+              maxLength: 80,
+              onChanged: (_) => setState(() {}),
+              decoration: const InputDecoration(
+                labelText: 'Group name',
+                prefixIcon: Icon(Icons.groups_outlined),
+              ),
+            ),
+            if (_selectedUsers.isNotEmpty) ...[
+              Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                children: _selectedUsers.values
+                    .map(
+                      (user) => InputChip(
+                        label: Text(user.displayName),
+                        onDeleted: () => setState(() {
+                          _selectedUsers.remove(user.id);
+                        }),
+                      ),
+                    )
+                    .toList(),
+              ),
+              const SizedBox(height: 10),
+            ],
+            TextField(
+              key: const Key('new-group-search'),
+              controller: _searchController,
+              textInputAction: TextInputAction.search,
+              onChanged: _scheduleSearch,
+              decoration: InputDecoration(
+                hintText: 'Search people',
+                prefixIcon: const Icon(Icons.search),
+                helperText: '${_selectedUsers.length}/49 selected',
+              ),
+            ),
+            const SizedBox(height: 8),
+            Expanded(child: _buildResults()),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          key: const Key('create-group'),
+          onPressed: canCreate
+              ? () => Navigator.of(context).pop(
+                  _NewGroupDraft(
+                    name: _nameController.text.trim(),
+                    members: _selectedUsers.values.toList(),
+                  ),
+                )
+              : null,
+          child: const Text('Create group'),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildResults() {
+    if (_isLoading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_error != null) {
+      return Center(child: Text(_error!));
+    }
+    if (_searchController.text.trim().isEmpty) {
+      return const Center(
+        child: Text('Search and select at least two people.'),
+      );
+    }
+    if (_users.isEmpty) {
+      return const Center(child: Text('No users found.'));
+    }
+    return ListView.builder(
+      itemCount: _users.length,
+      itemBuilder: (context, index) {
+        final user = _users[index];
+        final selected = _selectedUsers.containsKey(user.id);
+        return CheckboxListTile(
+          value: selected,
+          secondary: _UserAvatar(user: user),
+          title: Text(user.displayName),
+          subtitle: user.email == null ? null : Text(user.email!),
+          onChanged: _selectedUsers.length >= 49 && !selected
+              ? null
+              : (value) => setState(() {
+                  if (value == true) {
+                    _selectedUsers[user.id] = user;
+                  } else {
+                    _selectedUsers.remove(user.id);
+                  }
+                }),
+        );
+      },
+    );
+  }
+
+  void _scheduleSearch(String value) {
+    _debounce?.cancel();
+    setState(() {
+      _users = const [];
+      _error = null;
+      _isLoading = value.trim().isNotEmpty;
+    });
+    if (value.trim().isEmpty) return;
+    _debounce = Timer(const Duration(milliseconds: 250), () => _search(value));
+  }
+
+  Future<void> _search(String query) async {
+    final requestId = ++_requestId;
+    try {
+      final users = await widget.repository.searchUsers(query);
+      if (!mounted || requestId != _requestId) return;
+      setState(() {
+        _users = users;
+        _isLoading = false;
+      });
+    } catch (_) {
+      if (!mounted || requestId != _requestId) return;
+      setState(() {
+        _error = 'Could not search users.';
+        _isLoading = false;
+      });
+    }
+  }
+}
+
+class _GroupDetailsResult {
+  const _GroupDetailsResult({
+    required this.name,
+    required this.memberCount,
+    this.leftGroup = false,
+  });
+
+  final String name;
+  final int memberCount;
+  final bool leftGroup;
+}
+
+class _GroupDetailsDialog extends StatefulWidget {
+  const _GroupDetailsDialog({required this.repository, required this.thread});
+
+  final ChatRepository repository;
+  final ChatThread thread;
+
+  @override
+  State<_GroupDetailsDialog> createState() => _GroupDetailsDialogState();
+}
+
+class _GroupDetailsDialogState extends State<_GroupDetailsDialog> {
+  List<ChatGroupMember> _members = const [];
+  late String _name;
+  bool _isLoading = true;
+  bool _isWorking = false;
+  String? _error;
+
+  bool get _isAdmin =>
+      _members.any((member) => member.isCurrentUser && member.isAdmin);
+
+  @override
+  void initState() {
+    super.initState();
+    _name = widget.thread.title;
+    unawaited(_loadMembers());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Row(
+        children: [
+          CircleAvatar(child: Text(_groupAvatarLabel(_name))),
+          const SizedBox(width: 12),
+          Expanded(child: Text(_name, overflow: TextOverflow.ellipsis)),
+          if (_isAdmin)
+            IconButton(
+              tooltip: 'Rename group',
+              onPressed: _isWorking ? null : _rename,
+              icon: const Icon(Icons.edit_outlined),
+            ),
+        ],
+      ),
+      content: SizedBox(
+        width: 480,
+        height: 460,
+        child: _isLoading
+            ? const Center(child: CircularProgressIndicator())
+            : Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          '${_members.length} ${_members.length == 1 ? 'member' : 'members'}',
+                          style: Theme.of(context).textTheme.titleMedium,
+                        ),
+                      ),
+                      if (_isAdmin)
+                        TextButton.icon(
+                          onPressed: _isWorking ? null : _addMember,
+                          icon: const Icon(Icons.person_add_alt_1_outlined),
+                          label: const Text('Add'),
+                        ),
+                    ],
+                  ),
+                  if (_error != null)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: Text(
+                        _error!,
+                        style: TextStyle(
+                          color: Theme.of(context).colorScheme.error,
+                        ),
+                      ),
+                    ),
+                  Expanded(
+                    child: ListView.builder(
+                      itemCount: _members.length,
+                      itemBuilder: (context, index) {
+                        final member = _members[index];
+                        return ListTile(
+                          leading: _UserAvatar(user: member.user),
+                          title: Text(
+                            member.isCurrentUser
+                                ? '${member.user.displayName} (you)'
+                                : member.user.displayName,
+                          ),
+                          subtitle: member.isAdmin ? const Text('Admin') : null,
+                          trailing: _isAdmin && !member.isCurrentUser
+                              ? IconButton(
+                                  tooltip: 'Remove member',
+                                  onPressed: _isWorking
+                                      ? null
+                                      : () => _removeMember(member),
+                                  icon: const Icon(
+                                    Icons.person_remove_outlined,
+                                  ),
+                                )
+                              : null,
+                        );
+                      },
+                    ),
+                  ),
+                ],
+              ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: _isWorking ? null : _leave,
+          style: TextButton.styleFrom(
+            foregroundColor: Theme.of(context).colorScheme.error,
+          ),
+          child: const Text('Leave group'),
+        ),
+        FilledButton(
+          onPressed: _isWorking
+              ? null
+              : () => Navigator.of(context).pop(
+                  _GroupDetailsResult(
+                    name: _name,
+                    memberCount: _members.length,
+                  ),
+                ),
+          child: const Text('Done'),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _loadMembers() async {
+    try {
+      final members = await widget.repository.groupMembers(widget.thread.id);
+      if (!mounted) return;
+      setState(() {
+        _members = members;
+        _isLoading = false;
+        _error = null;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _error = 'Could not load members: ${_shortError(error)}';
+        _isLoading = false;
+      });
+    }
+  }
+
+  Future<void> _rename() async {
+    final controller = TextEditingController(text: _name);
+    final name = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Rename group'),
+        content: TextField(
+          key: const Key('rename-group-name'),
+          controller: controller,
+          autofocus: true,
+          maxLength: 80,
+          decoration: const InputDecoration(labelText: 'Group name'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(controller.text.trim()),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (name == null || name.isEmpty || name == _name) return;
+    await _run(() async {
+      await widget.repository.renameGroup(widget.thread.id, name);
+      _name = name;
+    });
+  }
+
+  Future<void> _addMember() async {
+    final user = await showDialog<ChatUser>(
+      context: context,
+      builder: (context) => _NewChatDialog(
+        repository: widget.repository,
+        title: 'Add member',
+        excludedUserIds: _members.map((member) => member.user.id).toSet(),
+      ),
+    );
+    if (user == null) return;
+    await _run(() async {
+      await widget.repository.addGroupMember(widget.thread.id, user);
+      await _loadMembers();
+    });
+  }
+
+  Future<void> _removeMember(ChatGroupMember member) async {
+    await _run(() async {
+      await widget.repository.removeGroupMember(
+        widget.thread.id,
+        member.user.id,
+      );
+      await _loadMembers();
+    });
+  }
+
+  Future<void> _leave() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Leave group?'),
+        content: const Text(
+          'You will lose access to this group and its messages.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Leave'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    await _run(() async {
+      await widget.repository.leaveGroup(widget.thread.id);
+      if (mounted) {
+        Navigator.of(context).pop(
+          _GroupDetailsResult(name: _name, memberCount: 0, leftGroup: true),
+        );
+      }
+    });
+  }
+
+  Future<void> _run(Future<void> Function() action) async {
+    setState(() {
+      _isWorking = true;
+      _error = null;
+    });
+    try {
+      await action();
+    } catch (error) {
+      if (mounted) setState(() => _error = _shortError(error));
+    } finally {
+      if (mounted) setState(() => _isWorking = false);
     }
   }
 }
@@ -2695,6 +3242,7 @@ class _ThreadList extends StatelessWidget {
     required this.onSearchChanged,
     required this.onThreadSelected,
     required this.onNewChat,
+    required this.onNewGroup,
     required this.onOpenProfile,
     required this.onRefresh,
     required this.onSignOut,
@@ -2707,6 +3255,7 @@ class _ThreadList extends StatelessWidget {
   final ValueChanged<String> onSearchChanged;
   final ValueChanged<ChatThread> onThreadSelected;
   final VoidCallback onNewChat;
+  final VoidCallback onNewGroup;
   final VoidCallback onOpenProfile;
   final Future<void> Function() onRefresh;
   final VoidCallback onSignOut;
@@ -2736,6 +3285,11 @@ class _ThreadList extends StatelessWidget {
                   tooltip: 'New chat',
                   onPressed: onNewChat,
                   icon: const Icon(Icons.edit_square),
+                ),
+                IconButton(
+                  tooltip: 'New group',
+                  onPressed: onNewGroup,
+                  icon: const Icon(Icons.group_add_outlined),
                 ),
                 IconButton(
                   tooltip: 'Profile',
@@ -2991,6 +3545,7 @@ class _ConversationPane extends StatelessWidget {
     required this.onComposerChanged,
     required this.onStartAudioCall,
     required this.onStartVideoCall,
+    required this.onOpenGroupDetails,
     required this.onOpenProfile,
     required this.onSignOut,
     required this.replyingTo,
@@ -3025,6 +3580,7 @@ class _ConversationPane extends StatelessWidget {
   final ValueChanged<String> onComposerChanged;
   final VoidCallback onStartAudioCall;
   final VoidCallback onStartVideoCall;
+  final VoidCallback onOpenGroupDetails;
   final VoidCallback onOpenProfile;
   final VoidCallback onSignOut;
   final ChatMessage? replyingTo;
@@ -3107,16 +3663,24 @@ class _ConversationPane extends StatelessWidget {
                   ],
                 ),
               ),
-              IconButton(
-                tooltip: 'Call',
-                onPressed: onStartAudioCall,
-                icon: const Icon(Icons.call_outlined),
-              ),
-              IconButton(
-                tooltip: 'Video',
-                onPressed: onStartVideoCall,
-                icon: const Icon(Icons.videocam_outlined),
-              ),
+              if (thread.isGroup)
+                IconButton(
+                  tooltip: 'Group info',
+                  onPressed: onOpenGroupDetails,
+                  icon: const Icon(Icons.group_outlined),
+                )
+              else ...[
+                IconButton(
+                  tooltip: 'Call',
+                  onPressed: onStartAudioCall,
+                  icon: const Icon(Icons.call_outlined),
+                ),
+                IconButton(
+                  tooltip: 'Video',
+                  onPressed: onStartVideoCall,
+                  icon: const Icon(Icons.videocam_outlined),
+                ),
+              ],
             ],
           ),
         ),
@@ -5221,6 +5785,21 @@ String _shortError(Object error) {
     return message;
   }
   return '${message.substring(0, 160)}...';
+}
+
+String _groupAvatarLabel(String name) {
+  final parts = name
+      .trim()
+      .split(RegExp(r'\s+'))
+      .where((part) => part.isNotEmpty)
+      .toList();
+  if (parts.length >= 2) {
+    return '${parts.first[0]}${parts.last[0]}'.toUpperCase();
+  }
+  if (parts.isNotEmpty) {
+    return parts.first.characters.take(2).toString().toUpperCase();
+  }
+  return 'G';
 }
 
 String _firstStackFrame(StackTrace stackTrace) {

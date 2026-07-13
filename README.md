@@ -1,6 +1,6 @@
 # chat_app
 
-A modern Flutter realtime direct-messaging UI with local preview data and Supabase auth.
+A modern Flutter realtime direct and group-messaging UI with local preview data and Supabase auth.
 
 ## Run locally
 
@@ -20,10 +20,11 @@ npx supabase link --project-ref your-project-ref
 npx supabase db push
 ```
 
-The migration files in `supabase/migrations/` create profiles, one-to-one
-conversations, realtime messages, per-recipient receipts, RLS policies, auth
-triggers, and existing-message receipt backfills. `supabase/schema.sql` is the
-full schema snapshot for reference.
+The migration files in `supabase/migrations/` create profiles, direct and named
+group conversations, membership/admin controls, realtime messages,
+per-recipient receipts, RLS policies, auth triggers, and existing-message
+receipt backfills. New group members only receive message history from their
+join time. `supabase/schema.sql` is the full schema snapshot for reference.
 
 2. In Supabase Auth, enable Email, Phone, and Google providers.
 3. Enable email confirmation if you want signups to require confirm-email.
@@ -46,8 +47,9 @@ apps, keep `chatapp://login-callback` unless you also update Android and iOS
 deep-link settings.
 
 Email/password, phone SMS OTP, forgot-password links, password recovery, Google
-OAuth, direct user search, and sign out are handled in the app. Realtime
-messages are only sent after Supabase has an authenticated user session.
+OAuth, direct user search, named group creation/member management, and sign out
+are handled in the app. Realtime messages are only sent after Supabase has an
+authenticated user session.
 
 ## Audio/video calls
 

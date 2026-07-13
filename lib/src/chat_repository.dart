@@ -240,15 +240,52 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
       return Stream.value(const []);
     }
 
-    return supabase
-        .from('conversations')
-        .stream(primaryKey: ['id'])
-        .order('last_message_at')
-        .asyncMap(
-          (rows) => _threadsFromConversationRows(
-            rows.where((row) => _belongsToUser(row, user.id)).toList(),
-          ),
-        );
+    final controller = StreamController<List<ChatThread>>();
+    StreamSubscription<List<Map<String, dynamic>>>? conversationsSubscription;
+    StreamSubscription<List<Map<String, dynamic>>>? membershipSubscription;
+    var requestId = 0;
+
+    Future<void> emitRows(List<Map<String, dynamic>> rows) async {
+      final currentRequest = ++requestId;
+      try {
+        final threads = await _threadsFromConversationRows(rows);
+        if (!controller.isClosed && currentRequest == requestId) {
+          controller.add(threads);
+        }
+      } catch (error, stackTrace) {
+        if (!controller.isClosed) controller.addError(error, stackTrace);
+      }
+    }
+
+    Future<void> refreshVisibleThreads() async {
+      final currentRequest = ++requestId;
+      try {
+        final threads = await fetchThreads();
+        if (!controller.isClosed && currentRequest == requestId) {
+          controller.add(threads);
+        }
+      } catch (error, stackTrace) {
+        if (!controller.isClosed) controller.addError(error, stackTrace);
+      }
+    }
+
+    controller.onListen = () {
+      conversationsSubscription = supabase
+          .from('conversations')
+          .stream(primaryKey: ['id'])
+          .order('last_message_at')
+          .listen(emitRows, onError: controller.addError);
+      membershipSubscription = supabase
+          .from('conversation_members')
+          .stream(primaryKey: ['conversation_id', 'user_id'])
+          .eq('user_id', user.id)
+          .listen((_) => refreshVisibleThreads(), onError: controller.addError);
+    };
+    controller.onCancel = () async {
+      await conversationsSubscription?.cancel();
+      await membershipSubscription?.cancel();
+    };
+    return controller.stream;
   }
 
   Future<List<ChatThread>> fetchThreads() async {
@@ -262,11 +299,7 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
     }
 
     final rows = await supabase.from('conversations').select();
-    return _threadsFromConversationRows(
-      List<Map<String, dynamic>>.from(
-        rows,
-      ).where((row) => _belongsToUser(row, user.id)).toList(),
-    );
+    return _threadsFromConversationRows(List<Map<String, dynamic>>.from(rows));
   }
 
   Stream<Map<String, UserPresence>> watchPresenceForThreads() {
@@ -549,6 +582,139 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
 
       return _threadFromConversation(raced, peer);
     }
+  }
+
+  Future<ChatThread> createGroupConversation({
+    required String name,
+    required List<ChatUser> members,
+  }) async {
+    final normalizedName = name.trim();
+    if (normalizedName.isEmpty || normalizedName.length > 80) {
+      throw ArgumentError('Group names must be between 1 and 80 characters.');
+    }
+    final distinctMembers = {for (final member in members) member.id: member};
+    if (distinctMembers.length < 2 || distinctMembers.length > 49) {
+      throw ArgumentError('Choose between 2 and 49 other members.');
+    }
+
+    final supabase = client;
+    if (supabase == null) {
+      return _threadFromGroup(
+        row: {'id': 'group-${_uuid.v4()}', 'title': normalizedName},
+        memberCount: distinctMembers.length + 1,
+        isAdmin: true,
+      );
+    }
+    if (supabase.auth.currentUser == null) {
+      throw const AuthException('Sign in before creating a group.');
+    }
+
+    await upsertCurrentProfile();
+    final result = await supabase.rpc(
+      'create_group_conversation',
+      params: {
+        'group_name': normalizedName,
+        'member_ids': distinctMembers.keys.toList(),
+      },
+    );
+    final resultRow = switch (result) {
+      Map<dynamic, dynamic> row => Map<String, dynamic>.from(row),
+      List<dynamic> rows when rows.isNotEmpty && rows.first is Map =>
+        Map<String, dynamic>.from(rows.first as Map),
+      _ => throw StateError('Group creation returned no conversation.'),
+    };
+    return _threadFromGroup(
+      row: resultRow,
+      memberCount: distinctMembers.length + 1,
+      isAdmin: true,
+    );
+  }
+
+  Future<List<ChatGroupMember>> groupMembers(String conversationId) async {
+    final supabase = client;
+    if (supabase == null) {
+      return [
+        ChatGroupMember(
+          user: ChatUser(id: localUserId, displayName: localSenderName),
+          isAdmin: true,
+          isCurrentUser: true,
+          joinedAt: DateTime.now(),
+        ),
+        ...ChatSeed.users
+            .take(3)
+            .map(
+              (user) => ChatGroupMember(
+                user: user,
+                isAdmin: false,
+                isCurrentUser: false,
+                joinedAt: DateTime.now(),
+              ),
+            ),
+      ];
+    }
+
+    final rows = List<Map<String, dynamic>>.from(
+      await supabase
+          .from('conversation_members')
+          .select('conversation_id, user_id, role, joined_at')
+          .eq('conversation_id', conversationId)
+          .order('joined_at'),
+    );
+    final profiles = await _profilesById(
+      rows.map((row) => row['user_id']?.toString() ?? '').toSet(),
+    );
+    return rows.map((row) {
+      final userId = row['user_id']?.toString() ?? '';
+      return ChatGroupMember(
+        user:
+            profiles[userId] ??
+            ChatUser(id: userId, displayName: 'Unknown user'),
+        isAdmin: row['role'] == 'admin',
+        isCurrentUser: userId == localUserId,
+        joinedAt: _readTimestamp(row['joined_at']) ?? DateTime.now(),
+      );
+    }).toList();
+  }
+
+  Future<void> renameGroup(String conversationId, String name) async {
+    final normalizedName = name.trim();
+    if (normalizedName.isEmpty || normalizedName.length > 80) {
+      throw ArgumentError('Group names must be between 1 and 80 characters.');
+    }
+    await client?.rpc(
+      'rename_group_conversation',
+      params: {
+        'target_conversation_id': conversationId,
+        'new_name': normalizedName,
+      },
+    );
+  }
+
+  Future<void> addGroupMember(String conversationId, ChatUser user) async {
+    await client?.rpc(
+      'add_group_member',
+      params: {
+        'target_conversation_id': conversationId,
+        'new_member_id': user.id,
+      },
+    );
+  }
+
+  Future<void> removeGroupMember(String conversationId, String userId) async {
+    await client?.rpc(
+      'remove_group_member',
+      params: {
+        'target_conversation_id': conversationId,
+        'removed_member_id': userId,
+      },
+    );
+  }
+
+  Future<void> leaveGroup(String conversationId) async {
+    await client?.rpc(
+      'leave_group_conversation',
+      params: {'target_conversation_id': conversationId},
+    );
   }
 
   Future<PickedChatMedia?> pickMediaAttachment(ChatMediaSource source) async {
@@ -976,7 +1142,7 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
 
     final controller = StreamController<List<ChatMessage>>();
     final messagesById = <String, Map<String, dynamic>>{};
-    var receiptsByMessageId = <String, MessageReceipt>{};
+    var receiptsByMessageId = <String, List<MessageReceipt>>{};
     var reactionRows = <Map<String, dynamic>>[];
     StreamSubscription<List<Map<String, dynamic>>>? messagesSubscription;
     StreamSubscription<List<Map<String, dynamic>>>? receiptsSubscription;
@@ -992,7 +1158,9 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
           row['id']?.toString() ?? '': ChatMessage.fromSupabase(
             row,
             localUserId: user.id,
-            receipt: receiptsByMessageId[row['id']?.toString()],
+            receipt: _aggregateReceipts(
+              receiptsByMessageId[row['id']?.toString()],
+            ),
           ),
       };
       final reactionsByMessageId = <String, List<Map<String, dynamic>>>{};
@@ -1009,7 +1177,7 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
         return ChatMessage.fromSupabase(
           row,
           localUserId: user.id,
-          receipt: receiptsByMessageId[messageId],
+          receipt: _aggregateReceipts(receiptsByMessageId[messageId]),
           replyTo: replyMessage == null
               ? null
               : MessageReplyPreview.fromMessage(replyMessage),
@@ -1042,12 +1210,14 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
         .stream(primaryKey: ['message_id', 'user_id'])
         .eq('conversation_id', conversationId)
         .listen((rows) {
-          receiptsByMessageId = {
-            for (final row in rows)
-              if (row['user_id']?.toString() != user.id)
-                MessageReceipt.fromSupabase(row).messageId:
-                    MessageReceipt.fromSupabase(row),
-          };
+          receiptsByMessageId = {};
+          for (final row in rows) {
+            if (row['user_id']?.toString() == user.id) continue;
+            final receipt = MessageReceipt.fromSupabase(row);
+            receiptsByMessageId
+                .putIfAbsent(receipt.messageId, () => [])
+                .add(receipt);
+          }
           emitMessages();
         }, onError: controller.addError);
 
@@ -1463,10 +1633,45 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
       return bTime.compareTo(aTime);
     });
 
-    final peerIds = rows.map(_peerUserIdFor).whereType<String>().toSet();
+    final peerIds = rows
+        .where((row) => row['conversation_type'] != 'group')
+        .map(_peerUserIdFor)
+        .whereType<String>()
+        .toSet();
     final profiles = await _profilesById(peerIds);
+    final groupIds = rows
+        .where((row) => row['conversation_type'] == 'group')
+        .map((row) => row['id']?.toString() ?? '')
+        .where((id) => id.isNotEmpty)
+        .toList();
+    final groupMemberships = groupIds.isEmpty
+        ? const <Map<String, dynamic>>[]
+        : List<Map<String, dynamic>>.from(
+            await client!
+                .from('conversation_members')
+                .select('conversation_id, user_id, role')
+                .inFilter('conversation_id', groupIds),
+          );
 
     return rows.map((row) {
+      if (row['conversation_type'] == 'group') {
+        final conversationId = row['id']?.toString() ?? '';
+        final memberships = groupMemberships
+            .where(
+              (membership) =>
+                  membership['conversation_id']?.toString() == conversationId,
+            )
+            .toList();
+        return _threadFromGroup(
+          row: row,
+          memberCount: memberships.length,
+          isAdmin: memberships.any(
+            (membership) =>
+                membership['user_id']?.toString() == localUserId &&
+                membership['role'] == 'admin',
+          ),
+        );
+      }
       final peerId = _peerUserIdFor(row) ?? '';
       final peer =
           profiles[peerId] ?? ChatUser(id: peerId, displayName: 'Unknown user');
@@ -1491,11 +1696,6 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
     };
   }
 
-  bool _belongsToUser(Map<String, dynamic> row, String userId) {
-    return row['user_one_id']?.toString() == userId ||
-        row['user_two_id']?.toString() == userId;
-  }
-
   String? _peerUserIdFor(Map<String, dynamic> row) {
     final userId = localUserId;
     final userOneId = row['user_one_id']?.toString();
@@ -1518,6 +1718,34 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
       peer: peer,
       hasMessages: lastMessageAt != null,
       lastMessageAt: lastMessageAt,
+    );
+  }
+
+  ChatThread _threadFromGroup({
+    required Map<String, dynamic> row,
+    required int memberCount,
+    required bool isAdmin,
+  }) {
+    final lastMessageAt = _readTimestamp(row['last_message_at']);
+    final title = row['title']?.toString().trim();
+    final displayTitle = title == null || title.isEmpty ? 'Group' : title;
+    return ChatThread(
+      id: row['id']?.toString() ?? '',
+      title: displayTitle,
+      subtitle: lastMessageAt == null
+          ? 'No messages yet'
+          : 'Latest messages are synced.',
+      avatarLabel: _avatarLabelFor(displayTitle),
+      accentColor: _accentColorFor(row['id']?.toString() ?? displayTitle),
+      lastActive: lastMessageAt == null
+          ? 'New'
+          : relativeTimeLabel(lastMessageAt),
+      unreadCount: 0,
+      isOnline: false,
+      activityLabel: '$memberCount ${memberCount == 1 ? 'member' : 'members'}',
+      conversationType: ChatConversationType.group,
+      memberCount: memberCount,
+      isAdmin: isAdmin,
     );
   }
 
@@ -1552,6 +1780,33 @@ bool _matchesUser(ChatUser user, String query) {
   return user.id.toLowerCase().contains(query) ||
       user.displayName.toLowerCase().contains(query) ||
       (user.email?.toLowerCase().contains(query) ?? false);
+}
+
+MessageReceipt? _aggregateReceipts(List<MessageReceipt>? receipts) {
+  if (receipts == null || receipts.isEmpty) return null;
+  final allDelivered = receipts.every((receipt) => receipt.isDelivered);
+  final allRead = receipts.every((receipt) => receipt.isRead);
+  return MessageReceipt(
+    messageId: receipts.first.messageId,
+    userId: 'all-recipients',
+    deliveredAt: allDelivered ? DateTime.now() : null,
+    readAt: allRead ? DateTime.now() : null,
+  );
+}
+
+String _avatarLabelFor(String name) {
+  final parts = name
+      .trim()
+      .split(RegExp(r'\s+'))
+      .where((part) => part.isNotEmpty)
+      .toList();
+  if (parts.length >= 2) {
+    return '${parts.first[0]}${parts.last[0]}'.toUpperCase();
+  }
+  if (parts.isNotEmpty) {
+    return parts.first.characters.take(2).toString().toUpperCase();
+  }
+  return 'G';
 }
 
 DateTime? _readTimestamp(Object? value) {

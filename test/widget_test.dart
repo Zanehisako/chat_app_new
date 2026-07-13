@@ -494,7 +494,7 @@ void main() {
       find.text('The new chat layout is in a good place.'),
       findsOneWidget,
     );
-    expect(find.text('Typing...'), findsOneWidget);
+    expect(find.text('Samira is typing...'), findsWidgets);
     expect(find.byKey(const Key('message-status-read')), findsOneWidget);
     expect(find.byKey(const Key('message-status-delivered')), findsOneWidget);
 
@@ -518,7 +518,7 @@ void main() {
 
     await tester.tap(find.text('Design Studio'));
     await tester.pumpAndSettle();
-    expect(find.text('Typing...'), findsOneWidget);
+    expect(find.text('Samira is typing...'), findsWidgets);
 
     await tester.tap(find.byTooltip('Back to chats'));
     await tester.pumpAndSettle();
@@ -566,12 +566,56 @@ void main() {
   ) async {
     await tester.pumpWidget(const ChatApp());
 
-    await tester.tap(find.text('Design Studio'));
+    await tester.tap(find.text('Product Team'));
     await tester.pumpAndSettle();
     await tester.tap(find.byTooltip('Call'));
     await tester.pump();
 
     expect(find.text('Calls require a signed-in direct chat.'), findsOneWidget);
+  });
+
+  testWidgets('creates a local group and hides direct call controls', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(1000, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    await tester.pumpWidget(const ChatApp());
+    await tester.tap(find.byTooltip('New group'));
+    await tester.pumpAndSettle();
+
+    await tester.enterText(
+      find.byKey(const Key('new-group-name')),
+      'Launch Team',
+    );
+    await tester.enterText(find.byKey(const Key('new-group-search')), 'sam');
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Samira Haddad'));
+    await tester.pump();
+
+    await tester.enterText(find.byKey(const Key('new-group-search')), 'alex');
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Alex Morgan'));
+    await tester.pump();
+
+    await tester.tap(find.byKey(const Key('create-group')));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Launch Team'), findsWidgets);
+    expect(find.byTooltip('Group info'), findsOneWidget);
+    expect(find.byTooltip('Call'), findsNothing);
+    expect(find.byTooltip('Video'), findsNothing);
+    expect(find.text('3 members'), findsOneWidget);
+
+    await tester.tap(find.byTooltip('Group info'));
+    await tester.pumpAndSettle();
+    expect(find.text('Add'), findsOneWidget);
+    expect(find.text('Leave group'), findsOneWidget);
+    expect(find.text('Admin'), findsOneWidget);
   });
 
   testWidgets('selects a GIPHY GIF, stages upload, and sends caption', (

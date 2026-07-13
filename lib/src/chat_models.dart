@@ -65,6 +65,8 @@ class MessageReceipt {
   }
 }
 
+enum ChatConversationType { direct, group }
+
 class ChatThread {
   const ChatThread({
     required this.id,
@@ -78,6 +80,9 @@ class ChatThread {
     required this.activityLabel,
     this.peerUserId,
     this.peerLastSeenAt,
+    this.conversationType = ChatConversationType.direct,
+    this.memberCount = 2,
+    this.isAdmin = false,
     this.isTyping = false,
     this.typingUserName,
   });
@@ -93,8 +98,13 @@ class ChatThread {
   final String activityLabel;
   final String? peerUserId;
   final DateTime? peerLastSeenAt;
+  final ChatConversationType conversationType;
+  final int memberCount;
+  final bool isAdmin;
   final bool isTyping;
   final String? typingUserName;
+
+  bool get isGroup => conversationType == ChatConversationType.group;
 
   String get displaySubtitle {
     if (!isTyping) {
@@ -114,6 +124,8 @@ class ChatThread {
     bool? isOnline,
     String? activityLabel,
     DateTime? peerLastSeenAt,
+    int? memberCount,
+    bool? isAdmin,
     bool? isTyping,
     String? typingUserName,
   }) {
@@ -131,12 +143,29 @@ class ChatThread {
       activityLabel: activityLabel ?? this.activityLabel,
       peerUserId: peerUserId,
       peerLastSeenAt: peerLastSeenAt ?? this.peerLastSeenAt,
+      conversationType: conversationType,
+      memberCount: memberCount ?? this.memberCount,
+      isAdmin: isAdmin ?? this.isAdmin,
       isTyping: nextIsTyping,
       typingUserName: nextIsTyping
           ? typingUserName ?? this.typingUserName
           : null,
     );
   }
+}
+
+class ChatGroupMember {
+  const ChatGroupMember({
+    required this.user,
+    required this.isAdmin,
+    required this.isCurrentUser,
+    required this.joinedAt,
+  });
+
+  final ChatUser user;
+  final bool isAdmin;
+  final bool isCurrentUser;
+  final DateTime joinedAt;
 }
 
 class ChatUser {
@@ -729,8 +758,10 @@ class ChatSeed {
       lastActive: 'Now',
       unreadCount: 3,
       isOnline: true,
-      activityLabel: 'Typing...',
-      peerUserId: 'samira',
+      activityLabel: '4 members',
+      conversationType: ChatConversationType.group,
+      memberCount: 4,
+      isAdmin: true,
       isTyping: true,
       typingUserName: 'Samira',
     ),
