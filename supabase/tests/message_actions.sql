@@ -11,7 +11,6 @@ declare
   source_message_id uuid := '33000000-0000-0000-0000-000000000001';
   reply_message_id uuid := '33000000-0000-0000-0000-000000000002';
   other_message_id uuid := '33000000-0000-0000-0000-000000000003';
-  reaction_added boolean;
 begin
   insert into auth.users (
     id, instance_id, aud, role, email, encrypted_password,
@@ -29,6 +28,10 @@ begin
     (conversation_id, sender_id, recipient_id),
     (other_conversation_id, sender_id, outsider_id);
 
+  -- These rows represent history from before the irreversible E2EE cutover.
+  update public.e2ee_rollout_config
+  set plaintext_cutover_at = null
+  where id = true;
   insert into public.messages (
     id, conversation_id, sender_id, sender_name, body
   ) values
@@ -54,6 +57,9 @@ begin
     when others then
       if sqlerrm = 'Cross-conversation reply was accepted' then raise; end if;
   end;
+  update public.e2ee_rollout_config
+  set plaintext_cutover_at = now()
+  where id = true;
 
   perform set_config('request.jwt.claim.sub', outsider_id::text, true);
   begin
@@ -65,24 +71,13 @@ begin
   end;
 
   perform set_config('request.jwt.claim.sub', recipient_id::text, true);
-  select public.toggle_message_reaction(source_message_id, '👍')
-  into reaction_added;
-  if not reaction_added then raise exception 'Reaction was not added'; end if;
-  if (
-    select count(*) from public.message_reactions
-    where message_id = source_message_id and user_id = recipient_id
-  ) <> 1 then
-    raise exception 'Reaction uniqueness was not preserved';
-  end if;
-  select public.toggle_message_reaction(source_message_id, '👍')
-  into reaction_added;
-  if reaction_added or exists (
-    select 1 from public.message_reactions
-    where message_id = source_message_id and user_id = recipient_id
-  ) then
-    raise exception 'Reaction toggle did not remove the existing reaction';
-  end if;
-  perform public.toggle_message_reaction(source_message_id, '👍');
+  begin
+    perform public.toggle_message_reaction(source_message_id, '👍');
+    raise exception 'Legacy reaction was accepted after E2EE cutover';
+  exception
+    when others then
+      if sqlerrm = 'Legacy reaction was accepted after E2EE cutover' then raise; end if;
+  end;
 
   begin
     perform public.edit_message(source_message_id, 'Unauthorized edit');
@@ -101,26 +96,28 @@ begin
   end;
 
   perform set_config('request.jwt.claim.sub', sender_id::text, true);
-  perform public.edit_message(source_message_id, 'Edited body');
+  begin
+    perform public.edit_message(source_message_id, 'Edited body');
+    raise exception 'Legacy edit was accepted after E2EE cutover';
+  exception
+    when others then
+      if sqlerrm = 'Legacy edit was accepted after E2EE cutover' then raise; end if;
+  end;
+  begin
+    perform * from public.delete_message(source_message_id);
+    raise exception 'Legacy delete was accepted after E2EE cutover';
+  exception
+    when others then
+      if sqlerrm = 'Legacy delete was accepted after E2EE cutover' then raise; end if;
+  end;
   if not exists (
-    select 1 from public.messages
-    where id = source_message_id and body = 'Edited body' and edited_at is not null
+    select 1
+    from public.messages
+    where id = source_message_id
+      and body = 'Original'
+      and deleted_at is null
   ) then
-    raise exception 'Authorized edit was not persisted';
-  end if;
-
-  perform * from public.delete_message(source_message_id);
-  if not exists (
-    select 1 from public.messages
-    where id = source_message_id and deleted_at is not null and body = ''
-      and media_path is null
-  ) then
-    raise exception 'Delete did not preserve a clean tombstone';
-  end if;
-  if exists (
-    select 1 from public.message_reactions where message_id = source_message_id
-  ) then
-    raise exception 'Delete did not clear reactions';
+    raise exception 'A historical message changed after a rejected legacy action';
   end if;
 end;
 $$;

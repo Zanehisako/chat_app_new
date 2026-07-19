@@ -7,6 +7,7 @@ import 'package:cached_network_image/cached_network_image.dart';
 import 'package:emoji_picker_flutter/emoji_picker_flutter.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/physics.dart';
 import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:realtime_calls/realtime_calls.dart';
@@ -18,10 +19,14 @@ import 'group_call_signaling.dart';
 import 'chat_models.dart';
 import 'connectivity_service.dart';
 import 'chat_repository.dart';
+import 'e2ee_draft_protector.dart';
 import 'notification_service.dart';
 import 'offline_outbox_service.dart';
 import 'outbox_database.dart';
 import 'profile_page.dart';
+import 'motion/chat_motion.dart';
+import 'motion/chat_motion_routes.dart';
+import 'motion/chat_motion_widgets.dart';
 import 'voice_recording_file.dart';
 
 class ChatHomePage extends StatefulWidget {
@@ -98,18 +103,113 @@ class _StagedMediaAttachment {
   }
 }
 
+class _MessageInsertionEvent {
+  const _MessageInsertionEvent({
+    required this.messageId,
+    required this.threadId,
+    required this.isMine,
+  });
+
+  final String messageId;
+  final String threadId;
+  final bool isMine;
+}
+
+const _callOverlayUnchanged = Object();
+
+class _CallOverlayState {
+  const _CallOverlayState({
+    this.incomingCallInvite,
+    this.callSnapshot,
+    this.incomingGroupCallInvite,
+    this.groupCallSnapshot,
+  });
+
+  final CallInvite? incomingCallInvite;
+  final CallSnapshot? callSnapshot;
+  final GroupCallInvite? incomingGroupCallInvite;
+  final GroupCallSnapshot? groupCallSnapshot;
+
+  bool get hasActiveOverlay =>
+      incomingCallInvite != null ||
+      callSnapshot != null ||
+      incomingGroupCallInvite != null ||
+      groupCallSnapshot != null;
+
+  _CallOverlayState copyWith({
+    Object? incomingCallInvite = _callOverlayUnchanged,
+    Object? callSnapshot = _callOverlayUnchanged,
+    Object? incomingGroupCallInvite = _callOverlayUnchanged,
+    Object? groupCallSnapshot = _callOverlayUnchanged,
+  }) {
+    return _CallOverlayState(
+      incomingCallInvite: identical(incomingCallInvite, _callOverlayUnchanged)
+          ? this.incomingCallInvite
+          : incomingCallInvite as CallInvite?,
+      callSnapshot: identical(callSnapshot, _callOverlayUnchanged)
+          ? this.callSnapshot
+          : callSnapshot as CallSnapshot?,
+      incomingGroupCallInvite:
+          identical(incomingGroupCallInvite, _callOverlayUnchanged)
+          ? this.incomingGroupCallInvite
+          : incomingGroupCallInvite as GroupCallInvite?,
+      groupCallSnapshot: identical(groupCallSnapshot, _callOverlayUnchanged)
+          ? this.groupCallSnapshot
+          : groupCallSnapshot as GroupCallSnapshot?,
+    );
+  }
+}
+
+class _VoiceRecordingVisualController extends ChangeNotifier {
+  final ValueNotifier<Duration> elapsed = ValueNotifier(Duration.zero);
+  List<double> _levels = const [];
+
+  List<double> get levels => _levels;
+
+  void reset() {
+    _levels = List<double>.filled(24, 0.08);
+    elapsed.value = Duration.zero;
+    notifyListeners();
+  }
+
+  void addLevel(double level) {
+    final next = [..._levels, level];
+    if (next.length > 48) {
+      next.removeRange(0, next.length - 48);
+    }
+    _levels = List<double>.unmodifiable(next);
+    notifyListeners();
+  }
+
+  void updateElapsed(Duration value) {
+    elapsed.value = value;
+  }
+
+  void clear() {
+    _levels = const [];
+    elapsed.value = Duration.zero;
+    notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    elapsed.dispose();
+    super.dispose();
+  }
+}
+
 class _ChatHomePageState extends State<ChatHomePage>
     with WidgetsBindingObserver {
-  late Stream<List<ChatThread>> _threadsStream;
+  StreamSubscription<List<ChatThread>>? _threadsSubscription;
+  List<ChatThread> _remoteThreads = const [];
   ChatThread? _selectedThread;
   final _messageController = TextEditingController();
-  final _searchController = TextEditingController();
+  final _messageInsertionEvents = ValueNotifier<_MessageInsertionEvent?>(null);
   final AudioRecorder _voiceRecorder = AudioRecorder();
   final List<ChatThread> _startedThreads = [];
   final List<ChatMessage> _localMessages = [];
-  List<ChatThread> _availableThreads = const [];
   final List<int> _voiceBytes = [];
-  final List<double> _voiceLevels = [];
+  final _voiceVisualController = _VoiceRecordingVisualController();
   final Map<String, ChatUser> _profileOverridesByUser = {};
   final Map<String, UserPresence> _presenceByUser = {};
   final Map<String, TypingState> _typingByConversation = {};
@@ -124,6 +224,13 @@ class _ChatHomePageState extends State<ChatHomePage>
   Future<OfflineOutboxService?>? _outboxSetup;
   Future<void>? _outboxTransition;
   int _outboxGeneration = 0;
+  Future<bool>? _e2eeSetup;
+  String? _e2eeSetupOwnerId;
+  String? _e2eeReadyOwnerId;
+  int _e2eeGeneration = 0;
+  bool _e2eeDialogShowing = false;
+  Route<dynamic>? _e2eeDialogRoute;
+  NavigatorState? _e2eeDialogNavigator;
   StreamSubscription<List<OutboxMessage>>? _outboxSubscription;
   StreamSubscription<ChatMessage>? _incomingMessageSubscription;
   StreamSubscription<NotificationRoute>? _notificationRouteSubscription;
@@ -136,12 +243,9 @@ class _ChatHomePageState extends State<ChatHomePage>
   StreamSubscription<Amplitude>? _voiceAmplitudeSubscription;
   Completer<void>? _voiceStreamDone;
   CallClient? _callClient;
-  CallInvite? _incomingCallInvite;
-  CallSnapshot? _callSnapshot;
+  final _callOverlay = ValueNotifier(const _CallOverlayState());
   GroupCallClient? _groupCallClient;
   SupabaseGroupCallGateway? _groupCallGateway;
-  GroupCallInvite? _incomingGroupCallInvite;
-  GroupCallSnapshot? _groupCallSnapshot;
   final Map<String, GroupCallSessionSummary> _activeGroupCalls = {};
   Timer? _groupCallRefreshTimer;
   Timer? _typingStopTimer;
@@ -157,15 +261,34 @@ class _ChatHomePageState extends State<ChatHomePage>
   ChatMessage? _replyingTo;
   ChatMessage? _editingMessage;
   String? _pendingNotificationConversationId;
-  String _query = '';
-  _ThreadStatusFilter _statusFilter = _ThreadStatusFilter.all;
   bool _isSending = false;
   bool _isRecordingVoice = false;
   bool _isVoiceRecordingFileBacked = false;
   bool _isCompactConversationOpen = false;
   bool _isTearingDown = false;
   static const _maxKnownIncomingMessageIds = 256;
-  Duration _voiceRecordingElapsed = Duration.zero;
+
+  CallInvite? get _incomingCallInvite => _callOverlay.value.incomingCallInvite;
+  CallSnapshot? get _callSnapshot => _callOverlay.value.callSnapshot;
+  GroupCallInvite? get _incomingGroupCallInvite =>
+      _callOverlay.value.incomingGroupCallInvite;
+  GroupCallSnapshot? get _groupCallSnapshot =>
+      _callOverlay.value.groupCallSnapshot;
+
+  void _updateCallOverlay({
+    Object? incomingCallInvite = _callOverlayUnchanged,
+    Object? callSnapshot = _callOverlayUnchanged,
+    Object? incomingGroupCallInvite = _callOverlayUnchanged,
+    Object? groupCallSnapshot = _callOverlayUnchanged,
+  }) {
+    if (_isTearingDown) return;
+    _callOverlay.value = _callOverlay.value.copyWith(
+      incomingCallInvite: incomingCallInvite,
+      callSnapshot: callSnapshot,
+      incomingGroupCallInvite: incomingGroupCallInvite,
+      groupCallSnapshot: groupCallSnapshot,
+    );
+  }
 
   @override
   void initState() {
@@ -173,11 +296,17 @@ class _ChatHomePageState extends State<ChatHomePage>
     _outboxDatabase = widget.outboxDatabase;
     _ownsOutboxDatabase = widget.outboxDatabase == null;
     WidgetsBinding.instance.addObserver(this);
-    _threadsStream = widget.repository.watchThreads();
+    _bindThreadsStream(
+      widget.repository.watchThreads(),
+      initialData: widget.repository.isConnected
+          ? const []
+          : widget.repository.threads,
+      notify: false,
+    );
     unawaited(_acknowledgePendingMessagesDelivered());
     _subscribePresence();
     _configureCalls();
-    unawaited(_ensureOfflineOutbox());
+    unawaited(_initializeE2eeAndOutbox());
     _configureNotifications();
   }
 
@@ -185,6 +314,7 @@ class _ChatHomePageState extends State<ChatHomePage>
   void didUpdateWidget(covariant ChatHomePage oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.repository != widget.repository) {
+      _invalidateE2eeOnboarding(dismissDialog: true);
       unawaited(_cancelVoiceRecording());
       unawaited(_removeStagedAttachment());
       unawaited(oldWidget.repository.disposeRealtime());
@@ -193,7 +323,13 @@ class _ChatHomePageState extends State<ChatHomePage>
       _cancelTypingSubscriptions();
       _presenceByUser.clear();
       _typingByConversation.clear();
-      _threadsStream = widget.repository.watchThreads();
+      _bindThreadsStream(
+        widget.repository.watchThreads(),
+        initialData: widget.repository.isConnected
+            ? const []
+            : widget.repository.threads,
+        notify: false,
+      );
       _outboxMessages = [];
       _selectedThread = null;
       _startedThreads.clear();
@@ -214,17 +350,21 @@ class _ChatHomePageState extends State<ChatHomePage>
   @override
   void dispose() {
     _isTearingDown = true;
+    _invalidateE2eeOnboarding(dismissDialog: true);
     WidgetsBinding.instance.removeObserver(this);
     _activeUploadToken = null;
     final stagedMedia = _stagedAttachment?.uploadedMedia?.media;
     if (stagedMedia != null) {
       unawaited(widget.repository.deleteStagedMedia(stagedMedia));
     }
-    unawaited(_disposeVoiceRecorder());
+    unawaited(
+      _disposeVoiceRecorder().whenComplete(_voiceVisualController.dispose),
+    );
     _typingStopTimer?.cancel();
     _voiceRecordingTimer?.cancel();
     _clearEndedCallTimer?.cancel();
     _presenceSubscription?.cancel();
+    _threadsSubscription?.cancel();
     _outboxGeneration += 1;
     final outboxDatabase = _outboxDatabase;
     _outboxDatabase = null;
@@ -233,11 +373,11 @@ class _ChatHomePageState extends State<ChatHomePage>
       unawaited(outboxShutdown.whenComplete(outboxDatabase.close));
     }
     _disposeNotifications();
-    unawaited(_disposeCallClient());
+    unawaited(_disposeCallClient().whenComplete(_callOverlay.dispose));
     _cancelTypingSubscriptions();
     unawaited(widget.repository.disposeRealtime());
     _messageController.dispose();
-    _searchController.dispose();
+    _messageInsertionEvents.dispose();
     super.dispose();
   }
 
@@ -256,6 +396,45 @@ class _ChatHomePageState extends State<ChatHomePage>
         state == AppLifecycleState.paused ||
         state == AppLifecycleState.detached) {
       unawaited(widget.repository.updateLastSeen());
+    }
+  }
+
+  void _bindThreadsStream(
+    Stream<List<ChatThread>> stream, {
+    required List<ChatThread> initialData,
+    bool notify = true,
+  }) {
+    unawaited(_threadsSubscription?.cancel());
+    _remoteThreads = initialData;
+    _threadsSubscription = stream.listen(
+      _handleThreadsChanged,
+      onError: (Object error, StackTrace stackTrace) {
+        debugPrint('[Thread stream] $error\n$stackTrace');
+      },
+    );
+
+    if (notify && mounted) {
+      setState(() {});
+    }
+    scheduleMicrotask(_handleThreadProjectionChanged);
+  }
+
+  void _handleThreadsChanged(List<ChatThread> threads) {
+    if (!mounted || _isTearingDown) return;
+    setState(() {
+      _remoteThreads = threads;
+    });
+    _handleThreadProjectionChanged();
+  }
+
+  void _handleThreadProjectionChanged() {
+    if (!mounted || _isTearingDown) return;
+    final threads = _availableThreads;
+    _scheduleNotificationRouteResolution(threads);
+    _syncTypingSubscriptions(threads);
+    final isWide = (MediaQuery.maybeOf(context)?.size.width ?? 0) >= 840;
+    if (isWide || _isCompactConversationOpen) {
+      _scheduleConversationEntryRefresh(_selectedThreadFor(threads));
     }
   }
 
@@ -308,7 +487,7 @@ class _ChatHomePageState extends State<ChatHomePage>
             _incomingCallInvite != null) {
           return;
         }
-        setState(() => _incomingGroupCallInvite = invite);
+        _updateCallOverlay(incomingGroupCallInvite: invite);
       },
       onError: (Object error, StackTrace stackTrace) {
         debugPrint('[Group call invite watch] $error\n$stackTrace');
@@ -316,10 +495,12 @@ class _ChatHomePageState extends State<ChatHomePage>
     );
     _groupCallSnapshotSubscription = groupClient.snapshots.listen((snapshot) {
       if (!mounted) return;
-      setState(() {
-        _groupCallSnapshot = snapshot;
-        if (snapshot != null) _incomingGroupCallInvite = null;
-      });
+      _updateCallOverlay(
+        groupCallSnapshot: snapshot,
+        incomingGroupCallInvite: snapshot == null
+            ? _callOverlayUnchanged
+            : null,
+      );
     });
     _groupCallRefreshTimer = Timer.periodic(
       const Duration(seconds: 5),
@@ -336,9 +517,7 @@ class _ChatHomePageState extends State<ChatHomePage>
         debugPrint(
           '[Incoming call invite] call=${invite.id} from=${invite.callerName}',
         );
-        setState(() {
-          _incomingCallInvite = invite;
-        });
+        _updateCallOverlay(incomingCallInvite: invite);
       },
       onError: (Object error, StackTrace stackTrace) {
         _logCallFailure('Incoming call watch failed', error, stackTrace);
@@ -354,12 +533,10 @@ class _ChatHomePageState extends State<ChatHomePage>
       if (!mounted) {
         return;
       }
-      setState(() {
-        _callSnapshot = snapshot;
-        if (snapshot != null) {
-          _incomingCallInvite = null;
-        }
-      });
+      _updateCallOverlay(
+        callSnapshot: snapshot,
+        incomingCallInvite: snapshot == null ? _callOverlayUnchanged : null,
+      );
 
       if (snapshot?.isTerminal ?? false) {
         _clearEndedCallTimer?.cancel();
@@ -367,9 +544,7 @@ class _ChatHomePageState extends State<ChatHomePage>
           if (!mounted || _callSnapshot?.callId != snapshot?.callId) {
             return;
           }
-          setState(() {
-            _callSnapshot = null;
-          });
+          _updateCallOverlay(callSnapshot: null);
         });
       }
     });
@@ -409,9 +584,27 @@ class _ChatHomePageState extends State<ChatHomePage>
     required String ownerId,
     required String backendOrigin,
   }) async {
+    final repository = widget.repository;
+    final generation = _e2eeGeneration;
+    final draftProtector = await _loadE2eeDraftProtector(
+      repository: repository,
+      ownerId: ownerId,
+      backendOrigin: backendOrigin,
+      generation: generation,
+    );
+    if (!_isCurrentE2eeSetup(
+      repository: repository,
+      ownerId: ownerId,
+      backendOrigin: backendOrigin,
+      generation: generation,
+    )) {
+      return null;
+    }
+
     final outbox = OfflineOutboxService(
       scope: OutboxScope(backendOrigin: backendOrigin, userId: ownerId),
       database: _outboxDatabase ??= OutboxDatabase(),
+      draftProtector: draftProtector,
     );
     final connectivity = ConnectivityService();
     _outboxService = outbox;
@@ -420,7 +613,7 @@ class _ChatHomePageState extends State<ChatHomePage>
       unawaited(_refreshOutboxMessages(outbox));
     });
 
-    await outbox.start(widget.repository);
+    await outbox.start(repository);
     if (!mounted || _isTearingDown || _outboxService != outbox) {
       await connectivity.dispose();
       await outbox.dispose();
@@ -429,6 +622,373 @@ class _ChatHomePageState extends State<ChatHomePage>
     await _refreshOutboxMessages(outbox);
     await connectivity.start(() => _flushOutbox(ignoreBackoff: true));
     return outbox;
+  }
+
+  Future<void> _initializeE2eeAndOutbox() async {
+    await _ensureOfflineOutbox();
+  }
+
+  Future<E2eeDraftProtector?> _loadE2eeDraftProtector({
+    required ChatRepository repository,
+    required String ownerId,
+    required String backendOrigin,
+    required int generation,
+  }) async {
+    // Local preview/test data deliberately stays outside the authenticated
+    // E2EE queue. A connected account must complete recovery onboarding before
+    // it is allowed to create a durable outbox.
+    if (!repository.isConnected) {
+      return null;
+    }
+
+    while (_isCurrentE2eeSetup(
+      repository: repository,
+      ownerId: ownerId,
+      backendOrigin: backendOrigin,
+      generation: generation,
+    )) {
+      final ready = await _ensureE2eeReadyForOutbox(
+        repository: repository,
+        ownerId: ownerId,
+        backendOrigin: backendOrigin,
+        generation: generation,
+      );
+      if (!ready) {
+        return null;
+      }
+
+      try {
+        return await repository.e2eeDraftProtector();
+      } catch (_) {
+        if (!await _showE2eeRetryDialog(
+          title: 'Encryption setup needs attention',
+          message:
+              'The secure message queue is not ready yet. Check your connection and try again.',
+          repository: repository,
+          ownerId: ownerId,
+          backendOrigin: backendOrigin,
+          generation: generation,
+        )) {
+          return null;
+        }
+      }
+    }
+    return null;
+  }
+
+  Future<bool> _ensureE2eeReadyForOutbox({
+    required ChatRepository repository,
+    required String ownerId,
+    required String backendOrigin,
+    required int generation,
+  }) async {
+    if (!repository.isConnected) {
+      return true;
+    }
+    if (_e2eeReadyOwnerId == ownerId) {
+      return true;
+    }
+
+    final activeSetup = _e2eeSetup;
+    if (activeSetup != null && _e2eeSetupOwnerId == ownerId) {
+      return activeSetup;
+    }
+
+    if (activeSetup != null) {
+      _invalidateE2eeOnboarding(dismissDialog: true);
+      generation = _e2eeGeneration;
+    }
+    if (!_isCurrentE2eeSetup(
+      repository: repository,
+      ownerId: ownerId,
+      backendOrigin: backendOrigin,
+      generation: generation,
+    )) {
+      return false;
+    }
+
+    final setup = _completeE2eeOnboarding(
+      repository: repository,
+      ownerId: ownerId,
+      backendOrigin: backendOrigin,
+      generation: generation,
+    );
+    _e2eeSetup = setup;
+    _e2eeSetupOwnerId = ownerId;
+    try {
+      return await setup;
+    } finally {
+      if (identical(_e2eeSetup, setup)) {
+        _e2eeSetup = null;
+        _e2eeSetupOwnerId = null;
+      }
+    }
+  }
+
+  Future<bool> _completeE2eeOnboarding({
+    required ChatRepository repository,
+    required String ownerId,
+    required String backendOrigin,
+    required int generation,
+  }) async {
+    while (_isCurrentE2eeSetup(
+      repository: repository,
+      ownerId: ownerId,
+      backendOrigin: backendOrigin,
+      generation: generation,
+    )) {
+      try {
+        final state = await repository.e2eeReadyState();
+        if (!_isCurrentE2eeSetup(
+          repository: repository,
+          ownerId: ownerId,
+          backendOrigin: backendOrigin,
+          generation: generation,
+        )) {
+          return false;
+        }
+
+        if (state.requiresRecoveryPhraseRestore) {
+          final restored = await _showRecoveryPhraseRestoreDialog(
+            repository: repository,
+            ownerId: ownerId,
+            backendOrigin: backendOrigin,
+            generation: generation,
+          );
+          if (!restored) {
+            return false;
+          }
+          continue;
+        }
+
+        if (state.requiresRecoveryPhraseConfirmation) {
+          final phrase = _normalizeRecoveryPhrase(
+            await repository.recoveryPhrase(),
+          );
+          if (!_isCurrentE2eeSetup(
+            repository: repository,
+            ownerId: ownerId,
+            backendOrigin: backendOrigin,
+            generation: generation,
+          )) {
+            return false;
+          }
+          if (phrase == null) {
+            await _showE2eeRetryDialog(
+              title: 'Recovery phrase unavailable',
+              message:
+                  'Your recovery phrase could not be loaded securely. Try again before sending messages.',
+              repository: repository,
+              ownerId: ownerId,
+              backendOrigin: backendOrigin,
+              generation: generation,
+            );
+            continue;
+          }
+
+          final confirmed = await _showRecoveryPhraseConfirmationDialog(
+            phrase: phrase,
+            repository: repository,
+            ownerId: ownerId,
+            backendOrigin: backendOrigin,
+            generation: generation,
+          );
+          if (!confirmed) {
+            return false;
+          }
+          continue;
+        }
+
+        if (!state.isReadyForSending) {
+          throw StateError('E2EE identity is incomplete.');
+        }
+        _e2eeReadyOwnerId = ownerId;
+        return true;
+      } catch (_) {
+        final retry = await _showE2eeRetryDialog(
+          title: 'Encryption setup needs attention',
+          message:
+              'Encrypted messaging could not be set up. Check your connection and try again.',
+          repository: repository,
+          ownerId: ownerId,
+          backendOrigin: backendOrigin,
+          generation: generation,
+        );
+        if (!retry) {
+          return false;
+        }
+      }
+    }
+    return false;
+  }
+
+  Future<bool> _showRecoveryPhraseConfirmationDialog({
+    required String phrase,
+    required ChatRepository repository,
+    required String ownerId,
+    required String backendOrigin,
+    required int generation,
+  }) async {
+    final result = await _showE2eeDialog<bool>(
+      repository: repository,
+      ownerId: ownerId,
+      backendOrigin: backendOrigin,
+      generation: generation,
+      builder: (context) => _E2eeRecoveryPhraseConfirmationDialog(
+        phrase: phrase,
+        onConfirm: (enteredPhrase) async {
+          if (!_isCurrentE2eeSetup(
+            repository: repository,
+            ownerId: ownerId,
+            backendOrigin: backendOrigin,
+            generation: generation,
+          )) {
+            throw StateError('The signed-in account changed.');
+          }
+          await repository.confirmRecoveryPhrase(enteredPhrase);
+        },
+      ),
+    );
+    return result == true;
+  }
+
+  Future<bool> _showRecoveryPhraseRestoreDialog({
+    required ChatRepository repository,
+    required String ownerId,
+    required String backendOrigin,
+    required int generation,
+  }) async {
+    final result = await _showE2eeDialog<bool>(
+      repository: repository,
+      ownerId: ownerId,
+      backendOrigin: backendOrigin,
+      generation: generation,
+      builder: (context) => _E2eeRecoveryPhraseRestoreDialog(
+        onRestore: (phrase) async {
+          if (!_isCurrentE2eeSetup(
+            repository: repository,
+            ownerId: ownerId,
+            backendOrigin: backendOrigin,
+            generation: generation,
+          )) {
+            throw StateError('The signed-in account changed.');
+          }
+          await repository.restoreE2eeRecoveryPhrase(phrase);
+        },
+      ),
+    );
+    return result == true;
+  }
+
+  Future<bool> _showE2eeRetryDialog({
+    required String title,
+    required String message,
+    required ChatRepository repository,
+    required String ownerId,
+    required String backendOrigin,
+    required int generation,
+  }) async {
+    final result = await _showE2eeDialog<bool>(
+      repository: repository,
+      ownerId: ownerId,
+      backendOrigin: backendOrigin,
+      generation: generation,
+      builder: (context) => _E2eeRetryDialog(title: title, message: message),
+    );
+    return result == true;
+  }
+
+  Future<T?> _showE2eeDialog<T>({
+    required ChatRepository repository,
+    required String ownerId,
+    required String backendOrigin,
+    required int generation,
+    required WidgetBuilder builder,
+  }) async {
+    if (!_isCurrentE2eeSetup(
+      repository: repository,
+      ownerId: ownerId,
+      backendOrigin: backendOrigin,
+      generation: generation,
+    )) {
+      return null;
+    }
+    await WidgetsBinding.instance.endOfFrame;
+    if (!_isCurrentE2eeSetup(
+      repository: repository,
+      ownerId: ownerId,
+      backendOrigin: backendOrigin,
+      generation: generation,
+    )) {
+      return null;
+    }
+    if (!mounted) {
+      return null;
+    }
+
+    final route = ChatDialogRoute<T>(
+      context: context,
+      builder: builder,
+      barrierDismissible: false,
+    );
+    _e2eeDialogShowing = true;
+    _e2eeDialogRoute = route;
+    final navigator = Navigator.of(context, rootNavigator: true);
+    _e2eeDialogNavigator = navigator;
+    try {
+      return await navigator.push<T>(route);
+    } finally {
+      if (identical(_e2eeDialogRoute, route)) {
+        _e2eeDialogRoute = null;
+        _e2eeDialogNavigator = null;
+        _e2eeDialogShowing = false;
+      }
+    }
+  }
+
+  bool _isCurrentE2eeSetup({
+    required ChatRepository repository,
+    required String ownerId,
+    required String backendOrigin,
+    required int generation,
+  }) {
+    return mounted &&
+        !_isTearingDown &&
+        identical(widget.repository, repository) &&
+        _e2eeGeneration == generation &&
+        widget.repository.outboxUserId == ownerId &&
+        widget.repository.outboxBackendOrigin == backendOrigin;
+  }
+
+  void _invalidateE2eeOnboarding({required bool dismissDialog}) {
+    _e2eeGeneration += 1;
+    _e2eeSetup = null;
+    _e2eeSetupOwnerId = null;
+    _e2eeReadyOwnerId = null;
+    if (!dismissDialog || !_e2eeDialogShowing || !mounted) {
+      return;
+    }
+    final route = _e2eeDialogRoute;
+    final navigator = _e2eeDialogNavigator;
+    if (route != null && navigator != null) {
+      _e2eeDialogRoute = null;
+      _e2eeDialogNavigator = null;
+      _e2eeDialogShowing = false;
+      navigator.removeRoute(route);
+    }
+  }
+
+  String? _normalizeRecoveryPhrase(String? phrase) {
+    final words = phrase
+        ?.trim()
+        .toLowerCase()
+        .split(RegExp(r'\s+'))
+        .where((word) => word.isNotEmpty)
+        .toList(growable: false);
+    if (words == null || words.length != 24) {
+      return null;
+    }
+    return words.join(' ');
   }
 
   void _scheduleOutboxReconfiguration() {
@@ -605,6 +1165,7 @@ class _ChatHomePageState extends State<ChatHomePage>
         _selectedThread = thread;
         _isCompactConversationOpen = true;
       });
+      _handleThreadProjectionChanged();
     });
   }
 
@@ -623,12 +1184,14 @@ class _ChatHomePageState extends State<ChatHomePage>
     _groupCallSnapshotSubscription = null;
     _groupCallClient = null;
     _groupCallGateway = null;
-    _incomingGroupCallInvite = null;
-    _groupCallSnapshot = null;
+    _updateCallOverlay(
+      incomingCallInvite: null,
+      callSnapshot: null,
+      incomingGroupCallInvite: null,
+      groupCallSnapshot: null,
+    );
     _groupCallRefreshTimer?.cancel();
     _groupCallRefreshTimer = null;
-    _incomingCallInvite = null;
-    _callSnapshot = null;
     await incomingSubscription?.cancel();
     await snapshotSubscription?.cancel();
     await groupInviteSubscription?.cancel();
@@ -730,6 +1293,9 @@ class _ChatHomePageState extends State<ChatHomePage>
     }).toList();
   }
 
+  List<ChatThread> get _availableThreads =>
+      _threadsWithActivity(_mergeThreads(_remoteThreads));
+
   ChatThread _threadWithProfileOverride(ChatThread thread) {
     final peerUserId = thread.peerUserId;
     final profile = peerUserId == null
@@ -752,139 +1318,112 @@ class _ChatHomePageState extends State<ChatHomePage>
 
   @override
   Widget build(BuildContext context) {
-    return StreamBuilder<List<ChatThread>>(
-      stream: _threadsStream,
-      initialData: widget.repository.isConnected
-          ? const []
-          : widget.repository.threads,
-      builder: (context, snapshot) {
-        final threads = _threadsWithActivity(
-          _mergeThreads(snapshot.data ?? const []),
-        );
-        _availableThreads = threads;
-        _scheduleNotificationRouteResolution(threads);
-        _syncTypingSubscriptions(threads);
-        final selectedThread = _selectedThreadFor(threads);
+    final threads = _availableThreads;
+    final selectedThread = _selectedThreadFor(threads);
 
-        return LayoutBuilder(
-          builder: (context, constraints) {
-            final isWide = constraints.maxWidth >= 840;
-            if (isWide || _isCompactConversationOpen) {
-              _scheduleConversationEntryRefresh(selectedThread);
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final isWide = constraints.maxWidth >= 840;
+        return PopScope(
+          canPop: isWide || !_isCompactConversationOpen,
+          onPopInvokedWithResult: (didPop, result) {
+            if (!didPop && !isWide && _isCompactConversationOpen) {
+              _showCompactInbox();
             }
-
-            return Stack(
-              children: [
-                Scaffold(
+          },
+          child: Stack(
+            children: [
+              ValueListenableBuilder<_CallOverlayState>(
+                valueListenable: _callOverlay,
+                child: Scaffold(
                   body: SafeArea(
-                    child: isWide
-                        ? _buildWideLayout(threads, selectedThread)
-                        : _buildCompactLayout(threads, selectedThread),
+                    child: _buildResponsiveLayout(
+                      threads,
+                      selectedThread,
+                      isWide: isWide,
+                    ),
                   ),
                 ),
-                if (_incomingCallInvite case final invite?)
-                  _IncomingCallOverlay(
-                    invite: invite,
-                    onAccept: _acceptIncomingCall,
-                    onReject: _rejectIncomingCall,
+                builder: (context, overlay, child) => IgnorePointer(
+                  ignoring: overlay.hasActiveOverlay,
+                  child: ExcludeSemantics(
+                    excluding: overlay.hasActiveOverlay,
+                    child: child!,
                   ),
-                if (_callSnapshot case final snapshot?)
-                  _ActiveCallOverlay(
-                    snapshot: snapshot,
-                    onToggleMute: () => _toggleCallMute(snapshot),
-                    onToggleCamera: () => _toggleCallCamera(snapshot),
-                    onSwitchCamera: _switchCallCamera,
-                    onHangUp: _hangUpCall,
-                  ),
-                if (_incomingGroupCallInvite case final invite?)
-                  _IncomingGroupCallOverlay(
-                    invite: invite,
-                    onJoin: () => _joinGroupCall(invite.callId),
-                    onDecline: () => _declineGroupCall(invite.callId),
-                  ),
-                if (_groupCallSnapshot case final snapshot?)
-                  _ActiveGroupCallOverlay(
-                    snapshot: snapshot,
-                    onToggleMute: () => _toggleGroupMute(snapshot),
-                    onToggleCamera: () => _toggleGroupCamera(snapshot),
-                    onSwitchCamera: () =>
-                        unawaited(_groupCallClient?.switchCamera()),
-                    onLeave: _leaveGroupCall,
-                  ),
-              ],
-            );
-          },
+                ),
+              ),
+              ValueListenableBuilder<_CallOverlayState>(
+                valueListenable: _callOverlay,
+                builder: (context, overlay, child) => Stack(
+                  children: [
+                    if (overlay.incomingCallInvite case final invite?)
+                      _IncomingCallOverlay(
+                        invite: invite,
+                        onAccept: _acceptIncomingCall,
+                        onReject: _rejectIncomingCall,
+                      ),
+                    if (overlay.callSnapshot case final snapshot?)
+                      _ActiveCallOverlay(
+                        snapshot: snapshot,
+                        onToggleMute: () => _toggleCallMute(snapshot),
+                        onToggleCamera: () => _toggleCallCamera(snapshot),
+                        onSwitchCamera: _switchCallCamera,
+                        onHangUp: _hangUpCall,
+                      ),
+                    if (overlay.incomingGroupCallInvite case final invite?)
+                      _IncomingGroupCallOverlay(
+                        invite: invite,
+                        onJoin: () => _joinGroupCall(invite.callId),
+                        onDecline: () => _declineGroupCall(invite.callId),
+                      ),
+                    if (overlay.groupCallSnapshot case final snapshot?)
+                      _ActiveGroupCallOverlay(
+                        snapshot: snapshot,
+                        onToggleMute: () => _toggleGroupMute(snapshot),
+                        onToggleCamera: () => _toggleGroupCamera(snapshot),
+                        onSwitchCamera: () =>
+                            unawaited(_groupCallClient?.switchCamera()),
+                        onLeave: _leaveGroupCall,
+                      ),
+                  ],
+                ),
+              ),
+            ],
+          ),
         );
       },
     );
   }
 
-  Widget _buildWideLayout(
+  Widget _buildResponsiveLayout(
     List<ChatThread> threads,
-    ChatThread? selectedThread,
-  ) {
-    final filteredThreads = _filteredThreads(threads);
-    return Row(
-      children: [
-        SizedBox(
-          width: 360,
-          child: _ThreadList(
-            threads: filteredThreads,
-            selectedThread: selectedThread,
-            isConnected: widget.repository.isConnected,
-            searchController: _searchController,
-            onSearchChanged: _setQuery,
-            statusFilter: _statusFilter,
-            onStatusFilterChanged: _setStatusFilter,
-            emptyMessage: _emptyThreadListMessage(threads),
-            onThreadSelected: _selectThread,
-            onNewChat: _openNewChat,
-            onNewGroup: _openNewGroup,
-            onOpenProfile: _openProfile,
-            onRefresh: _refreshConversations,
-            onSignOut: _requestSignOut,
-          ),
-        ),
-        const VerticalDivider(width: 1),
-        Expanded(
-          child: selectedThread == null
-              ? const _EmptyConversationPane()
-              : _buildConversation(
-                  thread: selectedThread,
-                  showBackButton: false,
-                ),
-        ),
-      ],
+    ChatThread? selectedThread, {
+    required bool isWide,
+  }) {
+    final threadPane = _ThreadList(
+      key: const ValueKey<String>('thread-pane'),
+      threads: threads,
+      selectedThread: selectedThread,
+      isConnected: widget.repository.isConnected,
+      onThreadSelected: isWide ? _selectThread : _selectCompactThread,
+      onNewChat: _openNewChat,
+      onNewGroup: _openNewGroup,
+      onOpenProfile: _openProfile,
+      onRefresh: _refreshConversations,
+      onSignOut: _requestSignOut,
     );
-  }
+    final conversationPane = selectedThread == null
+        ? const _EmptyConversationPane(
+            key: ValueKey<String>('empty-conversation-pane'),
+          )
+        : _buildConversation(thread: selectedThread, showBackButton: !isWide);
 
-  Widget _buildCompactLayout(
-    List<ChatThread> threads,
-    ChatThread? selectedThread,
-  ) {
-    if (!_isCompactConversationOpen) {
-      final filteredThreads = _filteredThreads(threads);
-      return _ThreadList(
-        threads: filteredThreads,
-        selectedThread: selectedThread,
-        isConnected: widget.repository.isConnected,
-        searchController: _searchController,
-        onSearchChanged: _setQuery,
-        statusFilter: _statusFilter,
-        onStatusFilterChanged: _setStatusFilter,
-        emptyMessage: _emptyThreadListMessage(threads),
-        onThreadSelected: _selectCompactThread,
-        onNewChat: _openNewChat,
-        onNewGroup: _openNewGroup,
-        onOpenProfile: _openProfile,
-        onRefresh: _refreshConversations,
-        onSignOut: _requestSignOut,
-      );
-    }
-
-    return selectedThread == null
-        ? const _EmptyConversationPane()
-        : _buildConversation(thread: selectedThread, showBackButton: true);
+    return _ResponsiveChatShell(
+      isWide: isWide,
+      compactConversationOpen: _isCompactConversationOpen,
+      threadPane: threadPane,
+      conversationPane: conversationPane,
+    );
   }
 
   Widget _buildConversation({
@@ -899,14 +1438,15 @@ class _ChatHomePageState extends State<ChatHomePage>
         ..._localMessages,
         ..._outboxMessages,
       ].where((message) => message.threadId == thread.id).toList(),
+      insertionEvents: _messageInsertionEvents,
       stagedAttachment: _stagedAttachment?.conversationId == thread.id
           ? _stagedAttachment
           : null,
       messageController: _messageController,
       isSending: _isSending,
       isRecordingVoice: _isRecordingVoice,
-      voiceRecordingElapsed: _voiceRecordingElapsed,
-      voiceRecordingLevels: List<double>.unmodifiable(_voiceLevels),
+      voiceRecordingVisuals: _voiceVisualController,
+      isVisible: !showBackButton || _isCompactConversationOpen,
       showBackButton: showBackButton,
       onBackToInbox: _showCompactInbox,
       onSend: () => _sendMessage(thread),
@@ -939,24 +1479,6 @@ class _ChatHomePageState extends State<ChatHomePage>
       onOpenProfile: _openProfile,
       onSignOut: _requestSignOut,
     );
-  }
-
-  List<ChatThread> _filteredThreads(List<ChatThread> threads) {
-    final normalizedQuery = _query.trim().toLowerCase();
-    return threads.where((thread) {
-      final statusMatches = switch (_statusFilter) {
-        _ThreadStatusFilter.all => true,
-        _ThreadStatusFilter.unread => thread.status == ChatThreadStatus.unread,
-        _ThreadStatusFilter.sent => thread.status == ChatThreadStatus.sent,
-        _ThreadStatusFilter.delivered =>
-          thread.status == ChatThreadStatus.delivered,
-        _ThreadStatusFilter.read => thread.status == ChatThreadStatus.read,
-      };
-      if (!statusMatches) return false;
-      if (normalizedQuery.isEmpty) return true;
-      return thread.title.toLowerCase().contains(normalizedQuery) ||
-          thread.displaySubtitle.toLowerCase().contains(normalizedQuery);
-    }).toList();
   }
 
   List<ChatThread> _mergeThreads(List<ChatThread> threads) {
@@ -1011,19 +1533,6 @@ class _ChatHomePageState extends State<ChatHomePage>
     return message.isMine ? 'You: $preview' : preview;
   }
 
-  String _emptyThreadListMessage(List<ChatThread> threads) {
-    if (threads.isEmpty) return 'No conversations yet.';
-    if (_query.trim().isNotEmpty) return 'No conversations match your search.';
-    return 'No ${_statusFilter.label.toLowerCase()} conversations.';
-  }
-
-  Stream<List<ChatThread>> _watchThreadsStartingWith(
-    List<ChatThread> initialThreads,
-  ) async* {
-    yield initialThreads;
-    yield* widget.repository.watchThreads();
-  }
-
   ChatThread? _selectedThreadFor(List<ChatThread> threads) {
     final selected = _selectedThread;
     if (selected != null) {
@@ -1040,18 +1549,6 @@ class _ChatHomePageState extends State<ChatHomePage>
     return threads.first;
   }
 
-  void _setQuery(String value) {
-    setState(() {
-      _query = value;
-    });
-  }
-
-  void _setStatusFilter(_ThreadStatusFilter value) {
-    setState(() {
-      _statusFilter = value;
-    });
-  }
-
   void _selectThread(ChatThread thread) {
     if (_isRecordingVoice) {
       unawaited(_cancelVoiceRecording());
@@ -1066,6 +1563,7 @@ class _ChatHomePageState extends State<ChatHomePage>
       _editingMessage = null;
       _messageController.clear();
     });
+    _scheduleConversationEntryRefresh(thread);
   }
 
   void _selectCompactThread(ChatThread thread) {
@@ -1083,10 +1581,11 @@ class _ChatHomePageState extends State<ChatHomePage>
       _editingMessage = null;
       _messageController.clear();
     });
+    _scheduleConversationEntryRefresh(thread);
   }
 
   Future<void> _openNewChat() async {
-    final user = await showDialog<ChatUser>(
+    final user = await showChatDialog<ChatUser>(
       context: context,
       builder: (context) => _NewChatDialog(repository: widget.repository),
     );
@@ -1099,7 +1598,7 @@ class _ChatHomePageState extends State<ChatHomePage>
   }
 
   Future<void> _openNewGroup() async {
-    final draft = await showDialog<_NewGroupDraft>(
+    final draft = await showChatDialog<_NewGroupDraft>(
       context: context,
       builder: (context) => _NewGroupDialog(repository: widget.repository),
     );
@@ -1117,6 +1616,7 @@ class _ChatHomePageState extends State<ChatHomePage>
         _selectedThread = thread;
         _isCompactConversationOpen = true;
       });
+      _handleThreadProjectionChanged();
     } catch (error) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -1129,7 +1629,7 @@ class _ChatHomePageState extends State<ChatHomePage>
 
   Future<void> _openGroupDetails(ChatThread thread) async {
     if (!thread.isGroup) return;
-    final result = await showDialog<_GroupDetailsResult>(
+    final result = await showChatDialog<_GroupDetailsResult>(
       context: context,
       builder: (context) =>
           _GroupDetailsDialog(repository: widget.repository, thread: thread),
@@ -1144,8 +1644,11 @@ class _ChatHomePageState extends State<ChatHomePage>
         _startedThreads.removeWhere((item) => item.id == thread.id);
         _selectedThread = null;
         _isCompactConversationOpen = false;
-        _threadsStream = _watchThreadsStartingWith(remainingThreads);
       });
+      _bindThreadsStream(
+        widget.repository.watchThreads(),
+        initialData: remainingThreads,
+      );
       return;
     }
 
@@ -1161,8 +1664,11 @@ class _ChatHomePageState extends State<ChatHomePage>
         .toList();
     setState(() {
       _selectedThread = updated;
-      _threadsStream = _watchThreadsStartingWith(updatedThreads);
     });
+    _bindThreadsStream(
+      widget.repository.watchThreads(),
+      initialData: updatedThreads,
+    );
   }
 
   Future<void> _startChatWith(ChatUser user) async {
@@ -1178,6 +1684,7 @@ class _ChatHomePageState extends State<ChatHomePage>
         _selectedThread = thread;
         _isCompactConversationOpen = true;
       });
+      _handleThreadProjectionChanged();
     } catch (_) {
       if (!mounted) {
         return;
@@ -1246,9 +1753,10 @@ class _ChatHomePageState extends State<ChatHomePage>
         return;
       }
 
-      setState(() {
-        _threadsStream = _watchThreadsStartingWith(threads);
-      });
+      _bindThreadsStream(
+        widget.repository.watchThreads(),
+        initialData: threads,
+      );
 
       final selectedThread = _selectedThread;
       if (selectedThread != null) {
@@ -1267,7 +1775,8 @@ class _ChatHomePageState extends State<ChatHomePage>
 
   Future<void> _openProfile() async {
     await Navigator.of(context).push(
-      MaterialPageRoute<void>(
+      ChatPageRoute<void>(
+        context: context,
         builder: (context) => ProfilePage(repository: widget.repository),
       ),
     );
@@ -1353,7 +1862,8 @@ class _ChatHomePageState extends State<ChatHomePage>
   Future<void> _joinGroupCall(String callId) async {
     final groupClient = _groupCallClient;
     if (groupClient == null) return;
-    setState(() => _incomingGroupCallInvite = null);
+    _updateCallOverlay(incomingGroupCallInvite: null);
+    unawaited(ChatHaptics.lightImpact());
     try {
       await groupClient.join(callId: callId);
     } on CallException catch (error, stackTrace) {
@@ -1368,7 +1878,7 @@ class _ChatHomePageState extends State<ChatHomePage>
   Future<void> _declineGroupCall(String callId) async {
     final gateway = _groupCallGateway;
     if (gateway == null) return;
-    setState(() => _incomingGroupCallInvite = null);
+    _updateCallOverlay(incomingGroupCallInvite: null);
     try {
       await gateway.decline(callId: callId);
     } catch (error) {
@@ -1405,9 +1915,8 @@ class _ChatHomePageState extends State<ChatHomePage>
       return;
     }
 
-    setState(() {
-      _incomingCallInvite = null;
-    });
+    _updateCallOverlay(incomingCallInvite: null);
+    unawaited(ChatHaptics.lightImpact());
 
     try {
       await callClient.acceptInvite(
@@ -1430,9 +1939,7 @@ class _ChatHomePageState extends State<ChatHomePage>
       return;
     }
 
-    setState(() {
-      _incomingCallInvite = null;
-    });
+    _updateCallOverlay(incomingCallInvite: null);
     try {
       await callClient.rejectInvite(invite);
     } catch (error, stackTrace) {
@@ -1539,7 +2046,7 @@ class _ChatHomePageState extends State<ChatHomePage>
   }
 
   Future<PickedChatMedia?> _pickGiphyMedia() async {
-    final gif = await showDialog<GiphyGif>(
+    final gif = await showChatDialog<GiphyGif>(
       context: context,
       builder: (context) => _GiphyPickerDialog(repository: widget.repository),
     );
@@ -1551,7 +2058,7 @@ class _ChatHomePageState extends State<ChatHomePage>
   }
 
   Future<PickedChatMedia?> _captureCameraMedia() async {
-    final captured = await showDialog<camera.XFile>(
+    final captured = await showChatDialog<camera.XFile>(
       context: context,
       builder: (context) => const _CameraCaptureDialog(),
     );
@@ -1592,12 +2099,9 @@ class _ChatHomePageState extends State<ChatHomePage>
       await _voiceAmplitudeSubscription?.cancel();
 
       _voiceBytes.clear();
-      _voiceLevels
-        ..clear()
-        ..addAll(List<double>.filled(24, 0.08));
+      _voiceVisualController.reset();
       _voiceStreamDone = Completer<void>();
       _voiceRecordingStartedAt = DateTime.now();
-      _voiceRecordingElapsed = Duration.zero;
 
       final useFileRecording = _shouldUseFileVoiceRecording;
       _isVoiceRecordingFileBacked = useFileRecording;
@@ -1651,12 +2155,9 @@ class _ChatHomePageState extends State<ChatHomePage>
             if (!mounted || !_isRecordingVoice) {
               return;
             }
-            setState(() {
-              _voiceLevels.add(_voiceLevelFromDb(amplitude.current));
-              if (_voiceLevels.length > 48) {
-                _voiceLevels.removeRange(0, _voiceLevels.length - 48);
-              }
-            });
+            _voiceVisualController.addLevel(
+              _voiceLevelFromDb(amplitude.current),
+            );
           });
 
       _voiceRecordingTimer?.cancel();
@@ -1665,9 +2166,9 @@ class _ChatHomePageState extends State<ChatHomePage>
         if (!mounted || startedAt == null) {
           return;
         }
-        setState(() {
-          _voiceRecordingElapsed = DateTime.now().difference(startedAt);
-        });
+        _voiceVisualController.updateElapsed(
+          DateTime.now().difference(startedAt),
+        );
       });
 
       if (!mounted) {
@@ -1678,6 +2179,7 @@ class _ChatHomePageState extends State<ChatHomePage>
       setState(() {
         _isRecordingVoice = true;
       });
+      unawaited(ChatHaptics.lightImpact());
     } catch (error, stackTrace) {
       _logAttachmentFailure('Voice recording failed', error, stackTrace);
       if (mounted) {
@@ -1694,13 +2196,14 @@ class _ChatHomePageState extends State<ChatHomePage>
 
     final startedAt = _voiceRecordingStartedAt;
     final elapsed = startedAt == null
-        ? _voiceRecordingElapsed
+        ? _voiceVisualController.elapsed.value
         : DateTime.now().difference(startedAt);
 
+    _voiceVisualController.updateElapsed(elapsed);
     setState(() {
       _isRecordingVoice = false;
-      _voiceRecordingElapsed = elapsed;
     });
+    unawaited(ChatHaptics.lightImpact());
 
     _voiceRecordingTimer?.cancel();
     _voiceRecordingTimer = null;
@@ -1743,9 +2246,9 @@ class _ChatHomePageState extends State<ChatHomePage>
         mimeType = 'audio/wav';
       }
 
-      final waveform = _compactVoiceLevels(_voiceLevels);
+      final waveform = _compactVoiceLevels(_voiceVisualController.levels);
       _voiceBytes.clear();
-      _voiceLevels.clear();
+      _voiceVisualController.clear();
       _voiceRecordingStartedAt = null;
       _voiceRecordingFilePath = null;
       _voiceStreamDone = null;
@@ -1800,7 +2303,7 @@ class _ChatHomePageState extends State<ChatHomePage>
     }
     _voiceStreamDone = null;
     _voiceBytes.clear();
-    _voiceLevels.clear();
+    _voiceVisualController.clear();
     _voiceRecordingStartedAt = null;
     await deleteVoiceRecordingFile(_voiceRecordingFilePath);
     _voiceRecordingFilePath = null;
@@ -1809,7 +2312,6 @@ class _ChatHomePageState extends State<ChatHomePage>
     if (mounted && !_isTearingDown) {
       setState(() {
         _isRecordingVoice = false;
-        _voiceRecordingElapsed = Duration.zero;
       });
     }
   }
@@ -2050,36 +2552,41 @@ class _ChatHomePageState extends State<ChatHomePage>
     FocusScope.of(context).unfocus();
 
     if (!widget.repository.isConnected) {
+      final localMessage = ChatMessage(
+        id:
+            uploadedMedia?.messageId ??
+            'local-${DateTime.now().microsecondsSinceEpoch}',
+        threadId: selectedThread.id,
+        senderId: ChatSeed.localUserId,
+        senderName: 'You',
+        body: text,
+        createdAt: DateTime.now(),
+        isMine: true,
+        isDelivered: false,
+        isRead: false,
+        messageType: uploadedMedia?.media.isVoice == true
+            ? ChatMessageType.voice
+            : uploadedMedia?.media.isGif == true
+            ? ChatMessageType.gif
+            : uploadedMedia == null
+            ? ChatMessageType.text
+            : ChatMessageType.image,
+        media: uploadedMedia?.media,
+        replyTo: replyTo == null
+            ? null
+            : MessageReplyPreview.fromMessage(replyTo),
+      );
       setState(() {
-        _localMessages.add(
-          ChatMessage(
-            id:
-                uploadedMedia?.messageId ??
-                'local-${DateTime.now().microsecondsSinceEpoch}',
-            threadId: selectedThread.id,
-            senderId: ChatSeed.localUserId,
-            senderName: 'You',
-            body: text,
-            createdAt: DateTime.now(),
-            isMine: true,
-            isDelivered: false,
-            isRead: false,
-            messageType: uploadedMedia?.media.isVoice == true
-                ? ChatMessageType.voice
-                : uploadedMedia?.media.isGif == true
-                ? ChatMessageType.gif
-                : uploadedMedia == null
-                ? ChatMessageType.text
-                : ChatMessageType.image,
-            media: uploadedMedia?.media,
-            replyTo: replyTo == null
-                ? null
-                : MessageReplyPreview.fromMessage(replyTo),
-          ),
-        );
+        _localMessages.add(localMessage);
         _stagedAttachment = null;
         _replyingTo = null;
       });
+      _messageInsertionEvents.value = _MessageInsertionEvent(
+        messageId: localMessage.id,
+        threadId: localMessage.threadId,
+        isMine: true,
+      );
+      unawaited(ChatHaptics.lightImpact());
       return;
     }
 
@@ -2146,14 +2653,16 @@ class _ChatHomePageState extends State<ChatHomePage>
     try {
       await activeOutbox.initialize();
       await _stopTyping();
-      await activeOutbox.enqueue(
+      final queuedMessage = await activeOutbox.enqueue(
         conversationId: selectedThread.id,
         senderId: widget.repository.localUserId,
         senderName: widget.repository.localSenderName,
         body: text,
-        pickedMedia: stagedAttachment?.uploadedMedia == null
-            ? stagedAttachment?.pickedMedia
-            : null,
+        // Retain the original encrypted-draft source even after the staging
+        // upload succeeds. If membership changes before delivery, the outbox
+        // must re-encrypt the bytes for the new epoch instead of retrying an
+        // obsolete ciphertext object.
+        pickedMedia: stagedAttachment?.pickedMedia,
         uploadedMedia: stagedAttachment?.uploadedMedia,
         replyTo: replyTo == null
             ? null
@@ -2168,7 +2677,28 @@ class _ChatHomePageState extends State<ChatHomePage>
         FocusScope.of(context).unfocus();
       }
       await _refreshOutboxMessages(activeOutbox);
+      if (mounted) {
+        _messageInsertionEvents.value = _MessageInsertionEvent(
+          messageId: queuedMessage.id,
+          threadId: queuedMessage.conversationId,
+          isMine: true,
+        );
+        unawaited(ChatHaptics.lightImpact());
+      }
       await _flushOutbox();
+      OutboxMessage? unsent;
+      for (final item in activeOutbox.items) {
+        if (item.id == queuedMessage.id) {
+          unsent = item;
+          break;
+        }
+      }
+      final sendError = unsent?.lastError;
+      if (mounted && sendError != null && sendError.isNotEmpty) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Message not sent: $sendError')));
+      }
     } catch (error) {
       if (!mounted) {
         return;
@@ -2187,6 +2717,10 @@ class _ChatHomePageState extends State<ChatHomePage>
   }
 
   void _startReply(ChatMessage message) {
+    if (message.isLocked || message.hasInvalidEncryption) {
+      _showMessageActionError('This encrypted message is unavailable.');
+      return;
+    }
     setState(() {
       _replyingTo = message;
       _editingMessage = null;
@@ -2194,6 +2728,10 @@ class _ChatHomePageState extends State<ChatHomePage>
   }
 
   void _startEdit(ChatMessage message) {
+    if (message.isLocked || message.hasInvalidEncryption) {
+      _showMessageActionError('This encrypted message is unavailable.');
+      return;
+    }
     setState(() {
       _editingMessage = message;
       _replyingTo = null;
@@ -2215,13 +2753,17 @@ class _ChatHomePageState extends State<ChatHomePage>
   }
 
   Future<void> _submitMessageEdit(ChatMessage message, String body) async {
+    if (message.isLocked || message.hasInvalidEncryption) {
+      _showMessageActionError('This encrypted message is unavailable.');
+      return;
+    }
     if (message.messageType == ChatMessageType.text && body.isEmpty) {
       _showMessageActionError('Text messages cannot be empty.');
       return;
     }
     try {
       if (widget.repository.isConnected) {
-        await widget.repository.editMessage(messageId: message.id, body: body);
+        await widget.repository.editMessage(message: message, body: body);
       } else {
         _replaceLocalMessage(
           message.copyWith(body: body, editedAt: DateTime.now()),
@@ -2238,7 +2780,7 @@ class _ChatHomePageState extends State<ChatHomePage>
   }
 
   Future<void> _deleteMessage(ChatMessage message) async {
-    final confirmed = await showDialog<bool>(
+    final confirmed = await showChatDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Delete message?'),
@@ -2280,10 +2822,14 @@ class _ChatHomePageState extends State<ChatHomePage>
   }
 
   Future<void> _toggleMessageReaction(ChatMessage message, String emoji) async {
+    if (message.isLocked || message.hasInvalidEncryption) {
+      _showMessageActionError('This encrypted message is unavailable.');
+      return;
+    }
     try {
       if (widget.repository.isConnected) {
         await widget.repository.toggleMessageReaction(
-          messageId: message.id,
+          message: message,
           emoji: emoji,
         );
         return;
@@ -2314,7 +2860,7 @@ class _ChatHomePageState extends State<ChatHomePage>
 
   Future<void> _showReactionPicker(ChatMessage message) async {
     const quick = ['👍', '❤️', '😂', '😮', '😢', '🙏'];
-    final selected = await showModalBottomSheet<String>(
+    final selected = await showChatModalBottomSheet<String>(
       context: context,
       isScrollControlled: true,
       builder: (context) => SafeArea(
@@ -2326,17 +2872,19 @@ class _ChatHomePageState extends State<ChatHomePage>
                 padding: const EdgeInsets.all(12),
                 child: Wrap(
                   spacing: 8,
-                  children: quick
-                      .map(
-                        (emoji) => ActionChip(
+                  children: [
+                    for (var index = 0; index < quick.length; index++)
+                      ChatStagger(
+                        index: index,
+                        child: ActionChip(
                           label: Text(
-                            emoji,
+                            quick[index],
                             style: const TextStyle(fontSize: 22),
                           ),
-                          onPressed: () => Navigator.pop(context, emoji),
+                          onPressed: () => Navigator.pop(context, quick[index]),
                         ),
-                      )
-                      .toList(),
+                      ),
+                  ],
                 ),
               ),
               const Divider(height: 1),
@@ -2353,11 +2901,16 @@ class _ChatHomePageState extends State<ChatHomePage>
       ),
     );
     if (selected != null) {
+      unawaited(ChatHaptics.selection());
       await _toggleMessageReaction(message, selected);
     }
   }
 
   Future<void> _copyMessage(ChatMessage message) async {
+    if (message.isLocked || message.hasInvalidEncryption) {
+      _showMessageActionError('This encrypted message is unavailable.');
+      return;
+    }
     await Clipboard.setData(ClipboardData(text: message.body));
     if (!mounted) return;
     ScaffoldMessenger.of(
@@ -2366,7 +2919,11 @@ class _ChatHomePageState extends State<ChatHomePage>
   }
 
   Future<void> _forwardMessage(ChatMessage message) async {
-    final destination = await showDialog<ChatThread>(
+    if (message.isLocked || message.hasInvalidEncryption) {
+      _showMessageActionError('This encrypted message is unavailable.');
+      return;
+    }
+    final destination = await showChatDialog<ChatThread>(
       context: context,
       builder: (context) => SimpleDialog(
         title: const Text('Forward to'),
@@ -2447,6 +3004,379 @@ class _ChatHomePageState extends State<ChatHomePage>
       context,
     ).showSnackBar(SnackBar(content: Text(message)));
   }
+}
+
+class _E2eeRecoveryPhraseConfirmationDialog extends StatefulWidget {
+  const _E2eeRecoveryPhraseConfirmationDialog({
+    required this.phrase,
+    required this.onConfirm,
+  });
+
+  final String phrase;
+  final Future<void> Function(String phrase) onConfirm;
+
+  @override
+  State<_E2eeRecoveryPhraseConfirmationDialog> createState() =>
+      _E2eeRecoveryPhraseConfirmationDialogState();
+}
+
+class _E2eeRecoveryPhraseConfirmationDialogState
+    extends State<_E2eeRecoveryPhraseConfirmationDialog> {
+  final _controller = TextEditingController();
+  bool _savedPhrase = false;
+  bool _isConfirming = false;
+  String? _error;
+
+  String get _enteredPhrase => _normalizePhrase(_controller.text);
+
+  bool get _matchesPhrase =>
+      _enteredPhrase == _normalizePhrase(widget.phrase) &&
+      _enteredPhrase.split(' ').length == 24;
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  Future<void> _confirm() async {
+    if (_isConfirming) return;
+    if (!_matchesPhrase) {
+      setState(() {
+        _error = 'Enter all 24 words exactly as shown.';
+      });
+      return;
+    }
+    if (!_savedPhrase) {
+      setState(() {
+        _error = 'Confirm that you have saved the recovery phrase.';
+      });
+      return;
+    }
+
+    setState(() {
+      _isConfirming = true;
+      _error = null;
+    });
+    try {
+      await widget.onConfirm(_enteredPhrase);
+      if (mounted) {
+        Navigator.of(context).pop(true);
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _error =
+              'The recovery phrase could not be confirmed. Check the words and try again.';
+        });
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isConfirming = false;
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final wordCount = _enteredPhrase.isEmpty
+        ? 0
+        : _enteredPhrase.split(' ').length;
+
+    return PopScope(
+      canPop: false,
+      child: AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.key_outlined),
+            SizedBox(width: 10),
+            Expanded(child: Text('Save your recovery phrase')),
+          ],
+        ),
+        content: SizedBox(
+          width: 520,
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'This 24-word phrase is the only way to restore your encrypted conversations on another device. It is never sent to the server.',
+                ),
+                const SizedBox(height: 16),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).colorScheme.surfaceContainerHigh,
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: SelectableText(
+                    widget.phrase,
+                    key: const Key('e2ee-recovery-phrase'),
+                    style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                      fontFeatures: const [FontFeature.tabularFigures()],
+                      height: 1.5,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 18),
+                const Text(
+                  'Write it down, then enter every word below to confirm before messaging is enabled.',
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  key: const Key('e2ee-recovery-phrase-confirmation'),
+                  controller: _controller,
+                  enabled: !_isConfirming,
+                  autocorrect: false,
+                  enableSuggestions: false,
+                  obscureText: true,
+                  maxLines: 1,
+                  textCapitalization: TextCapitalization.none,
+                  onChanged: (_) {
+                    if (_error != null) {
+                      setState(() {
+                        _error = null;
+                      });
+                    } else {
+                      setState(() {});
+                    }
+                  },
+                  onSubmitted: (_) => _confirm(),
+                  decoration: InputDecoration(
+                    labelText: 'Re-enter all 24 words',
+                    helperText: '$wordCount of 24 words entered',
+                    errorText: _error,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                CheckboxListTile(
+                  contentPadding: EdgeInsets.zero,
+                  value: _savedPhrase,
+                  onChanged: _isConfirming
+                      ? null
+                      : (value) {
+                          setState(() {
+                            _savedPhrase = value ?? false;
+                            _error = null;
+                          });
+                        },
+                  title: const Text(
+                    'I have saved this recovery phrase safely.',
+                  ),
+                  controlAffinity: ListTileControlAffinity.leading,
+                ),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          FilledButton(
+            onPressed: _isConfirming || !_matchesPhrase || !_savedPhrase
+                ? null
+                : _confirm,
+            child: _isConfirming
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Text('Confirm and continue'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _E2eeRecoveryPhraseRestoreDialog extends StatefulWidget {
+  const _E2eeRecoveryPhraseRestoreDialog({required this.onRestore});
+
+  final Future<void> Function(String phrase) onRestore;
+
+  @override
+  State<_E2eeRecoveryPhraseRestoreDialog> createState() =>
+      _E2eeRecoveryPhraseRestoreDialogState();
+}
+
+class _E2eeRecoveryPhraseRestoreDialogState
+    extends State<_E2eeRecoveryPhraseRestoreDialog> {
+  final _controller = TextEditingController();
+  bool _isRestoring = false;
+  bool _showPhrase = false;
+  String? _error;
+
+  String get _phrase => _normalizePhrase(_controller.text);
+
+  bool get _has24Words => _phrase.isNotEmpty && _phrase.split(' ').length == 24;
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  Future<void> _restore() async {
+    if (_isRestoring) return;
+    if (!_has24Words) {
+      setState(() {
+        _error = 'Enter all 24 recovery words.';
+      });
+      return;
+    }
+
+    setState(() {
+      _isRestoring = true;
+      _error = null;
+    });
+    try {
+      await widget.onRestore(_phrase);
+      if (mounted) {
+        Navigator.of(context).pop(true);
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _error =
+              'That recovery phrase could not be used. Check the words and try again.';
+        });
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isRestoring = false;
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final wordCount = _phrase.isEmpty ? 0 : _phrase.split(' ').length;
+
+    return PopScope(
+      canPop: false,
+      child: AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.lock_reset_outlined),
+            SizedBox(width: 10),
+            Expanded(child: Text('Restore encrypted messages')),
+          ],
+        ),
+        content: SizedBox(
+          width: 500,
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'This account already has an encryption identity, but this device does not. Enter your 24-word recovery phrase to unlock encrypted conversations. The phrase stays on this device.',
+                ),
+                const SizedBox(height: 18),
+                TextField(
+                  key: const Key('e2ee-recovery-phrase-restore'),
+                  controller: _controller,
+                  enabled: !_isRestoring,
+                  autofocus: true,
+                  autocorrect: false,
+                  enableSuggestions: false,
+                  obscureText: !_showPhrase,
+                  maxLines: 1,
+                  textCapitalization: TextCapitalization.none,
+                  onChanged: (_) {
+                    if (_error != null) {
+                      setState(() {
+                        _error = null;
+                      });
+                    } else {
+                      setState(() {});
+                    }
+                  },
+                  onSubmitted: (_) => _restore(),
+                  decoration: InputDecoration(
+                    labelText: '24-word recovery phrase',
+                    helperText: '$wordCount of 24 words entered',
+                    errorText: _error,
+                    suffixIcon: IconButton(
+                      tooltip: _showPhrase ? 'Hide phrase' : 'Show phrase',
+                      onPressed: _isRestoring
+                          ? null
+                          : () {
+                              setState(() {
+                                _showPhrase = !_showPhrase;
+                              });
+                            },
+                      icon: Icon(
+                        _showPhrase
+                            ? Icons.visibility_off_outlined
+                            : Icons.visibility_outlined,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          FilledButton(
+            onPressed: _isRestoring || !_has24Words ? null : _restore,
+            child: _isRestoring
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Text('Restore and continue'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _E2eeRetryDialog extends StatelessWidget {
+  const _E2eeRetryDialog({required this.title, required this.message});
+
+  final String title;
+  final String message;
+
+  @override
+  Widget build(BuildContext context) {
+    return PopScope(
+      canPop: false,
+      child: AlertDialog(
+        title: Row(
+          children: [
+            const Icon(Icons.shield_outlined),
+            const SizedBox(width: 10),
+            Expanded(child: Text(title)),
+          ],
+        ),
+        content: Text(message),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Retry'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+String _normalizePhrase(String phrase) {
+  return phrase
+      .trim()
+      .toLowerCase()
+      .split(RegExp(r'\s+'))
+      .where((word) => word.isNotEmpty)
+      .join(' ');
 }
 
 class _NewChatDialog extends StatefulWidget {
@@ -2973,7 +3903,7 @@ class _GroupDetailsDialogState extends State<_GroupDetailsDialog> {
 
   Future<void> _rename() async {
     final controller = TextEditingController(text: _name);
-    final name = await showDialog<String>(
+    final name = await showChatDialog<String>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Rename group'),
@@ -3005,7 +3935,7 @@ class _GroupDetailsDialogState extends State<_GroupDetailsDialog> {
   }
 
   Future<void> _addMember() async {
-    final user = await showDialog<ChatUser>(
+    final user = await showChatDialog<ChatUser>(
       context: context,
       builder: (context) => _NewChatDialog(
         repository: widget.repository,
@@ -3031,7 +3961,7 @@ class _GroupDetailsDialogState extends State<_GroupDetailsDialog> {
   }
 
   Future<void> _leave() async {
-    final confirmed = await showDialog<bool>(
+    final confirmed = await showChatDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Leave group?'),
@@ -3499,16 +4429,117 @@ class _UserAvatar extends StatelessWidget {
   }
 }
 
-class _ThreadList extends StatelessWidget {
+class _ResponsiveChatShell extends StatelessWidget {
+  const _ResponsiveChatShell({
+    required this.isWide,
+    required this.compactConversationOpen,
+    required this.threadPane,
+    required this.conversationPane,
+  });
+
+  final bool isWide;
+  final bool compactConversationOpen;
+  final Widget threadPane;
+  final Widget conversationPane;
+
+  @override
+  Widget build(BuildContext context) {
+    final policy = context.chatMotion;
+    final duration = policy.duration(policy.theme.emphasizedDuration);
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final width = constraints.maxWidth;
+        final threadWidth = isWide ? 360.0 : width;
+        final conversationWidth = isWide ? math.max(0.0, width - 361) : width;
+        final showThread = isWide || !compactConversationOpen;
+        final showConversation = isWide || compactConversationOpen;
+        final threadLeft = isWide
+            ? 0.0
+            : compactConversationOpen
+            ? -width
+            : 0.0;
+        final conversationLeft = isWide
+            ? 361.0
+            : compactConversationOpen
+            ? 0.0
+            : width;
+
+        return ClipRect(
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              AnimatedPositioned(
+                duration: duration,
+                curve: Curves.easeOutCubic,
+                left: threadLeft,
+                top: 0,
+                bottom: 0,
+                width: threadWidth,
+                child: _ResponsivePaneActivity(
+                  active: showThread,
+                  child: threadPane,
+                ),
+              ),
+              AnimatedPositioned(
+                duration: duration,
+                curve: Curves.easeOutCubic,
+                left: conversationLeft,
+                top: 0,
+                bottom: 0,
+                width: conversationWidth,
+                child: _ResponsivePaneActivity(
+                  active: showConversation,
+                  child: conversationPane,
+                ),
+              ),
+              if (isWide)
+                const Positioned(
+                  left: 360,
+                  top: 0,
+                  bottom: 0,
+                  child: VerticalDivider(width: 1),
+                ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _ResponsivePaneActivity extends StatelessWidget {
+  const _ResponsivePaneActivity({required this.active, required this.child});
+
+  final bool active;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return Offstage(
+      offstage: !active,
+      child: IgnorePointer(
+        ignoring: !active,
+        child: ExcludeFocus(
+          excluding: !active,
+          child: ExcludeSemantics(
+            excluding: !active,
+            child: TickerMode(
+              enabled: active,
+              child: HeroMode(enabled: active, child: child),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ThreadList extends StatefulWidget {
   const _ThreadList({
+    super.key,
     required this.threads,
     required this.selectedThread,
     required this.isConnected,
-    required this.searchController,
-    required this.onSearchChanged,
-    required this.statusFilter,
-    required this.onStatusFilterChanged,
-    required this.emptyMessage,
     required this.onThreadSelected,
     required this.onNewChat,
     required this.onNewGroup,
@@ -3520,17 +4551,74 @@ class _ThreadList extends StatelessWidget {
   final List<ChatThread> threads;
   final ChatThread? selectedThread;
   final bool isConnected;
-  final TextEditingController searchController;
-  final ValueChanged<String> onSearchChanged;
-  final _ThreadStatusFilter statusFilter;
-  final ValueChanged<_ThreadStatusFilter> onStatusFilterChanged;
-  final String emptyMessage;
   final ValueChanged<ChatThread> onThreadSelected;
   final VoidCallback onNewChat;
   final VoidCallback onNewGroup;
   final VoidCallback onOpenProfile;
   final Future<void> Function() onRefresh;
   final VoidCallback onSignOut;
+
+  @override
+  State<_ThreadList> createState() => _ThreadListState();
+}
+
+class _ThreadListState extends State<_ThreadList> {
+  final TextEditingController searchController = TextEditingController();
+  String _query = '';
+  _ThreadStatusFilter statusFilter = _ThreadStatusFilter.all;
+
+  List<ChatThread> get threads {
+    final normalizedQuery = _query.trim().toLowerCase();
+    return widget.threads.where((thread) {
+      final statusMatches = switch (statusFilter) {
+        _ThreadStatusFilter.all => true,
+        _ThreadStatusFilter.unread => thread.status == ChatThreadStatus.unread,
+        _ThreadStatusFilter.sent => thread.status == ChatThreadStatus.sent,
+        _ThreadStatusFilter.delivered =>
+          thread.status == ChatThreadStatus.delivered,
+        _ThreadStatusFilter.read => thread.status == ChatThreadStatus.read,
+      };
+      if (!statusMatches) return false;
+      if (normalizedQuery.isEmpty) return true;
+      return thread.title.toLowerCase().contains(normalizedQuery) ||
+          thread.displaySubtitle.toLowerCase().contains(normalizedQuery);
+    }).toList();
+  }
+
+  ChatThread? get selectedThread => widget.selectedThread;
+  bool get isConnected => widget.isConnected;
+  ValueChanged<ChatThread> get onThreadSelected => widget.onThreadSelected;
+  VoidCallback get onNewChat => widget.onNewChat;
+  VoidCallback get onNewGroup => widget.onNewGroup;
+  VoidCallback get onOpenProfile => widget.onOpenProfile;
+  Future<void> Function() get onRefresh => widget.onRefresh;
+  VoidCallback get onSignOut => widget.onSignOut;
+
+  String get emptyMessage {
+    if (widget.threads.isEmpty) return 'No conversations yet.';
+    if (_query.trim().isNotEmpty) return 'No conversations match your search.';
+    return 'No ${statusFilter.label.toLowerCase()} conversations.';
+  }
+
+  @override
+  void dispose() {
+    searchController.dispose();
+    super.dispose();
+  }
+
+  void onSearchChanged(String value) {
+    setState(() {
+      _query = value;
+    });
+  }
+
+  void onStatusFilterChanged(_ThreadStatusFilter value) {
+    if (value == statusFilter) return;
+    setState(() {
+      statusFilter = value;
+    });
+    unawaited(ChatHaptics.selection());
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -3586,22 +4674,9 @@ class _ThreadList extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 12),
-            SizedBox(
-              height: 36,
-              child: ListView.separated(
-                scrollDirection: Axis.horizontal,
-                itemCount: _ThreadStatusFilter.values.length,
-                separatorBuilder: (_, _) => const SizedBox(width: 8),
-                itemBuilder: (context, index) {
-                  final filter = _ThreadStatusFilter.values[index];
-                  return ChoiceChip(
-                    key: Key('thread-status-filter-${filter.name}'),
-                    label: Text(filter.label),
-                    selected: filter == statusFilter,
-                    onSelected: (_) => onStatusFilterChanged(filter),
-                  );
-                },
-              ),
+            _ThreadFilterBar(
+              selected: statusFilter,
+              onSelected: onStatusFilterChanged,
             ),
             const SizedBox(height: 12),
             _BackendStatusPill(isConnected: isConnected),
@@ -3609,32 +4684,140 @@ class _ThreadList extends StatelessWidget {
             Expanded(
               child: RefreshIndicator(
                 onRefresh: onRefresh,
-                child: threads.isEmpty
-                    ? ListView(
-                        physics: const AlwaysScrollableScrollPhysics(),
-                        children: [
-                          SizedBox(
-                            height: 280,
-                            child: _EmptyThreadList(message: emptyMessage),
-                          ),
-                        ],
-                      )
-                    : ListView.separated(
-                        physics: const AlwaysScrollableScrollPhysics(),
-                        itemCount: threads.length,
-                        separatorBuilder: (_, _) => const SizedBox(height: 8),
-                        itemBuilder: (context, index) {
-                          final thread = threads[index];
-                          return _ThreadTile(
-                            thread: thread,
-                            isSelected: thread.id == selectedThread?.id,
-                            onTap: () => onThreadSelected(thread),
-                          );
-                        },
-                      ),
+                child: ChatStateSwitcher(
+                  alignment: Alignment.topCenter,
+                  child: threads.isEmpty
+                      ? ListView(
+                          key: ValueKey<String>('threads-empty-$emptyMessage'),
+                          physics: const AlwaysScrollableScrollPhysics(),
+                          children: [
+                            SizedBox(
+                              height: 280,
+                              child: _EmptyThreadList(message: emptyMessage),
+                            ),
+                          ],
+                        )
+                      : ListView.separated(
+                          key: const ValueKey<String>('threads-list'),
+                          physics: const AlwaysScrollableScrollPhysics(),
+                          itemCount: threads.length,
+                          separatorBuilder: (_, _) => const SizedBox(height: 8),
+                          itemBuilder: (context, index) {
+                            final thread = threads[index];
+                            return ChatStagger(
+                              key: ValueKey<String>(
+                                'thread-motion-${thread.id}',
+                              ),
+                              index: index,
+                              child: ChatPressScale(
+                                row: true,
+                                child: _ThreadTile(
+                                  key: ValueKey<String>('thread-${thread.id}'),
+                                  thread: thread,
+                                  isSelected: thread.id == selectedThread?.id,
+                                  onTap: () => onThreadSelected(thread),
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                ),
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ThreadFilterBar extends StatelessWidget {
+  const _ThreadFilterBar({required this.selected, required this.onSelected});
+
+  static const _itemWidth = 76.0;
+  static const _spacing = 6.0;
+
+  final _ThreadStatusFilter selected;
+  final ValueChanged<_ThreadStatusFilter> onSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final policy = context.chatMotion;
+    final filters = _ThreadStatusFilter.values;
+    final selectedIndex = filters.indexOf(selected);
+    final totalWidth =
+        filters.length * _itemWidth + (filters.length - 1) * _spacing;
+
+    return SizedBox(
+      height: 36,
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: SizedBox(
+          width: totalWidth,
+          child: Stack(
+            children: [
+              AnimatedPositioned(
+                duration: policy.duration(policy.theme.emphasizedDuration),
+                curve: Curves.easeOutCubic,
+                left: selectedIndex * (_itemWidth + _spacing),
+                top: 0,
+                width: _itemWidth,
+                height: 36,
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: theme.colorScheme.secondaryContainer,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                ),
+              ),
+              Row(
+                children: [
+                  for (var index = 0; index < filters.length; index++) ...[
+                    if (index > 0) const SizedBox(width: _spacing),
+                    SizedBox(
+                      width: _itemWidth,
+                      height: 36,
+                      child: Semantics(
+                        button: true,
+                        selected: filters[index] == selected,
+                        child: Material(
+                          color: Colors.transparent,
+                          child: InkWell(
+                            key: Key(
+                              'thread-status-filter-${filters[index].name}',
+                            ),
+                            borderRadius: BorderRadius.circular(8),
+                            onTap: () => onSelected(filters[index]),
+                            child: Center(
+                              child: AnimatedDefaultTextStyle(
+                                duration: policy.duration(
+                                  policy.theme.microDuration,
+                                ),
+                                style: theme.textTheme.labelMedium!.copyWith(
+                                  color: filters[index] == selected
+                                      ? theme.colorScheme.onSecondaryContainer
+                                      : theme.colorScheme.onSurfaceVariant,
+                                  fontWeight: filters[index] == selected
+                                      ? FontWeight.w800
+                                      : FontWeight.w600,
+                                ),
+                                child: Text(
+                                  filters[index].label,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -3684,23 +4867,27 @@ class _BackendStatusPill extends StatelessWidget {
         color: color.withValues(alpha: 0.1),
         borderRadius: BorderRadius.circular(8),
       ),
-      child: Row(
-        children: [
-          Icon(
-            isConnected ? Icons.cloud_done : Icons.data_object,
-            size: 18,
-            color: color,
-          ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              isConnected
-                  ? 'Supabase realtime connected'
-                  : 'Local preview data',
-              style: theme.textTheme.labelLarge?.copyWith(color: color),
+      child: ChatStateSwitcher(
+        alignment: Alignment.centerLeft,
+        child: Row(
+          key: ValueKey<bool>(isConnected),
+          children: [
+            Icon(
+              isConnected ? Icons.cloud_done : Icons.data_object,
+              size: 18,
+              color: color,
             ),
-          ),
-        ],
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                isConnected
+                    ? 'Supabase realtime connected'
+                    : 'Local preview data',
+                style: theme.textTheme.labelLarge?.copyWith(color: color),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -3708,6 +4895,7 @@ class _BackendStatusPill extends StatelessWidget {
 
 class _ThreadTile extends StatelessWidget {
   const _ThreadTile({
+    super.key,
     required this.thread,
     required this.isSelected,
     required this.onTap,
@@ -3726,7 +4914,10 @@ class _ThreadTile extends StatelessWidget {
       onTap: onTap,
       borderRadius: BorderRadius.circular(8),
       child: AnimatedContainer(
-        duration: const Duration(milliseconds: 180),
+        duration: context.chatMotion.duration(
+          context.chatMotion.theme.standardDuration,
+        ),
+        curve: Curves.easeOutCubic,
         padding: const EdgeInsets.all(12),
         decoration: BoxDecoration(
           color: isSelected ? selectedColor : theme.colorScheme.surface,
@@ -3769,27 +4960,42 @@ class _ThreadTile extends StatelessWidget {
                   Row(
                     children: [
                       Expanded(
-                        child: Text(
-                          thread.displaySubtitle,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: theme.textTheme.bodyMedium?.copyWith(
-                            color: thread.isTyping
-                                ? const Color(0xFF127A74)
-                                : theme.colorScheme.onSurfaceVariant,
-                            fontWeight: thread.isTyping
-                                ? FontWeight.w700
-                                : null,
+                        child: ChatStateSwitcher(
+                          alignment: Alignment.centerLeft,
+                          offset: const Offset(0, 4),
+                          child: Text(
+                            thread.displaySubtitle,
+                            key: ValueKey<String>(
+                              '${thread.id}:${thread.displaySubtitle}',
+                            ),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: theme.textTheme.bodyMedium?.copyWith(
+                              color: thread.isTyping
+                                  ? const Color(0xFF127A74)
+                                  : theme.colorScheme.onSurfaceVariant,
+                              fontWeight: thread.isTyping
+                                  ? FontWeight.w700
+                                  : null,
+                            ),
                           ),
                         ),
                       ),
-                      if (thread.unreadCount > 0) ...[
-                        const SizedBox(width: 8),
-                        _UnreadBadge(
-                          key: Key('unread-badge-${thread.id}'),
-                          count: thread.unreadCount,
-                        ),
-                      ],
+                      ChatSizeFade(
+                        alignment: Alignment.centerRight,
+                        child: thread.unreadCount > 0
+                            ? Padding(
+                                key: ValueKey<String>(
+                                  'unread-${thread.id}-visible',
+                                ),
+                                padding: const EdgeInsets.only(left: 8),
+                                child: _UnreadBadge(
+                                  key: Key('unread-badge-${thread.id}'),
+                                  count: thread.unreadCount,
+                                ),
+                              )
+                            : null,
+                      ),
                     ],
                   ),
                 ],
@@ -3803,7 +5009,7 @@ class _ThreadTile extends StatelessWidget {
 }
 
 class _EmptyConversationPane extends StatelessWidget {
-  const _EmptyConversationPane();
+  const _EmptyConversationPane({super.key});
 
   @override
   Widget build(BuildContext context) {
@@ -3820,18 +5026,19 @@ class _EmptyConversationPane extends StatelessWidget {
   }
 }
 
-class _ConversationPane extends StatelessWidget {
+class _ConversationPane extends StatefulWidget {
   const _ConversationPane({
     super.key,
     required this.thread,
     required this.repository,
     required this.localMessages,
+    required this.insertionEvents,
     required this.stagedAttachment,
     required this.messageController,
     required this.isSending,
     required this.isRecordingVoice,
-    required this.voiceRecordingElapsed,
-    required this.voiceRecordingLevels,
+    required this.voiceRecordingVisuals,
+    required this.isVisible,
     required this.showBackButton,
     required this.onBackToInbox,
     required this.onSend,
@@ -3865,12 +5072,13 @@ class _ConversationPane extends StatelessWidget {
   final ChatThread thread;
   final ChatRepository repository;
   final List<ChatMessage> localMessages;
+  final ValueListenable<_MessageInsertionEvent?> insertionEvents;
   final _StagedMediaAttachment? stagedAttachment;
   final TextEditingController messageController;
   final bool isSending;
   final bool isRecordingVoice;
-  final Duration voiceRecordingElapsed;
-  final List<double> voiceRecordingLevels;
+  final _VoiceRecordingVisualController voiceRecordingVisuals;
+  final bool isVisible;
   final bool showBackButton;
   final VoidCallback onBackToInbox;
   final VoidCallback onSend;
@@ -3901,8 +5109,291 @@ class _ConversationPane extends StatelessWidget {
   final Future<void> Function(ChatMessage) onCopy;
 
   @override
+  State<_ConversationPane> createState() => _ConversationPaneState();
+}
+
+class _ConversationPaneState extends State<_ConversationPane>
+    with WidgetsBindingObserver, RouteAware {
+  final ScrollController messagesScrollController = ScrollController();
+  StreamSubscription<List<ChatMessage>>? _messageSubscription;
+  List<ChatMessage> _remoteMessages = const [];
+  final Set<String> _animatedMessageIds = {};
+  PageRoute<dynamic>? _route;
+  bool _routeVisible = true;
+  bool _appActive = true;
+  bool _markReadInFlight = false;
+  bool _receivedInitialRemoteSnapshot = false;
+  bool _didInitialScroll = false;
+  bool _isNearLatest = true;
+  int _unseenMessageCount = 0;
+  String? _lastReadFingerprint;
+
+  ChatThread get thread => widget.thread;
+  ChatRepository get repository => widget.repository;
+  List<ChatMessage> get localMessages => widget.localMessages;
+  _StagedMediaAttachment? get stagedAttachment => widget.stagedAttachment;
+  TextEditingController get messageController => widget.messageController;
+  bool get isSending => widget.isSending;
+  bool get isRecordingVoice => widget.isRecordingVoice;
+  _VoiceRecordingVisualController get voiceRecordingVisuals =>
+      widget.voiceRecordingVisuals;
+  bool get showBackButton => widget.showBackButton;
+  VoidCallback get onBackToInbox => widget.onBackToInbox;
+  VoidCallback get onSend => widget.onSend;
+  ValueChanged<ChatMediaSource> get onAttachMedia => widget.onAttachMedia;
+  VoidCallback get onToggleVoiceRecording => widget.onToggleVoiceRecording;
+  Future<void> Function() get onRemoveAttachment => widget.onRemoveAttachment;
+  VoidCallback get onRetryAttachment => widget.onRetryAttachment;
+  Future<void> Function(String) get onRetryOutboxMessage =>
+      widget.onRetryOutboxMessage;
+  ValueChanged<String> get onComposerChanged => widget.onComposerChanged;
+  VoidCallback get onStartAudioCall => widget.onStartAudioCall;
+  VoidCallback get onStartVideoCall => widget.onStartVideoCall;
+  VoidCallback get onStartGroupAudioCall => widget.onStartGroupAudioCall;
+  VoidCallback get onStartGroupVideoCall => widget.onStartGroupVideoCall;
+  GroupCallSessionSummary? get activeGroupCall => widget.activeGroupCall;
+  Future<void> Function(String) get onJoinGroupCall => widget.onJoinGroupCall;
+  VoidCallback get onOpenGroupDetails => widget.onOpenGroupDetails;
+  VoidCallback get onOpenProfile => widget.onOpenProfile;
+  VoidCallback get onSignOut => widget.onSignOut;
+  ChatMessage? get replyingTo => widget.replyingTo;
+  ChatMessage? get editingMessage => widget.editingMessage;
+  VoidCallback get onCancelComposerAction => widget.onCancelComposerAction;
+  ValueChanged<ChatMessage> get onReply => widget.onReply;
+  ValueChanged<ChatMessage> get onEdit => widget.onEdit;
+  Future<void> Function(ChatMessage) get onDelete => widget.onDelete;
+  Future<void> Function(ChatMessage) get onReact => widget.onReact;
+  Future<void> Function(ChatMessage, String) get onToggleReaction =>
+      widget.onToggleReaction;
+  Future<void> Function(ChatMessage) get onForward => widget.onForward;
+  Future<void> Function(ChatMessage) get onCopy => widget.onCopy;
+
+  List<ChatMessage> get _messages {
+    final messagesById = <String, ChatMessage>{
+      for (final message in _remoteMessages) message.id: message,
+      for (final message in localMessages) message.id: message,
+    };
+    return messagesById.values.toList()
+      ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    messagesScrollController.addListener(_handleScrollPosition);
+    widget.insertionEvents.addListener(_handleInsertionEvent);
+    _remoteMessages = ChatSeed.messagesFor(thread.id);
+    _bindMessageStream();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final nextRoute = ModalRoute.of(context);
+    if (nextRoute is PageRoute<dynamic> && !identical(nextRoute, _route)) {
+      if (_route != null) chatRouteObserver.unsubscribe(this);
+      _route = nextRoute;
+      _routeVisible = nextRoute.isCurrent;
+      chatRouteObserver.subscribe(this, nextRoute);
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant _ConversationPane oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.insertionEvents != widget.insertionEvents) {
+      oldWidget.insertionEvents.removeListener(_handleInsertionEvent);
+      widget.insertionEvents.addListener(_handleInsertionEvent);
+    }
+    if (oldWidget.repository != repository ||
+        oldWidget.thread.id != thread.id) {
+      _lastReadFingerprint = null;
+      _remoteMessages = ChatSeed.messagesFor(thread.id);
+      _animatedMessageIds.clear();
+      _receivedInitialRemoteSnapshot = false;
+      _didInitialScroll = false;
+      _isNearLatest = true;
+      _unseenMessageCount = 0;
+      _bindMessageStream();
+      return;
+    }
+
+    if (!oldWidget.isVisible && widget.isVisible) {
+      _scheduleMarkRead();
+      _scheduleScrollToLatest(initial: !_didInitialScroll);
+    }
+  }
+
+  @override
+  void dispose() {
+    chatRouteObserver.unsubscribe(this);
+    WidgetsBinding.instance.removeObserver(this);
+    widget.insertionEvents.removeListener(_handleInsertionEvent);
+    messagesScrollController.removeListener(_handleScrollPosition);
+    unawaited(_messageSubscription?.cancel());
+    messagesScrollController.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _appActive = state == AppLifecycleState.resumed;
+    if (_appActive) _scheduleMarkRead();
+  }
+
+  @override
+  void didPush() {
+    _routeVisible = true;
+    _scheduleMarkRead();
+  }
+
+  @override
+  void didPopNext() {
+    _routeVisible = true;
+    _scheduleMarkRead();
+  }
+
+  @override
+  void didPushNext() {
+    _routeVisible = false;
+  }
+
+  @override
+  void didPop() {
+    _routeVisible = false;
+  }
+
+  void _bindMessageStream() {
+    unawaited(_messageSubscription?.cancel());
+    _messageSubscription = repository
+        .watchMessages(thread.id)
+        .listen(
+          _handleRemoteMessages,
+          onError: (Object error, StackTrace stackTrace) {
+            debugPrint('[Message stream ${thread.id}] $error\n$stackTrace');
+          },
+        );
+  }
+
+  void _handleRemoteMessages(List<ChatMessage> messages) {
+    if (!mounted) return;
+    final existingIds = _messages.map((message) => message.id).toSet();
+    final newMessages = messages
+        .where((message) => !existingIds.contains(message.id))
+        .toList(growable: false);
+    final animateNewMessages = _receivedInitialRemoteSnapshot;
+    final shouldFollow = _isNearLatest;
+
+    setState(() {
+      _remoteMessages = messages;
+      if (animateNewMessages) {
+        _animatedMessageIds.addAll(newMessages.map((message) => message.id));
+        if (!shouldFollow) {
+          _unseenMessageCount += newMessages.length;
+        }
+      }
+      _receivedInitialRemoteSnapshot = true;
+    });
+
+    if (!_didInitialScroll) {
+      _scheduleScrollToLatest(initial: true);
+    } else if (newMessages.isNotEmpty && shouldFollow) {
+      _scheduleScrollToLatest();
+    }
+    _scheduleMarkRead();
+  }
+
+  void _handleInsertionEvent() {
+    final event = widget.insertionEvents.value;
+    if (!mounted || event == null || event.threadId != thread.id) return;
+    final shouldFollow = _isNearLatest;
+    setState(() {
+      _animatedMessageIds.add(event.messageId);
+      if (!shouldFollow) _unseenMessageCount += 1;
+    });
+    if (shouldFollow) _scheduleScrollToLatest();
+  }
+
+  void _handleScrollPosition() {
+    if (!messagesScrollController.hasClients) return;
+    final position = messagesScrollController.position;
+    final isNearLatest = position.maxScrollExtent - position.pixels <= 96;
+    if (isNearLatest == _isNearLatest &&
+        !(isNearLatest && _unseenMessageCount > 0)) {
+      return;
+    }
+    setState(() {
+      _isNearLatest = isNearLatest;
+      if (isNearLatest) _unseenMessageCount = 0;
+    });
+  }
+
+  void _scheduleMarkRead() {
+    if (!mounted ||
+        !repository.isConnected ||
+        !widget.isVisible ||
+        !_routeVisible ||
+        !_appActive ||
+        _markReadInFlight) {
+      return;
+    }
+
+    final unreadIncoming = _remoteMessages
+        .where((message) => !message.isMine && !message.isRead)
+        .toList(growable: false);
+    if (unreadIncoming.isEmpty) return;
+    final fingerprint = unreadIncoming.map((message) => message.id).join('|');
+    if (_lastReadFingerprint == fingerprint) return;
+
+    _lastReadFingerprint = fingerprint;
+    _markReadInFlight = true;
+    unawaited(
+      repository
+          .markConversationRead(thread.id)
+          .catchError((Object error, StackTrace stackTrace) {
+            if (_lastReadFingerprint == fingerprint) {
+              _lastReadFingerprint = null;
+            }
+            debugPrint('[Read receipt ${thread.id}] $error\n$stackTrace');
+          })
+          .whenComplete(() {
+            _markReadInFlight = false;
+          }),
+    );
+  }
+
+  void _scheduleScrollToLatest({bool explicit = false, bool initial = false}) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !messagesScrollController.hasClients) return;
+      if (!explicit && !initial && !_isNearLatest) return;
+      final target = messagesScrollController.position.maxScrollExtent;
+      final policy = context.chatMotion;
+      if (initial || policy.reduceMotion) {
+        messagesScrollController.jumpTo(target);
+      } else {
+        unawaited(
+          messagesScrollController.animateTo(
+            target,
+            duration: policy.theme.standardDuration,
+            curve: Curves.easeOutCubic,
+          ),
+        );
+      }
+      _didInitialScroll = true;
+      if (_unseenMessageCount > 0) {
+        setState(() {
+          _unseenMessageCount = 0;
+          _isNearLatest = true;
+        });
+      }
+    });
+  }
+
+  @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final messages = _messages;
 
     return Column(
       children: [
@@ -3930,12 +5421,16 @@ class _ConversationPane extends StatelessWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(
-                      thread.title,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: theme.textTheme.titleMedium?.copyWith(
-                        fontWeight: FontWeight.w800,
+                    ChatStateSwitcher(
+                      alignment: Alignment.centerLeft,
+                      child: Text(
+                        thread.title,
+                        key: ValueKey<String>('header-${thread.id}'),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.titleMedium?.copyWith(
+                          fontWeight: FontWeight.w800,
+                        ),
                       ),
                     ),
                     const SizedBox(height: 2),
@@ -3950,17 +5445,24 @@ class _ConversationPane extends StatelessWidget {
                         ),
                         const SizedBox(width: 6),
                         Flexible(
-                          child: Text(
-                            thread.activityLabel,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: theme.textTheme.labelMedium?.copyWith(
-                              color: thread.isTyping
-                                  ? const Color(0xFF127A74)
-                                  : theme.colorScheme.onSurfaceVariant,
-                              fontWeight: thread.isTyping
-                                  ? FontWeight.w700
-                                  : null,
+                          child: ChatStateSwitcher(
+                            alignment: Alignment.centerLeft,
+                            offset: const Offset(0, 4),
+                            child: Text(
+                              thread.activityLabel,
+                              key: ValueKey<String>(
+                                '${thread.id}:${thread.activityLabel}',
+                              ),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: theme.textTheme.labelMedium?.copyWith(
+                                color: thread.isTyping
+                                    ? const Color(0xFF127A74)
+                                    : theme.colorScheme.onSurfaceVariant,
+                                fontWeight: thread.isTyping
+                                    ? FontWeight.w700
+                                    : null,
+                              ),
                             ),
                           ),
                         ),
@@ -3969,14 +5471,19 @@ class _ConversationPane extends StatelessWidget {
                   ],
                 ),
               ),
+              IconButton(
+                tooltip: 'Safety numbers',
+                onPressed: () => _showSafetyNumbers(context),
+                icon: const Icon(Icons.shield_outlined),
+              ),
               if (thread.isGroup) ...[
                 IconButton(
-                  tooltip: 'Start voice group call',
+                  tooltip: 'Start voice group call (media E2EE is phase 2)',
                   onPressed: onStartGroupAudioCall,
                   icon: const Icon(Icons.call_outlined),
                 ),
                 IconButton(
-                  tooltip: 'Start video group call',
+                  tooltip: 'Start video group call (media E2EE is phase 2)',
                   onPressed: onStartGroupVideoCall,
                   icon: const Icon(Icons.videocam_outlined),
                 ),
@@ -3987,12 +5494,12 @@ class _ConversationPane extends StatelessWidget {
                 ),
               ] else ...[
                 IconButton(
-                  tooltip: 'Call',
+                  tooltip: 'Call (media E2EE is phase 2)',
                   onPressed: onStartAudioCall,
                   icon: const Icon(Icons.call_outlined),
                 ),
                 IconButton(
-                  tooltip: 'Video',
+                  tooltip: 'Video (media E2EE is phase 2)',
                   onPressed: onStartVideoCall,
                   icon: const Icon(Icons.videocam_outlined),
                 ),
@@ -4019,53 +5526,75 @@ class _ConversationPane extends StatelessWidget {
             ],
           ),
         Expanded(
-          child: StreamBuilder<List<ChatMessage>>(
-            stream: repository.watchMessages(thread.id),
-            builder: (context, snapshot) {
-              final remoteMessages =
-                  snapshot.data ?? ChatSeed.messagesFor(thread.id);
-              final messagesById = <String, ChatMessage>{
-                for (final message in remoteMessages) message.id: message,
-                for (final message in localMessages) message.id: message,
-              };
-              final messages = messagesById.values.toList()
-                ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
-
-              if (repository.isConnected && messages.isNotEmpty) {
-                unawaited(repository.markConversationRead(thread.id));
-              }
-
-              if (messages.isEmpty) {
-                return const _EmptyMessageList();
-              }
-
-              return ListView.builder(
-                padding: const EdgeInsets.fromLTRB(18, 18, 18, 24),
-                itemCount: messages.length,
-                itemBuilder: (context, index) {
-                  return _MessageBubble(
-                    message: messages[index],
-                    repository: repository,
-                    onRetry: () => onRetryOutboxMessage(messages[index].id),
-                    onReply: onReply,
-                    onEdit: onEdit,
-                    onDelete: onDelete,
-                    onReact: onReact,
-                    onToggleReaction: onToggleReaction,
-                    onForward: onForward,
-                    onCopy: onCopy,
-                  );
-                },
-              );
-            },
+          child: Stack(
+            children: [
+              Positioned.fill(
+                child: messages.isEmpty
+                    ? const _EmptyMessageList()
+                    : ListView.builder(
+                        controller: messagesScrollController,
+                        padding: const EdgeInsets.fromLTRB(18, 18, 18, 72),
+                        itemCount: messages.length,
+                        itemBuilder: (context, index) {
+                          final message = messages[index];
+                          return _AnimatedMessageEntry(
+                            key: ValueKey<String>(
+                              'message-entry-${message.id}',
+                            ),
+                            animate: _animatedMessageIds.contains(message.id),
+                            isMine: message.isMine,
+                            onComplete: () {
+                              if (!mounted) return;
+                              setState(() {
+                                _animatedMessageIds.remove(message.id);
+                              });
+                            },
+                            child: _MessageBubble(
+                              key: ValueKey<String>('message-${message.id}'),
+                              message: message,
+                              repository: repository,
+                              onRetry: () => onRetryOutboxMessage(message.id),
+                              onReply: onReply,
+                              onEdit: onEdit,
+                              onDelete: onDelete,
+                              onReact: onReact,
+                              onToggleReaction: onToggleReaction,
+                              onForward: onForward,
+                              onCopy: onCopy,
+                            ),
+                          );
+                        },
+                      ),
+              ),
+              if (_unseenMessageCount > 0)
+                Positioned(
+                  right: 16,
+                  bottom: 14,
+                  child: ChatEntrance(
+                    key: const ValueKey<String>('new-messages-control'),
+                    beginOffset: const Offset(0, 8),
+                    child: ChatPressScale(
+                      child: FilledButton.tonalIcon(
+                        onPressed: () =>
+                            _scheduleScrollToLatest(explicit: true),
+                        icon: const Icon(Icons.keyboard_arrow_down),
+                        label: Text(
+                          _unseenMessageCount == 1
+                              ? 'New message'
+                              : '$_unseenMessageCount new messages',
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+            ],
           ),
         ),
         _MessageComposer(
           controller: messageController,
           isSending: isSending,
           isRecordingVoice: isRecordingVoice,
-          voiceRecordingElapsed: voiceRecordingElapsed,
-          voiceRecordingLevels: voiceRecordingLevels,
+          voiceRecordingVisuals: voiceRecordingVisuals,
           stagedAttachment: stagedAttachment,
           replyingTo: replyingTo,
           editingMessage: editingMessage,
@@ -4078,6 +5607,268 @@ class _ConversationPane extends StatelessWidget {
           onSend: onSend,
         ),
       ],
+    );
+  }
+
+  Future<void> _showSafetyNumbers(BuildContext context) {
+    return showChatDialog<void>(
+      context: context,
+      builder: (context) => _SafetyNumbersDialog(
+        repository: repository,
+        conversationId: thread.id,
+      ),
+    );
+  }
+}
+
+class _SafetyNumbersDialog extends StatefulWidget {
+  const _SafetyNumbersDialog({
+    required this.repository,
+    required this.conversationId,
+  });
+
+  final ChatRepository repository;
+  final String conversationId;
+
+  @override
+  State<_SafetyNumbersDialog> createState() => _SafetyNumbersDialogState();
+}
+
+class _SafetyNumbersDialogState extends State<_SafetyNumbersDialog> {
+  late Future<List<ConversationSafetyIdentity>> _identities;
+  String? _verifyingUserId;
+  Object? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _reload();
+  }
+
+  void _reload() {
+    _identities = widget.repository.conversationSafetyIdentities(
+      widget.conversationId,
+    );
+  }
+
+  Future<void> _markVerified(ConversationSafetyIdentity identity) async {
+    final confirmed = await showChatDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Verify this identity?'),
+        content: const Text(
+          'Only continue after comparing this safety number with the other person through a trusted channel.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Mark verified'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    setState(() {
+      _verifyingUserId = identity.userId;
+      _error = null;
+    });
+    try {
+      await widget.repository.markSafetyIdentityVerified(identity);
+      if (!mounted) return;
+      setState(_reload);
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _error = error);
+    } finally {
+      if (mounted) {
+        setState(() => _verifyingUserId = null);
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return AlertDialog(
+      title: const Row(
+        children: [
+          Icon(Icons.shield_outlined),
+          SizedBox(width: 10),
+          Text('Safety numbers'),
+        ],
+      ),
+      content: SizedBox(
+        width: 440,
+        child: FutureBuilder<List<ConversationSafetyIdentity>>(
+          future: _identities,
+          builder: (context, snapshot) {
+            if (snapshot.connectionState != ConnectionState.done) {
+              return const Padding(
+                padding: EdgeInsets.all(24),
+                child: Center(child: CircularProgressIndicator()),
+              );
+            }
+            if (snapshot.hasError) {
+              return _SafetyNumbersError(
+                message: 'Could not load safety numbers: ${snapshot.error}',
+                onRetry: () => setState(_reload),
+              );
+            }
+
+            final identities = snapshot.data ?? const [];
+            if (identities.isEmpty) {
+              return const Text("Keys aren't ready for this conversation yet.");
+            }
+
+            return ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 430),
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Compare these fingerprints out of band. A changed verified identity blocks sending until you verify it again.',
+                      style: theme.textTheme.bodyMedium,
+                    ),
+                    const SizedBox(height: 16),
+                    for (final identity in identities) ...[
+                      _SafetyNumberIdentityCard(
+                        identity: identity,
+                        isVerifying: _verifyingUserId == identity.userId,
+                        onMarkVerified:
+                            identity.isVerified && !identity.hasChanged
+                            ? null
+                            : () => _markVerified(identity),
+                      ),
+                      const SizedBox(height: 10),
+                    ],
+                    if (_error != null) ...[
+                      const SizedBox(height: 2),
+                      Text(
+                        'Could not update verification: $_error',
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.error,
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            );
+          },
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Close'),
+        ),
+      ],
+    );
+  }
+}
+
+class _SafetyNumbersError extends StatelessWidget {
+  const _SafetyNumbersError({required this.message, required this.onRetry});
+
+  final String message;
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(message),
+        const SizedBox(height: 12),
+        OutlinedButton(onPressed: onRetry, child: const Text('Retry')),
+      ],
+    );
+  }
+}
+
+class _SafetyNumberIdentityCard extends StatelessWidget {
+  const _SafetyNumberIdentityCard({
+    required this.identity,
+    required this.isVerifying,
+    required this.onMarkVerified,
+  });
+
+  final ConversationSafetyIdentity identity;
+  final bool isVerifying;
+  final VoidCallback? onMarkVerified;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final status = switch ((identity.hasChanged, identity.isVerified)) {
+      (true, _) => 'Changed — sending blocked',
+      (false, true) => 'Verified',
+      (false, false) => 'Unverified',
+    };
+    final statusColor = identity.hasChanged
+        ? theme.colorScheme.error
+        : identity.isVerified
+        ? const Color(0xFF148A5B)
+        : theme.colorScheme.onSurfaceVariant;
+    final fingerprint = identity.fingerprint
+        .split(RegExp(r'\s+'))
+        .where((group) => group.isNotEmpty)
+        .join(' ');
+
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              identity.userId,
+              style: theme.textTheme.titleSmall?.copyWith(
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            const SizedBox(height: 5),
+            Text(
+              status,
+              style: theme.textTheme.labelLarge?.copyWith(
+                color: statusColor,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            const SizedBox(height: 10),
+            SelectableText(
+              fingerprint,
+              style: theme.textTheme.bodyMedium?.copyWith(
+                fontFeatures: const [FontFeature.tabularFigures()],
+                letterSpacing: 0.4,
+              ),
+            ),
+            if (onMarkVerified != null) ...[
+              const SizedBox(height: 12),
+              OutlinedButton.icon(
+                onPressed: isVerifying ? null : onMarkVerified,
+                icon: isVerifying
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.verified_user_outlined),
+                label: const Text('Mark verified'),
+              ),
+            ],
+          ],
+        ),
+      ),
     );
   }
 }
@@ -4104,56 +5895,58 @@ class _IncomingGroupCallOverlay extends StatelessWidget {
         child: Center(
           child: ConstrainedBox(
             constraints: const BoxConstraints(maxWidth: 380),
-            child: Card(
-              child: Padding(
-                padding: const EdgeInsets.all(20),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    CircleAvatar(
-                      radius: 34,
-                      backgroundColor: theme.colorScheme.primaryContainer,
-                      child: Icon(
-                        invite.isVideo ? Icons.videocam : Icons.call,
-                        color: theme.colorScheme.onPrimaryContainer,
-                        size: 32,
-                      ),
-                    ),
-                    const SizedBox(height: 16),
-                    Text(
-                      invite.title,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: theme.textTheme.titleLarge?.copyWith(
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
-                    const SizedBox(height: 6),
-                    Text(
-                      '${invite.callerName} started a '
-                      '${invite.isVideo ? 'video' : 'voice'} call',
-                      textAlign: TextAlign.center,
-                      style: theme.textTheme.bodyMedium?.copyWith(
-                        color: theme.colorScheme.onSurfaceVariant,
-                      ),
-                    ),
-                    const SizedBox(height: 22),
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        FilledButton.tonal(
-                          onPressed: onDecline,
-                          child: const Text('Not now'),
+            child: ChatSpringPop(
+              child: Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(20),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      CircleAvatar(
+                        radius: 34,
+                        backgroundColor: theme.colorScheme.primaryContainer,
+                        child: Icon(
+                          invite.isVideo ? Icons.videocam : Icons.call,
+                          color: theme.colorScheme.onPrimaryContainer,
+                          size: 32,
                         ),
-                        const SizedBox(width: 12),
-                        FilledButton.icon(
-                          onPressed: onJoin,
-                          icon: const Icon(Icons.call),
-                          label: const Text('Join'),
+                      ),
+                      const SizedBox(height: 16),
+                      Text(
+                        invite.title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.titleLarge?.copyWith(
+                          fontWeight: FontWeight.w800,
                         ),
-                      ],
-                    ),
-                  ],
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        '${invite.callerName} started a '
+                        '${invite.isVideo ? 'video' : 'voice'} call',
+                        textAlign: TextAlign.center,
+                        style: theme.textTheme.bodyMedium?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                      const SizedBox(height: 22),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          FilledButton.tonal(
+                            onPressed: onDecline,
+                            child: const Text('Not now'),
+                          ),
+                          const SizedBox(width: 12),
+                          FilledButton.icon(
+                            onPressed: onJoin,
+                            icon: const Icon(Icons.call),
+                            label: const Text('Join'),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -4227,11 +6020,18 @@ class _ActiveGroupCallOverlay extends StatelessWidget {
                               childAspectRatio: 1.25,
                             ),
                         itemCount: snapshot.participants.length,
-                        itemBuilder: (context, index) =>
-                            _GroupCallParticipantTile(
-                              participant: snapshot.participants[index],
+                        itemBuilder: (context, index) {
+                          final participant = snapshot.participants[index];
+                          return ChatSpringPop(
+                            key: ValueKey<String>(
+                              'participant-${participant.identity}',
+                            ),
+                            child: _GroupCallParticipantTile(
+                              participant: participant,
                               showVideo: isVideo,
                             ),
+                          );
+                        },
                       ),
               ),
               Padding(
@@ -4308,7 +6108,7 @@ class _GroupCallParticipantTile extends StatelessWidget {
           fit: StackFit.expand,
           children: [
             if (showVideo && track != null)
-              VideoTrackRenderer(track)
+              RepaintBoundary(child: VideoTrackRenderer(track))
             else
               Center(
                 child: CircleAvatar(
@@ -4380,13 +6180,18 @@ class _CallActionButton extends StatelessWidget {
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        IconButton.filled(
-          onPressed: onPressed,
-          style: IconButton.styleFrom(
-            backgroundColor: color ?? Colors.white24,
-            foregroundColor: Colors.white,
+        ChatPressScale(
+          child: IconButton.filled(
+            tooltip: label,
+            onPressed: onPressed,
+            style: IconButton.styleFrom(
+              backgroundColor: color ?? Colors.white24,
+              foregroundColor: Colors.white,
+            ),
+            icon: ChatStateSwitcher(
+              child: Icon(icon, key: ValueKey<IconData>(icon)),
+            ),
           ),
-          icon: Icon(icon),
         ),
         Text(
           label,
@@ -4417,55 +6222,59 @@ class _IncomingCallOverlay extends StatelessWidget {
         child: Center(
           child: ConstrainedBox(
             constraints: const BoxConstraints(maxWidth: 360),
-            child: Card(
-              child: Padding(
-                padding: const EdgeInsets.all(20),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    CircleAvatar(
-                      radius: 34,
-                      backgroundColor: theme.colorScheme.primaryContainer,
-                      child: Icon(
-                        invite.isVideo ? Icons.videocam : Icons.call,
-                        color: theme.colorScheme.onPrimaryContainer,
-                        size: 32,
-                      ),
-                    ),
-                    const SizedBox(height: 16),
-                    Text(
-                      invite.callerName,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: theme.textTheme.titleLarge?.copyWith(
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
-                    const SizedBox(height: 6),
-                    Text(
-                      invite.isVideo ? 'Incoming video call' : 'Incoming call',
-                      style: theme.textTheme.bodyMedium?.copyWith(
-                        color: theme.colorScheme.onSurfaceVariant,
-                      ),
-                    ),
-                    const SizedBox(height: 22),
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        FilledButton.tonalIcon(
-                          onPressed: onReject,
-                          icon: const Icon(Icons.call_end),
-                          label: const Text('Decline'),
+            child: ChatSpringPop(
+              child: Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(20),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      CircleAvatar(
+                        radius: 34,
+                        backgroundColor: theme.colorScheme.primaryContainer,
+                        child: Icon(
+                          invite.isVideo ? Icons.videocam : Icons.call,
+                          color: theme.colorScheme.onPrimaryContainer,
+                          size: 32,
                         ),
-                        const SizedBox(width: 12),
-                        FilledButton.icon(
-                          onPressed: onAccept,
-                          icon: const Icon(Icons.call),
-                          label: const Text('Answer'),
+                      ),
+                      const SizedBox(height: 16),
+                      Text(
+                        invite.callerName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.titleLarge?.copyWith(
+                          fontWeight: FontWeight.w800,
                         ),
-                      ],
-                    ),
-                  ],
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        invite.isVideo
+                            ? 'Incoming video call'
+                            : 'Incoming call',
+                        style: theme.textTheme.bodyMedium?.copyWith(
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                      const SizedBox(height: 22),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          FilledButton.tonalIcon(
+                            onPressed: onReject,
+                            icon: const Icon(Icons.call_end),
+                            label: const Text('Decline'),
+                          ),
+                          const SizedBox(width: 12),
+                          FilledButton.icon(
+                            onPressed: onAccept,
+                            icon: const Icon(Icons.call),
+                            label: const Text('Answer'),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -4494,6 +6303,7 @@ class _ActiveCallOverlay extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final isVideo = snapshot.mediaState.isVideoEnabled;
+    final motionSpec = _callWidgetMotionSpec(context);
     return Positioned.fill(
       child: Material(
         color: Colors.black,
@@ -4501,9 +6311,12 @@ class _ActiveCallOverlay extends StatelessWidget {
           children: [
             Positioned.fill(
               child: isVideo
-                  ? CallVideoView(
-                      renderer: snapshot.remoteRenderer,
-                      placeholderIcon: Icons.person,
+                  ? RepaintBoundary(
+                      key: ValueKey<String>('remote-${snapshot.callId}'),
+                      child: CallVideoView(
+                        renderer: snapshot.remoteRenderer,
+                        placeholderIcon: Icons.person,
+                      ),
                     )
                   : _AudioCallBackground(snapshot: snapshot),
             ),
@@ -4526,7 +6339,7 @@ class _ActiveCallOverlay extends StatelessWidget {
                       ),
                     ),
                     const SizedBox(height: 6),
-                    CallStatusLabel(snapshot: snapshot),
+                    CallStatusLabel(snapshot: snapshot, motionSpec: motionSpec),
                   ],
                 ),
               ),
@@ -4541,10 +6354,13 @@ class _ActiveCallOverlay extends StatelessWidget {
                     child: SizedBox(
                       width: 132,
                       height: 176,
-                      child: CallVideoView(
-                        renderer: snapshot.localRenderer,
-                        mirror: true,
-                        placeholderIcon: Icons.videocam_off,
+                      child: RepaintBoundary(
+                        key: ValueKey<String>('local-${snapshot.callId}'),
+                        child: CallVideoView(
+                          renderer: snapshot.localRenderer,
+                          mirror: true,
+                          placeholderIcon: Icons.videocam_off,
+                        ),
                       ),
                     ),
                   ),
@@ -4557,6 +6373,7 @@ class _ActiveCallOverlay extends StatelessWidget {
               child: CallControls(
                 mediaState: snapshot.mediaState,
                 showCameraControls: isVideo,
+                motionSpec: motionSpec,
                 onToggleMute: onToggleMute,
                 onToggleCamera: onToggleCamera,
                 onSwitchCamera: onSwitchCamera,
@@ -4568,6 +6385,16 @@ class _ActiveCallOverlay extends StatelessWidget {
       ),
     );
   }
+}
+
+CallWidgetMotionSpec _callWidgetMotionSpec(BuildContext context) {
+  final policy = context.chatMotion;
+  return CallWidgetMotionSpec(
+    statusTransitionDuration: policy.duration(policy.theme.standardDuration),
+    controlTransitionDuration: policy.duration(policy.theme.microDuration),
+    pressScale: policy.scale(policy.theme.pressScale),
+    reducedMotion: policy.reduceMotion,
+  );
 }
 
 class _AudioCallBackground extends StatelessWidget {
@@ -4630,8 +6457,121 @@ class _EmptyMessageList extends StatelessWidget {
   }
 }
 
-class _MessageBubble extends StatelessWidget {
+class _AnimatedMessageEntry extends StatefulWidget {
+  const _AnimatedMessageEntry({
+    super.key,
+    required this.animate,
+    required this.isMine,
+    required this.onComplete,
+    required this.child,
+  });
+
+  final bool animate;
+  final bool isMine;
+  final VoidCallback onComplete;
+  final Widget child;
+
+  @override
+  State<_AnimatedMessageEntry> createState() => _AnimatedMessageEntryState();
+}
+
+class _AnimatedMessageEntryState extends State<_AnimatedMessageEntry>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+  Timer? _settleTimer;
+  bool _didResolveDependencies = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController.unbounded(vsync: this, value: 1);
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_didResolveDependencies) return;
+    _didResolveDependencies = true;
+    if (widget.animate) _start();
+  }
+
+  @override
+  void didUpdateWidget(covariant _AnimatedMessageEntry oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.animate && !oldWidget.animate) _start();
+  }
+
+  @override
+  void dispose() {
+    _settleTimer?.cancel();
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _start() {
+    final policy = context.chatMotion;
+    _settleTimer?.cancel();
+    if (policy.reduceMotion) {
+      _controller.value = 1;
+      scheduleMicrotask(widget.onComplete);
+      return;
+    }
+
+    _controller.value = policy.theme.entryScale;
+    unawaited(
+      _controller.animateWith(
+        SpringSimulation(policy.theme.spring, policy.theme.entryScale, 1, 0),
+      ),
+    );
+    _settleTimer = Timer(policy.theme.maximumDuration, () {
+      if (!mounted) return;
+      _controller
+        ..stop()
+        ..value = 1;
+      widget.onComplete();
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = context.chatMotion.theme;
+    return RepaintBoundary(
+      child: AnimatedBuilder(
+        animation: _controller,
+        child: widget.child,
+        builder: (context, child) {
+          final scale = _controller.value
+              .clamp(theme.entryScale, theme.maximumOvershoot)
+              .toDouble();
+          final progress = ((scale - theme.entryScale) / (1 - theme.entryScale))
+              .clamp(0.0, 1.0)
+              .toDouble();
+          final beginOffset = Offset(
+            widget.isMine ? theme.standardOffset : -theme.standardOffset,
+            theme.standardOffset,
+          );
+          return Opacity(
+            opacity: progress,
+            child: Transform.translate(
+              offset: Offset.lerp(beginOffset, Offset.zero, progress)!,
+              child: Transform.scale(
+                alignment: widget.isMine
+                    ? Alignment.bottomRight
+                    : Alignment.bottomLeft,
+                scale: scale,
+                child: child,
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _MessageBubble extends StatefulWidget {
   const _MessageBubble({
+    super.key,
     required this.message,
     required this.repository,
     required this.onRetry,
@@ -4656,6 +6596,25 @@ class _MessageBubble extends StatelessWidget {
   final Future<void> Function(ChatMessage) onCopy;
 
   @override
+  State<_MessageBubble> createState() => _MessageBubbleState();
+}
+
+class _MessageBubbleState extends State<_MessageBubble> {
+  bool _actionsOpen = false;
+
+  ChatMessage get message => widget.message;
+  ChatRepository get repository => widget.repository;
+  Future<void> Function() get onRetry => widget.onRetry;
+  ValueChanged<ChatMessage> get onReply => widget.onReply;
+  ValueChanged<ChatMessage> get onEdit => widget.onEdit;
+  Future<void> Function(ChatMessage) get onDelete => widget.onDelete;
+  Future<void> Function(ChatMessage) get onReact => widget.onReact;
+  Future<void> Function(ChatMessage, String) get onToggleReaction =>
+      widget.onToggleReaction;
+  Future<void> Function(ChatMessage) get onForward => widget.onForward;
+  Future<void> Function(ChatMessage) get onCopy => widget.onCopy;
+
+  @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     if (message.messageType == ChatMessageType.call) {
@@ -4664,6 +6623,8 @@ class _MessageBubble extends StatelessWidget {
 
     final isMine = message.isMine;
     final media = message.media;
+    final encryptionUnavailable =
+        message.isLocked || message.hasInvalidEncryption;
     final hasText = message.body.trim().isNotEmpty;
     final bubbleColor = isMine
         ? theme.colorScheme.primary
@@ -4710,6 +6671,13 @@ class _MessageBubble extends StatelessWidget {
                 label: 'Forwarded',
                 color: textColor.withValues(alpha: 0.72),
               ),
+            if (message.encryptionState == ChatMessageEncryptionState.legacy &&
+                !message.isDeleted)
+              _MessageFlag(
+                icon: Icons.history_outlined,
+                label: 'Legacy (not end-to-end encrypted)',
+                color: textColor.withValues(alpha: 0.72),
+              ),
             if (message.replyTo case final reply?) ...[
               _ReplyPreviewCard(reply: reply, color: textColor),
               const SizedBox(height: 8),
@@ -4721,6 +6689,11 @@ class _MessageBubble extends StatelessWidget {
                   color: textColor.withValues(alpha: 0.72),
                   fontStyle: FontStyle.italic,
                 ),
+              )
+            else if (encryptionUnavailable)
+              _EncryptedMessageUnavailable(
+                isInvalid: message.hasInvalidEncryption,
+                color: textColor,
               )
             else ...[
               if (media != null) ...[
@@ -4795,13 +6768,24 @@ class _MessageBubble extends StatelessWidget {
             children: [
               GestureDetector(
                 behavior: HitTestBehavior.opaque,
-                onLongPress: message.isDeleted
+                onLongPress: message.isDeleted || encryptionUnavailable
                     ? null
                     : () => _showActions(context),
-                onSecondaryTapDown: message.isDeleted
+                onSecondaryTapDown: message.isDeleted || encryptionUnavailable
                     ? null
                     : (_) => _showActions(context),
-                child: bubble,
+                child: TweenAnimationBuilder<double>(
+                  tween: Tween<double>(end: _actionsOpen ? -4 : 0),
+                  duration: context.chatMotion.duration(
+                    context.chatMotion.theme.standardDuration,
+                  ),
+                  curve: Curves.easeOutCubic,
+                  child: bubble,
+                  builder: (context, offset, child) => Transform.translate(
+                    offset: Offset(0, offset),
+                    child: child,
+                  ),
+                ),
               ),
               if (message.reactions.isNotEmpty) ...[
                 const SizedBox(height: 4),
@@ -4810,14 +6794,29 @@ class _MessageBubble extends StatelessWidget {
                   runSpacing: 4,
                   children: message.reactions
                       .map(
-                        (reaction) => ActionChip(
-                          visualDensity: VisualDensity.compact,
-                          backgroundColor: reaction.reactedByMe
-                              ? theme.colorScheme.primaryContainer
-                              : theme.colorScheme.surfaceContainerHighest,
-                          label: Text('${reaction.emoji} ${reaction.count}'),
-                          onPressed: () => unawaited(
-                            onToggleReaction(message, reaction.emoji),
+                        (reaction) => ChatSpringPop(
+                          key: ValueKey<String>(
+                            '${message.id}:${reaction.emoji}',
+                          ),
+                          child: ActionChip(
+                            visualDensity: VisualDensity.compact,
+                            backgroundColor: reaction.reactedByMe
+                                ? theme.colorScheme.primaryContainer
+                                : theme.colorScheme.surfaceContainerHighest,
+                            label: ChatStateSwitcher(
+                              child: Text(
+                                '${reaction.emoji} ${reaction.count}',
+                                key: ValueKey<int>(reaction.count),
+                              ),
+                            ),
+                            onPressed: encryptionUnavailable
+                                ? null
+                                : () {
+                                    unawaited(ChatHaptics.selection());
+                                    unawaited(
+                                      onToggleReaction(message, reaction.emoji),
+                                    );
+                                  },
                           ),
                         ),
                       )
@@ -4832,51 +6831,66 @@ class _MessageBubble extends StatelessWidget {
   }
 
   Future<void> _showActions(BuildContext context) async {
+    if (message.isLocked || message.hasInvalidEncryption) {
+      return;
+    }
     final sent = message.sendState == ChatMessageSendState.sent;
-    final action = await showModalBottomSheet<_MessageAction>(
-      context: context,
-      builder: (context) => SafeArea(
-        child: Wrap(
-          children: [
-            if (sent) ...[
-              _MessageActionTile(
-                icon: Icons.reply,
-                label: 'Reply',
-                action: _MessageAction.reply,
-              ),
-              _MessageActionTile(
-                icon: Icons.add_reaction_outlined,
-                label: 'React',
-                action: _MessageAction.react,
-              ),
-              _MessageActionTile(
-                icon: Icons.forward,
-                label: 'Forward',
-                action: _MessageAction.forward,
-              ),
+    setState(() {
+      _actionsOpen = true;
+    });
+    _MessageAction? action;
+    try {
+      action = await showChatModalBottomSheet<_MessageAction>(
+        context: context,
+        builder: (context) => SafeArea(
+          child: Wrap(
+            children: [
+              if (sent) ...[
+                _MessageActionTile(
+                  icon: Icons.reply,
+                  label: 'Reply',
+                  action: _MessageAction.reply,
+                ),
+                _MessageActionTile(
+                  icon: Icons.add_reaction_outlined,
+                  label: 'React',
+                  action: _MessageAction.react,
+                ),
+                _MessageActionTile(
+                  icon: Icons.forward,
+                  label: 'Forward',
+                  action: _MessageAction.forward,
+                ),
+              ],
+              if (message.body.trim().isNotEmpty)
+                _MessageActionTile(
+                  icon: Icons.copy_outlined,
+                  label: 'Copy',
+                  action: _MessageAction.copy,
+                ),
+              if (message.isMine && sent) ...[
+                _MessageActionTile(
+                  icon: Icons.edit_outlined,
+                  label: 'Edit',
+                  action: _MessageAction.edit,
+                ),
+                _MessageActionTile(
+                  icon: Icons.delete_outline,
+                  label: 'Delete',
+                  action: _MessageAction.delete,
+                ),
+              ],
             ],
-            if (message.body.trim().isNotEmpty)
-              _MessageActionTile(
-                icon: Icons.copy_outlined,
-                label: 'Copy',
-                action: _MessageAction.copy,
-              ),
-            if (message.isMine && sent) ...[
-              _MessageActionTile(
-                icon: Icons.edit_outlined,
-                label: 'Edit',
-                action: _MessageAction.edit,
-              ),
-              _MessageActionTile(
-                icon: Icons.delete_outline,
-                label: 'Delete',
-                action: _MessageAction.delete,
-              ),
-            ],
-          ],
+          ),
         ),
-      ),
-    );
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _actionsOpen = false;
+        });
+      }
+    }
     if (action == null) return;
     switch (action) {
       case _MessageAction.reply:
@@ -4898,6 +6912,42 @@ class _MessageBubble extends StatelessWidget {
         await onCopy(message);
         return;
     }
+  }
+}
+
+class _EncryptedMessageUnavailable extends StatelessWidget {
+  const _EncryptedMessageUnavailable({
+    required this.isInvalid,
+    required this.color,
+  });
+
+  final bool isInvalid;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(
+          isInvalid ? Icons.gpp_bad_outlined : Icons.lock_outline,
+          size: 18,
+          color: color.withValues(alpha: 0.82),
+        ),
+        const SizedBox(width: 8),
+        Flexible(
+          child: Text(
+            isInvalid
+                ? 'Could not verify this encrypted message.'
+                : 'Encrypted message unavailable on this device.',
+            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+              color: color.withValues(alpha: 0.82),
+              fontStyle: FontStyle.italic,
+            ),
+          ),
+        ),
+      ],
+    );
   }
 }
 
@@ -5004,7 +7054,13 @@ class _CallEventBubble extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final text = message.body.trim().isEmpty ? 'Call updated' : message.body;
+    final text = switch (message.callEvent?.trim().toLowerCase()) {
+      'started' => 'Call started',
+      'ended' => 'Call ended',
+      'failed' => 'Call failed',
+      'rejected' => 'Call declined',
+      _ => 'Call updated',
+    };
 
     return Align(
       alignment: Alignment.center,
@@ -5049,6 +7105,21 @@ class _CallEventBubble extends StatelessWidget {
   }
 }
 
+class _MotionHero extends StatelessWidget {
+  const _MotionHero({required this.tag, required this.child});
+
+  final Object tag;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return HeroMode(
+      enabled: context.chatMotion.heroEnabled,
+      child: Hero(tag: tag, child: child),
+    );
+  }
+}
+
 class _MessageMediaPreview extends StatelessWidget {
   const _MessageMediaPreview({
     required this.message,
@@ -5077,7 +7148,8 @@ class _MessageMediaPreview extends StatelessWidget {
       borderRadius: borderRadius,
       onTap: () {
         Navigator.of(context).push(
-          MaterialPageRoute<void>(
+          ChatMediaPageRoute<void>(
+            context: context,
             builder: (context) => _MediaViewerPage(
               message: message,
               media: media,
@@ -5088,7 +7160,7 @@ class _MessageMediaPreview extends StatelessWidget {
       },
       child: Stack(
         children: [
-          Hero(
+          _MotionHero(
             tag: _mediaHeroTag(message),
             child: ClipRRect(
               borderRadius: borderRadius,
@@ -5218,10 +7290,9 @@ class _VoiceMessagePreview extends StatelessWidget {
 }
 
 class _VoiceRecordingCard extends StatelessWidget {
-  const _VoiceRecordingCard({required this.elapsed, required this.levels});
+  const _VoiceRecordingCard({required this.visuals});
 
-  final Duration elapsed;
-  final List<double> levels;
+  final _VoiceRecordingVisualController visuals;
 
   @override
   Widget build(BuildContext context) {
@@ -5240,17 +7311,25 @@ class _VoiceRecordingCard extends StatelessWidget {
         children: [
           Icon(Icons.fiber_manual_record, color: color, size: 14),
           const SizedBox(width: 8),
-          Text(
-            _formatDuration(elapsed),
-            style: theme.textTheme.labelLarge?.copyWith(
-              color: color,
-              fontWeight: FontWeight.w800,
+          ValueListenableBuilder<Duration>(
+            valueListenable: visuals.elapsed,
+            builder: (context, elapsed, child) => Semantics(
+              label: 'Recording ${_spokenDuration(elapsed)}',
+              child: ExcludeSemantics(
+                child: Text(
+                  _formatDuration(elapsed),
+                  style: theme.textTheme.labelLarge?.copyWith(
+                    color: color,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ),
             ),
           ),
           const SizedBox(width: 12),
           Expanded(
-            child: _VoiceWaveform(
-              levels: levels,
+            child: _LiveVoiceWaveform(
+              visuals: visuals,
               height: 32,
               barColor: color,
               trackColor: color.withValues(alpha: 0.18),
@@ -5260,6 +7339,164 @@ class _VoiceRecordingCard extends StatelessWidget {
       ),
     );
   }
+}
+
+class _LiveVoiceWaveform extends StatefulWidget {
+  const _LiveVoiceWaveform({
+    required this.visuals,
+    required this.height,
+    required this.barColor,
+    required this.trackColor,
+  });
+
+  final _VoiceRecordingVisualController visuals;
+  final double height;
+  final Color barColor;
+  final Color trackColor;
+
+  @override
+  State<_LiveVoiceWaveform> createState() => _LiveVoiceWaveformState();
+}
+
+class _LiveVoiceWaveformState extends State<_LiveVoiceWaveform>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _animation;
+  List<double> _fromLevels = const [];
+  List<double> _toLevels = const [];
+
+  @override
+  void initState() {
+    super.initState();
+    _animation = AnimationController(vsync: this, value: 1);
+    _toLevels = List<double>.of(widget.visuals.levels);
+    _fromLevels = _toLevels;
+    widget.visuals.addListener(_handleLevelsChanged);
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final policy = context.chatMotion;
+    _animation.duration = policy.duration(const Duration(milliseconds: 120));
+    if (policy.reduceMotion) _animation.value = 1;
+  }
+
+  @override
+  void didUpdateWidget(covariant _LiveVoiceWaveform oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.visuals != widget.visuals) {
+      oldWidget.visuals.removeListener(_handleLevelsChanged);
+      widget.visuals.addListener(_handleLevelsChanged);
+      _fromLevels = const [];
+      _toLevels = List<double>.of(widget.visuals.levels);
+      _animation.value = 1;
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.visuals.removeListener(_handleLevelsChanged);
+    _animation.dispose();
+    super.dispose();
+  }
+
+  void _handleLevelsChanged() {
+    if (!mounted) return;
+    final current = _interpolateWaveformLevels(
+      _fromLevels,
+      _toLevels,
+      Curves.easeOutCubic.transform(_animation.value),
+    );
+    setState(() {
+      _fromLevels = current;
+      _toLevels = List<double>.of(widget.visuals.levels);
+    });
+    if (context.chatMotion.reduceMotion) {
+      _animation.value = 1;
+    } else {
+      unawaited(_animation.forward(from: 0));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: widget.height,
+      child: CustomPaint(
+        painter: _LiveVoiceWaveformPainter(
+          animation: _animation,
+          fromLevels: _fromLevels,
+          toLevels: _toLevels,
+          barColor: widget.barColor,
+          trackColor: widget.trackColor,
+        ),
+        child: const SizedBox.expand(),
+      ),
+    );
+  }
+}
+
+class _LiveVoiceWaveformPainter extends CustomPainter {
+  _LiveVoiceWaveformPainter({
+    required this.animation,
+    required this.fromLevels,
+    required this.toLevels,
+    required this.barColor,
+    required this.trackColor,
+  }) : super(repaint: animation);
+
+  final Animation<double> animation;
+  final List<double> fromLevels;
+  final List<double> toLevels;
+  final Color barColor;
+  final Color trackColor;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    _paintVoiceWaveform(
+      canvas: canvas,
+      size: size,
+      levels: _waveformLevels(
+        _interpolateWaveformLevels(
+          fromLevels,
+          toLevels,
+          Curves.easeOutCubic.transform(animation.value),
+        ),
+      ),
+      barColor: barColor,
+      trackColor: trackColor,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _LiveVoiceWaveformPainter oldDelegate) {
+    return oldDelegate.animation != animation ||
+        !listEquals(oldDelegate.fromLevels, fromLevels) ||
+        !listEquals(oldDelegate.toLevels, toLevels) ||
+        oldDelegate.barColor != barColor ||
+        oldDelegate.trackColor != trackColor;
+  }
+}
+
+List<double> _interpolateWaveformLevels(
+  List<double> from,
+  List<double> to,
+  double progress,
+) {
+  if (from.isEmpty && to.isEmpty) return const [];
+  final count = math.max(from.length, to.length);
+  double sample(List<double> values, int index) {
+    if (values.isEmpty) return 0.08;
+    if (count <= 1 || values.length == 1) return values.first;
+    final sourceIndex = (index * (values.length - 1) / (count - 1)).round();
+    return values[sourceIndex];
+  }
+
+  return List<double>.generate(count, (index) {
+    final start = sample(from, index);
+    final end = sample(to, index);
+    return start + (end - start) * progress;
+  }, growable: false);
 }
 
 class _VoicePlaybackButton extends StatefulWidget {
@@ -5406,6 +7643,13 @@ class _VoicePlaybackButtonState extends State<_VoicePlaybackButton> {
       throw StateError('Missing media repository.');
     }
 
+    if (media.isEncrypted) {
+      final bytes = await repository.mediaBytes(media);
+      await player.setAudioSource(_BytesAudioSource(bytes, media.mimeType));
+      _loadedSourceKey = sourceKey;
+      return;
+    }
+
     final signedUrl = await repository.signedMediaUrl(media);
     await player.setUrl(signedUrl);
     _loadedSourceKey = sourceKey;
@@ -5504,41 +7748,65 @@ class _VoiceWaveformPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    if (size.width <= 0 || size.height <= 0) {
-      return;
-    }
-
-    final count = levels.length;
-    final gap = size.width < 180 ? 2.0 : 3.0;
-    final barWidth = math.max(2.0, (size.width - gap * (count - 1)) / count);
-    final radius = Radius.circular(barWidth / 2);
-    final centerY = size.height / 2;
-    final trackPaint = Paint()..color = trackColor;
-    final barPaint = Paint()..color = barColor;
-
-    for (var index = 0; index < count; index += 1) {
-      final left = index * (barWidth + gap);
-      final level = levels[index].clamp(0.0, 1.0).toDouble();
-      final barHeight = math.max(4.0, size.height * (0.22 + level * 0.78));
-      final fullRect = RRect.fromRectAndRadius(
-        Rect.fromLTWH(left, 0, barWidth, size.height),
-        radius,
-      );
-      final activeRect = RRect.fromRectAndRadius(
-        Rect.fromLTWH(left, centerY - barHeight / 2, barWidth, barHeight),
-        radius,
-      );
-
-      canvas.drawRRect(fullRect, trackPaint);
-      canvas.drawRRect(activeRect, barPaint);
-    }
+    _paintVoiceWaveform(
+      canvas: canvas,
+      size: size,
+      levels: levels,
+      barColor: barColor,
+      trackColor: trackColor,
+    );
   }
 
   @override
   bool shouldRepaint(covariant _VoiceWaveformPainter oldDelegate) {
-    return oldDelegate.levels != levels ||
+    return !listEquals(oldDelegate.levels, levels) ||
         oldDelegate.barColor != barColor ||
         oldDelegate.trackColor != trackColor;
+  }
+}
+
+void _paintVoiceWaveform({
+  required Canvas canvas,
+  required Size size,
+  required List<double> levels,
+  required Color barColor,
+  required Color trackColor,
+}) {
+  if (size.width <= 0 || size.height <= 0 || levels.isEmpty) return;
+
+  final preferredGap = size.width < 180 ? 2.0 : 3.0;
+  final maximumBars = math.max(1, (size.width / (2 + preferredGap)).floor());
+  final visibleLevels = levels.length <= maximumBars
+      ? levels
+      : _compactVoiceLevels(levels, target: maximumBars);
+  final count = visibleLevels.length;
+  final gap = count == 1
+      ? 0.0
+      : math.min(
+          preferredGap,
+          math.max(0.0, (size.width - count * 2) / (count - 1)),
+        );
+  final barWidth = math.max(1.0, (size.width - gap * (count - 1)) / count);
+  final radius = Radius.circular(barWidth / 2);
+  final centerY = size.height / 2;
+  final trackPaint = Paint()..color = trackColor;
+  final barPaint = Paint()..color = barColor;
+
+  for (var index = 0; index < count; index += 1) {
+    final left = index * (barWidth + gap);
+    final level = visibleLevels[index].clamp(0.0, 1.0).toDouble();
+    final barHeight = math.max(4.0, size.height * (0.22 + level * 0.78));
+    final fullRect = RRect.fromRectAndRadius(
+      Rect.fromLTWH(left, 0, barWidth, size.height),
+      radius,
+    );
+    final activeRect = RRect.fromRectAndRadius(
+      Rect.fromLTWH(left, centerY - barHeight / 2, barWidth, barHeight),
+      radius,
+    );
+
+    canvas.drawRRect(fullRect, trackPaint);
+    canvas.drawRRect(activeRect, barPaint);
   }
 }
 
@@ -5591,6 +7859,7 @@ class _ChatMediaImage extends StatefulWidget {
 
 class _ChatMediaImageState extends State<_ChatMediaImage> {
   Future<String>? _signedUrl;
+  Future<Uint8List>? _decryptedBytes;
 
   @override
   void initState() {
@@ -5608,7 +7877,11 @@ class _ChatMediaImageState extends State<_ChatMediaImage> {
   }
 
   void _syncSignedUrl() {
-    _signedUrl = widget.media.localBytes == null
+    _decryptedBytes =
+        widget.media.isEncrypted && widget.media.localBytes == null
+        ? widget.repository.mediaBytes(widget.media)
+        : null;
+    _signedUrl = widget.media.localBytes == null && !widget.media.isEncrypted
         ? widget.repository.signedMediaUrl(widget.media)
         : null;
   }
@@ -5622,6 +7895,39 @@ class _ChatMediaImageState extends State<_ChatMediaImage> {
         fit: widget.fit,
         gaplessPlayback: true,
         filterQuality: FilterQuality.high,
+      );
+    }
+
+    if (widget.media.isEncrypted) {
+      return FutureBuilder<Uint8List>(
+        future: _decryptedBytes,
+        builder: (context, snapshot) {
+          final bytes = snapshot.data;
+          if (bytes == null) {
+            if (snapshot.hasError) {
+              return ColoredBox(
+                color: Colors.black.withValues(alpha: 0.08),
+                child: const Center(child: Icon(Icons.broken_image_outlined)),
+              );
+            }
+            return ColoredBox(
+              color: Colors.black.withValues(alpha: 0.06),
+              child: const Center(
+                child: SizedBox(
+                  width: 22,
+                  height: 22,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+              ),
+            );
+          }
+          return Image.memory(
+            bytes,
+            fit: widget.fit,
+            gaplessPlayback: true,
+            filterQuality: FilterQuality.high,
+          );
+        },
       );
     }
 
@@ -5722,7 +8028,7 @@ class _MediaViewerPage extends StatelessWidget {
               child: InteractiveViewer(
                 minScale: 1,
                 maxScale: 4,
-                child: Hero(
+                child: _MotionHero(
                   tag: _mediaHeroTag(message),
                   child: SizedBox.expand(
                     child: _ChatMediaImage(
@@ -5796,8 +8102,12 @@ class _ReceiptIcon extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    late final String label;
+    late final Widget icon;
+
     if (message.sendState == ChatMessageSendState.failed) {
-      return IconButton(
+      label = 'Failed';
+      icon = IconButton(
         tooltip: message.sendError == null || message.sendError!.isEmpty
             ? 'Retry message'
             : 'Retry message: ${message.sendError}',
@@ -5808,60 +8118,63 @@ class _ReceiptIcon extends StatelessWidget {
         onPressed: () => unawaited(onRetry()),
         icon: Icon(Icons.error_outline, size: 15, color: fallbackColor),
       );
-    }
-
-    if (message.sendState == ChatMessageSendState.sending) {
-      return Icon(
+    } else if (message.sendState == ChatMessageSendState.sending) {
+      label = 'Sending';
+      icon = Icon(
         Icons.sync,
         key: const Key('message-status-sending'),
         size: 15,
         color: fallbackColor,
       );
-    }
-
-    if (message.sendState == ChatMessageSendState.pending) {
-      return Icon(
+    } else if (message.sendState == ChatMessageSendState.pending) {
+      label = 'Pending';
+      icon = Icon(
         Icons.schedule,
         key: const Key('message-status-pending'),
         size: 15,
         color: fallbackColor,
       );
-    }
-
-    if (message.isRead) {
-      return const Icon(
+    } else if (message.isRead) {
+      label = 'Read';
+      icon = const Icon(
         Icons.done_all,
         key: Key('message-status-read'),
         size: 15,
         color: Color(0xFF53BDEB),
       );
-    }
-
-    if (message.isDelivered) {
-      return Icon(
+    } else if (message.isDelivered) {
+      label = 'Delivered';
+      icon = Icon(
         Icons.done_all,
         key: const Key('message-status-delivered'),
         size: 15,
         color: fallbackColor,
       );
+    } else {
+      label = 'Sent';
+      icon = Icon(
+        Icons.done,
+        key: const Key('message-status-sent'),
+        size: 15,
+        color: fallbackColor,
+      );
     }
 
-    return Icon(
-      Icons.done,
-      key: const Key('message-status-sent'),
-      size: 15,
-      color: fallbackColor,
+    return Semantics(
+      label: label,
+      child: ExcludeSemantics(
+        child: ChatStateSwitcher(offset: const Offset(0, 3), child: icon),
+      ),
     );
   }
 }
 
-class _MessageComposer extends StatelessWidget {
+class _MessageComposer extends StatefulWidget {
   const _MessageComposer({
     required this.controller,
     required this.isSending,
     required this.isRecordingVoice,
-    required this.voiceRecordingElapsed,
-    required this.voiceRecordingLevels,
+    required this.voiceRecordingVisuals,
     required this.stagedAttachment,
     required this.replyingTo,
     required this.editingMessage,
@@ -5877,8 +8190,7 @@ class _MessageComposer extends StatelessWidget {
   final TextEditingController controller;
   final bool isSending;
   final bool isRecordingVoice;
-  final Duration voiceRecordingElapsed;
-  final List<double> voiceRecordingLevels;
+  final _VoiceRecordingVisualController voiceRecordingVisuals;
   final _StagedMediaAttachment? stagedAttachment;
   final ChatMessage? replyingTo;
   final ChatMessage? editingMessage;
@@ -5891,8 +8203,154 @@ class _MessageComposer extends StatelessWidget {
   final VoidCallback onSend;
 
   @override
+  State<_MessageComposer> createState() => _MessageComposerState();
+}
+
+class _MessageComposerState extends State<_MessageComposer> {
+  final LayerLink _attachmentLink = LayerLink();
+  final GlobalKey _attachmentAnchorKey = GlobalKey();
+  final FocusNode _attachmentFocus = FocusNode(debugLabel: 'attachment');
+  final List<FocusNode> _attachmentActionFocus = List.generate(
+    ChatMediaSource.values.length,
+    (index) => FocusNode(debugLabel: 'attachment-action-$index'),
+  );
+  OverlayEntry? _attachmentOverlay;
+  bool _attachmentMenuOpen = false;
+  bool _attachmentMenuAbove = true;
+
+  bool get _attachmentEnabled => !widget.isSending && !widget.isRecordingVoice;
+
+  @override
+  void didUpdateWidget(covariant _MessageComposer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!_attachmentEnabled && _attachmentMenuOpen) {
+      _closeAttachmentMenu();
+    }
+  }
+
+  @override
+  void dispose() {
+    _attachmentOverlay?.remove();
+    _attachmentFocus.dispose();
+    for (final focusNode in _attachmentActionFocus) {
+      focusNode.dispose();
+    }
+    super.dispose();
+  }
+
+  void _toggleAttachmentMenu() {
+    if (!_attachmentEnabled) return;
+    if (_attachmentMenuOpen) {
+      _closeAttachmentMenu();
+      return;
+    }
+
+    final anchorContext = _attachmentAnchorKey.currentContext;
+    final anchorBox = anchorContext?.findRenderObject() as RenderBox?;
+    final anchorTop = anchorBox?.localToGlobal(Offset.zero).dy ?? 0;
+    _attachmentMenuAbove = anchorTop > MediaQuery.sizeOf(context).height * 0.42;
+    _attachmentOverlay = OverlayEntry(builder: _buildAttachmentOverlay);
+    Overlay.of(context, rootOverlay: true).insert(_attachmentOverlay!);
+    setState(() {
+      _attachmentMenuOpen = true;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _attachmentMenuOpen) {
+        _attachmentActionFocus.first.requestFocus();
+      }
+    });
+  }
+
+  void _closeAttachmentMenu() {
+    _attachmentOverlay?.remove();
+    _attachmentOverlay = null;
+    if (mounted && _attachmentMenuOpen) {
+      setState(() {
+        _attachmentMenuOpen = false;
+      });
+      _attachmentFocus.requestFocus();
+    }
+  }
+
+  void _selectAttachment(ChatMediaSource source) {
+    _closeAttachmentMenu();
+    unawaited(ChatHaptics.selection());
+    widget.onAttachMedia(source);
+  }
+
+  Widget _buildAttachmentOverlay(BuildContext overlayContext) {
+    final actions = <(ChatMediaSource, IconData, String)>[
+      (ChatMediaSource.gallery, Icons.photo_library_outlined, 'Photo or GIF'),
+      (ChatMediaSource.giphy, Icons.gif_box_outlined, 'GIF'),
+      (ChatMediaSource.camera, Icons.photo_camera_outlined, 'Camera'),
+    ];
+    final beginOffset = _attachmentMenuAbove
+        ? const Offset(0, 8)
+        : const Offset(0, -8);
+
+    return CallbackShortcuts(
+      bindings: {
+        const SingleActivator(LogicalKeyboardKey.escape): _closeAttachmentMenu,
+      },
+      child: Stack(
+        children: [
+          Positioned.fill(
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: _closeAttachmentMenu,
+              child: const ColoredBox(color: Colors.transparent),
+            ),
+          ),
+          CompositedTransformFollower(
+            link: _attachmentLink,
+            showWhenUnlinked: false,
+            targetAnchor: _attachmentMenuAbove
+                ? Alignment.topLeft
+                : Alignment.bottomLeft,
+            followerAnchor: _attachmentMenuAbove
+                ? Alignment.bottomLeft
+                : Alignment.topLeft,
+            offset: Offset(0, _attachmentMenuAbove ? -8 : 8),
+            child: FocusTraversalGroup(
+              child: Material(
+                elevation: 8,
+                borderRadius: BorderRadius.circular(8),
+                clipBehavior: Clip.antiAlias,
+                color: Theme.of(overlayContext).colorScheme.surface,
+                child: IntrinsicWidth(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      for (var index = 0; index < actions.length; index++)
+                        ChatStagger(
+                          index: index,
+                          beginOffset: beginOffset,
+                          child: ListTile(
+                            key: Key(
+                              'attachment-option-${actions[index].$1.name}',
+                            ),
+                            focusNode: _attachmentActionFocus[index],
+                            leading: Icon(actions[index].$2),
+                            title: Text(actions[index].$3),
+                            onTap: () => _selectAttachment(actions[index].$1),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final policy = context.chatMotion;
+    final composerAction = widget.editingMessage ?? widget.replyingTo;
 
     return Container(
       padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
@@ -5907,113 +8365,146 @@ class _MessageComposer extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            if (replyingTo != null || editingMessage != null) ...[
-              _ComposerActionCard(
-                message: editingMessage ?? replyingTo!,
-                isEditing: editingMessage != null,
-                onCancel: onCancelComposerAction,
-              ),
-              const SizedBox(height: 10),
-            ],
-            if (stagedAttachment != null) ...[
-              _StagedAttachmentCard(
-                attachment: stagedAttachment!,
-                onRemove: onRemoveAttachment,
-                onRetry: onRetryAttachment,
-              ),
-              const SizedBox(height: 10),
-            ],
-            if (isRecordingVoice) ...[
-              _VoiceRecordingCard(
-                elapsed: voiceRecordingElapsed,
-                levels: voiceRecordingLevels,
-              ),
-              const SizedBox(height: 10),
-            ],
+            ChatSizeFade(
+              child: composerAction == null
+                  ? null
+                  : Padding(
+                      key: ValueKey<String>(
+                        'composer-action-${composerAction.id}',
+                      ),
+                      padding: const EdgeInsets.only(bottom: 10),
+                      child: _ComposerActionCard(
+                        message: composerAction,
+                        isEditing: widget.editingMessage != null,
+                        onCancel: widget.onCancelComposerAction,
+                      ),
+                    ),
+            ),
+            ChatSizeFade(
+              child: widget.stagedAttachment == null
+                  ? null
+                  : Padding(
+                      key: ValueKey<String>(
+                        'staged-${widget.stagedAttachment!.conversationId}-${widget.stagedAttachment!.status.name}',
+                      ),
+                      padding: const EdgeInsets.only(bottom: 10),
+                      child: _StagedAttachmentCard(
+                        attachment: widget.stagedAttachment!,
+                        onRemove: widget.onRemoveAttachment,
+                        onRetry: widget.onRetryAttachment,
+                      ),
+                    ),
+            ),
+            ChatSizeFade(
+              child: widget.isRecordingVoice
+                  ? Padding(
+                      key: const ValueKey<String>('recording-visible'),
+                      padding: const EdgeInsets.only(bottom: 10),
+                      child: _VoiceRecordingCard(
+                        visuals: widget.voiceRecordingVisuals,
+                      ),
+                    )
+                  : null,
+            ),
             Row(
               children: [
-                PopupMenuButton<ChatMediaSource>(
-                  tooltip: 'Attach',
-                  enabled: !isSending && !isRecordingVoice,
-                  icon: const Icon(Icons.add),
-                  onSelected: onAttachMedia,
-                  itemBuilder: (context) => const [
-                    PopupMenuItem(
-                      value: ChatMediaSource.gallery,
-                      child: ListTile(
-                        contentPadding: EdgeInsets.zero,
-                        leading: Icon(Icons.photo_library_outlined),
-                        title: Text('Photo or GIF'),
+                CompositedTransformTarget(
+                  link: _attachmentLink,
+                  child: ChatPressScale(
+                    enabled: _attachmentEnabled,
+                    child: IconButton(
+                      key: _attachmentAnchorKey,
+                      focusNode: _attachmentFocus,
+                      tooltip: _attachmentMenuOpen
+                          ? 'Close attachments'
+                          : 'Attach',
+                      onPressed: _attachmentEnabled
+                          ? _toggleAttachmentMenu
+                          : null,
+                      icon: AnimatedRotation(
+                        turns: _attachmentMenuOpen ? 0.125 : 0,
+                        duration: policy.duration(
+                          policy.theme.standardDuration,
+                        ),
+                        curve: Curves.easeOutCubic,
+                        child: const Icon(Icons.add),
                       ),
                     ),
-                    PopupMenuItem(
-                      value: ChatMediaSource.giphy,
-                      child: ListTile(
-                        contentPadding: EdgeInsets.zero,
-                        leading: Icon(Icons.gif_box_outlined),
-                        title: Text('GIF'),
-                      ),
-                    ),
-                    PopupMenuItem(
-                      value: ChatMediaSource.camera,
-                      child: ListTile(
-                        contentPadding: EdgeInsets.zero,
-                        leading: Icon(Icons.photo_camera_outlined),
-                        title: Text('Camera'),
-                      ),
-                    ),
-                  ],
-                ),
-                IconButton(
-                  tooltip: isRecordingVoice
-                      ? 'Stop voice message'
-                      : 'Record voice message',
-                  onPressed: isSending ? null : onToggleVoiceRecording,
-                  icon: Icon(
-                    isRecordingVoice ? Icons.stop : Icons.mic_none_outlined,
                   ),
-                  color: isRecordingVoice ? theme.colorScheme.error : null,
+                ),
+                ChatPressScale(
+                  enabled: !widget.isSending,
+                  child: IconButton(
+                    tooltip: widget.isRecordingVoice
+                        ? 'Stop voice message'
+                        : 'Record voice message',
+                    onPressed: widget.isSending
+                        ? null
+                        : widget.onToggleVoiceRecording,
+                    icon: ChatStateSwitcher(
+                      child: Icon(
+                        widget.isRecordingVoice
+                            ? Icons.stop
+                            : Icons.mic_none_outlined,
+                        key: ValueKey<bool>(widget.isRecordingVoice),
+                      ),
+                    ),
+                    color: widget.isRecordingVoice
+                        ? theme.colorScheme.error
+                        : null,
+                  ),
                 ),
                 Expanded(
                   child: TextField(
                     key: const Key('message-composer'),
-                    controller: controller,
-                    enabled: !isRecordingVoice,
+                    controller: widget.controller,
+                    enabled: !widget.isRecordingVoice,
                     minLines: 1,
                     maxLines: 4,
                     textInputAction: TextInputAction.newline,
-                    onChanged: onChanged,
+                    onChanged: widget.onChanged,
                     decoration: const InputDecoration(hintText: 'Message'),
                   ),
                 ),
                 const SizedBox(width: 8),
                 ValueListenableBuilder<TextEditingValue>(
-                  valueListenable: controller,
+                  valueListenable: widget.controller,
                   builder: (context, _, child) {
                     final uploadReady =
-                        stagedAttachment == null || stagedAttachment!.canSend;
+                        widget.stagedAttachment == null ||
+                        widget.stagedAttachment!.canSend;
                     final failed =
-                        stagedAttachment?.status ==
+                        widget.stagedAttachment?.status ==
                         _AttachmentUploadState.failed;
-                    return FilledButton(
-                      onPressed:
-                          isSending ||
-                              isRecordingVoice ||
-                              !uploadReady ||
-                              failed
-                          ? null
-                          : onSend,
-                      style: FilledButton.styleFrom(
-                        minimumSize: const Size(48, 48),
-                        padding: EdgeInsets.zero,
+                    final enabled =
+                        !widget.isSending &&
+                        !widget.isRecordingVoice &&
+                        uploadReady &&
+                        !failed;
+                    return ChatPressScale(
+                      enabled: enabled,
+                      child: FilledButton(
+                        onPressed: enabled ? widget.onSend : null,
+                        style: FilledButton.styleFrom(
+                          minimumSize: const Size(48, 48),
+                          padding: EdgeInsets.zero,
+                        ),
+                        child: ChatStateSwitcher(
+                          child: widget.isSending
+                              ? const SizedBox(
+                                  key: ValueKey<String>('composer-sending'),
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
+                                )
+                              : const Icon(
+                                  Icons.send,
+                                  key: ValueKey<String>('composer-send'),
+                                ),
+                        ),
                       ),
-                      child: isSending
-                          ? const SizedBox(
-                              width: 18,
-                              height: 18,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.send),
                     );
                   },
                 ),
@@ -6255,23 +8746,35 @@ class _Avatar extends StatelessWidget {
             ),
           ),
         ),
-        if (thread.isOnline || thread.isTyping)
-          Positioned(
-            right: -2,
-            bottom: -2,
-            child: Container(
-              width: 13,
-              height: 13,
-              decoration: BoxDecoration(
-                color: const Color(0xFF17A36B),
-                shape: BoxShape.circle,
-                border: Border.all(
-                  color: Theme.of(context).colorScheme.surface,
-                  width: 2,
+        Positioned(
+          right: -2,
+          bottom: -2,
+          child: AnimatedScale(
+            duration: context.chatMotion.duration(
+              context.chatMotion.theme.standardDuration,
+            ),
+            curve: Curves.easeOutCubic,
+            scale: thread.isOnline || thread.isTyping ? 1 : 0,
+            child: AnimatedOpacity(
+              duration: context.chatMotion.duration(
+                context.chatMotion.theme.microDuration,
+              ),
+              opacity: thread.isOnline || thread.isTyping ? 1 : 0,
+              child: Container(
+                width: 13,
+                height: 13,
+                decoration: BoxDecoration(
+                  color: const Color(0xFF17A36B),
+                  shape: BoxShape.circle,
+                  border: Border.all(
+                    color: Theme.of(context).colorScheme.surface,
+                    width: 2,
+                  ),
                 ),
               ),
             ),
           ),
+        ),
       ],
     );
   }
@@ -6284,20 +8787,27 @@ class _UnreadBadge extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final colorScheme = Theme.of(context).colorScheme;
-    return Container(
-      constraints: const BoxConstraints(minWidth: 22, minHeight: 22),
-      alignment: Alignment.center,
-      padding: const EdgeInsets.symmetric(horizontal: 7),
-      decoration: BoxDecoration(
-        color: colorScheme.error,
-        borderRadius: BorderRadius.circular(11),
-      ),
-      child: Text(
-        count > 99 ? '99+' : '$count',
-        style: Theme.of(context).textTheme.labelSmall?.copyWith(
-          color: colorScheme.onError,
-          fontWeight: FontWeight.w800,
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    final label = count > 99 ? '99+' : '$count';
+    return ChatSpringPop(
+      child: Container(
+        constraints: const BoxConstraints(minWidth: 22, minHeight: 22),
+        alignment: Alignment.center,
+        padding: const EdgeInsets.symmetric(horizontal: 7),
+        decoration: BoxDecoration(
+          color: colorScheme.error,
+          borderRadius: BorderRadius.circular(11),
+        ),
+        child: ChatStateSwitcher(
+          child: Text(
+            label,
+            key: ValueKey<String>(label),
+            style: theme.textTheme.labelSmall?.copyWith(
+              color: colorScheme.onError,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
         ),
       ),
     );
@@ -6325,6 +8835,15 @@ String _formatDuration(Duration duration) {
   final minutes = totalSeconds ~/ 60;
   final seconds = (totalSeconds % 60).toString().padLeft(2, '0');
   return '$minutes:$seconds';
+}
+
+String _spokenDuration(Duration duration) {
+  final totalSeconds = math.max(0, duration.inSeconds);
+  final minutes = totalSeconds ~/ 60;
+  final seconds = totalSeconds % 60;
+  if (minutes == 0) return '$seconds seconds';
+  if (seconds == 0) return '$minutes minutes';
+  return '$minutes minutes $seconds seconds';
 }
 
 double _voiceLevelFromDb(double db) {

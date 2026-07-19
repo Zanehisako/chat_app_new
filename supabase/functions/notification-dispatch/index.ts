@@ -33,6 +33,11 @@ type ProviderDependencies = {
   now: () => Date;
 };
 
+type GenericNotificationContent = {
+  title: string;
+  body: string;
+};
+
 export type DispatchDependencies = {
   env?: (name: string) => string | undefined;
   fetch?: typeof fetch;
@@ -83,7 +88,8 @@ export function createDispatchHandler(dependencies: DispatchDependencies = {}) {
     );
     if (expiryError) {
       return json({
-        error: `Could not drop expired call notifications: ${expiryError.message}`,
+        error:
+          `Could not drop expired call notifications: ${expiryError.message}`,
       }, 500);
     }
 
@@ -319,18 +325,17 @@ export async function sendFcm(
     };
   }
 
+  const content = genericNotificationContent(delivery);
+  const routingData = notificationRoutingData(delivery);
+  const isGroupCall = routingData.type === "group_call";
   const message: Record<string, unknown> = {
     token: delivery.token,
-    notification: { title: delivery.title, body: delivery.body },
-    data: stringifyData({
-      ...delivery.data,
-      notification_job_id: delivery.job_id,
-      message_id: delivery.message_id,
-      title: delivery.title,
-      body: delivery.body,
-    }),
+    // Push providers and their OS notification stores are outside the E2EE
+    // boundary. Never forward job copy or arbitrary job data: both may belong
+    // to an older plaintext job or contain encrypted payload material.
+    notification: content,
+    data: stringifyData(routingData),
   };
-  const isGroupCall = delivery.data.type === "group_call";
   if (delivery.platform === "android") {
     message.android = {
       priority: "HIGH",
@@ -339,7 +344,7 @@ export async function sendFcm(
         channel_id: isGroupCall ? "chat_calls" : "chat_messages",
         sound: "default",
         tag: isGroupCall
-          ? String(delivery.data.call_id ?? delivery.message_id)
+          ? routingData.call_id ?? delivery.message_id
           : delivery.message_id,
       },
     };
@@ -348,13 +353,18 @@ export async function sendFcm(
       headers: {
         "apns-priority": "10",
         "apns-collapse-id": isGroupCall
-          ? String(delivery.data.call_id ?? delivery.message_id)
+          ? routingData.call_id ?? delivery.message_id
           : delivery.message_id,
         ...(isGroupCall
           ? { "apns-expiration": String(Math.floor(Date.now() / 1000) + 300) }
           : {}),
       },
-      payload: { aps: { sound: "default" } },
+      payload: {
+        aps: {
+          alert: content,
+          sound: "default",
+        },
+      },
     };
   } else if (delivery.platform === "web") {
     const webAppUrl = webAppOrigin(env("WEB_APP_URL"));
@@ -369,13 +379,15 @@ export async function sendFcm(
     link.searchParams.set("conversation", delivery.conversation_id);
     if (isGroupCall) {
       link.searchParams.set("type", "group_call");
-      link.searchParams.set("call_id", String(delivery.data.call_id ?? ""));
+      if (routingData.call_id != null) {
+        link.searchParams.set("call_id", routingData.call_id);
+      }
     }
     message.webpush = {
       headers: { TTL: isGroupCall ? "300" : "2419200", Urgency: "high" },
       notification: {
         tag: isGroupCall
-          ? String(delivery.data.call_id ?? delivery.message_id)
+          ? routingData.call_id ?? delivery.message_id
           : delivery.message_id,
         renotify: false,
       },
@@ -416,7 +428,7 @@ export function resetPushProviderCachesForTesting() {
   wnsAccessToken = null;
 }
 
-async function sendWns(
+export async function sendWns(
   delivery: NotificationDelivery,
   env: (name: string) => string | undefined,
   fetchImpl: typeof fetch,
@@ -432,15 +444,21 @@ async function sendWns(
     return { ok: false, invalidToken: true, error: "Invalid WNS channel URI" };
   }
 
-  const isGroupCall = delivery.data.type === "group_call";
+  const content = genericNotificationContent(delivery);
+  const routingData = notificationRoutingData(delivery);
+  const isGroupCall = routingData.type === "group_call";
   const launchParams: Record<string, string> = {
-    type: isGroupCall ? "group_call" : "message",
-    conversation_id: delivery.conversation_id,
-    message_id: delivery.message_id,
+    type: routingData.type,
+    conversation_id: routingData.conversation_id,
+    message_id: routingData.message_id,
   };
   if (isGroupCall) {
-    launchParams.call_id = String(delivery.data.call_id ?? "");
-    launchParams.is_video = String(delivery.data.is_video ?? false);
+    if (routingData.call_id != null) {
+      launchParams.call_id = routingData.call_id;
+    }
+    if (routingData.is_video != null) {
+      launchParams.is_video = routingData.is_video;
+    }
   }
   const launch = new URLSearchParams(launchParams).toString();
   const response = await fetchImpl(url, {
@@ -454,10 +472,8 @@ async function sendWns(
     body: `<toast launch="${
       escapeXml(launch)
     }"><visual><binding template="ToastGeneric"><text>${
-      escapeXml(delivery.title)
-    }</text><text>${
-      escapeXml(delivery.body)
-    }</text></binding></visual></toast>`,
+      escapeXml(content.title)
+    }</text><text>${escapeXml(content.body)}</text></binding></visual></toast>`,
   });
   const body = await response.text();
   const notificationStatus = response.headers.get("x-wns-notificationstatus")
@@ -653,11 +669,69 @@ function stringifyData(data: Record<string, unknown>) {
   return result;
 }
 
+function genericNotificationContent(
+  delivery: NotificationDelivery,
+): GenericNotificationContent {
+  return isGroupCallNotification(delivery)
+    ? {
+      title: "Incoming group call",
+      body: "Open ChatApp to join it",
+    }
+    : {
+      title: "New message",
+      body: "Open ChatApp to read it",
+    };
+}
+
+/**
+ * Keep provider data to the identifiers needed to route a tap back into the
+ * app. In particular, do not spread `delivery.data`: SQL jobs from previous
+ * app versions may contain message previews, and future encrypted jobs may
+ * contain ciphertext or other protocol fields.
+ */
+function notificationRoutingData(
+  delivery: NotificationDelivery,
+): Record<string, string> {
+  const isGroupCall = isGroupCallNotification(delivery);
+  const data: Record<string, string> = {
+    type: isGroupCall ? "group_call" : "message",
+    notification_job_id: delivery.job_id,
+    conversation_id: delivery.conversation_id,
+    message_id: delivery.message_id,
+  };
+
+  if (isGroupCall) {
+    const callId = uuidValue(delivery.data.call_id);
+    if (callId != null) {
+      data.call_id = callId;
+    }
+    data.is_video = String(
+      delivery.data.is_video === true ||
+        delivery.data.is_video === "true",
+    );
+    return data;
+  }
+
+  return data;
+}
+
+function isGroupCallNotification(delivery: NotificationDelivery) {
+  return delivery.data.type === "group_call";
+}
+
+function uuidValue(value: unknown) {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const normalized = value.trim();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+      .test(normalized)
+    ? normalized
+    : null;
+}
+
 function fcmDataKey(key: string) {
   const normalized = key.toLowerCase();
-  if (normalized === "message_type") {
-    return "chat_message_type";
-  }
   if (
     normalized === "from" ||
     normalized.startsWith("google.") ||

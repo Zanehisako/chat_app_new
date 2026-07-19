@@ -318,6 +318,13 @@ enum ChatMessageType {
 
 enum ChatMessageSendState { sent, pending, sending, failed }
 
+/// The confidentiality state of a message as rendered by the client.
+///
+/// Legacy records predate protocol v1 and remain readable during rollout. New
+/// remote records must be [encrypted]; a missing or invalid local key is never
+/// treated as plaintext and instead becomes [locked] or [invalid].
+enum ChatMessageEncryptionState { legacy, encrypted, locked, invalid }
+
 enum ChatMediaSource { gallery, camera, giphy }
 
 class GiphyGif {
@@ -352,6 +359,13 @@ class ChatMedia {
     this.waveform = const [],
     this.originalName,
     this.localBytes,
+    this.isEncrypted = false,
+    this.conversationId,
+    this.messageId,
+    this.encryptionEpoch,
+    this.encryptionEpochId,
+    this.encryptionSenderDeviceId,
+    this.encryptionMetadata,
   });
 
   final String bucket;
@@ -364,6 +378,17 @@ class ChatMedia {
   final List<double> waveform;
   final String? originalName;
   final Uint8List? localBytes;
+
+  /// New media objects are opaque ciphertext in storage. These fields are
+  /// client-side context only; the original MIME type, filename, waveform and
+  /// dimensions are authenticated message payload data, not server metadata.
+  final bool isEncrypted;
+  final String? conversationId;
+  final String? messageId;
+  final int? encryptionEpoch;
+  final String? encryptionEpochId;
+  final String? encryptionSenderDeviceId;
+  final Map<String, dynamic>? encryptionMetadata;
 
   bool get isGif => mimeType.toLowerCase() == 'image/gif';
   bool get isVoice => mimeType.toLowerCase().startsWith('audio/');
@@ -390,6 +415,13 @@ class ChatMedia {
     List<double>? waveform,
     String? originalName,
     Uint8List? localBytes,
+    bool? isEncrypted,
+    String? conversationId,
+    String? messageId,
+    int? encryptionEpoch,
+    String? encryptionEpochId,
+    String? encryptionSenderDeviceId,
+    Map<String, dynamic>? encryptionMetadata,
   }) {
     return ChatMedia(
       bucket: bucket ?? this.bucket,
@@ -402,6 +434,14 @@ class ChatMedia {
       waveform: waveform ?? this.waveform,
       originalName: originalName ?? this.originalName,
       localBytes: localBytes ?? this.localBytes,
+      isEncrypted: isEncrypted ?? this.isEncrypted,
+      conversationId: conversationId ?? this.conversationId,
+      messageId: messageId ?? this.messageId,
+      encryptionEpoch: encryptionEpoch ?? this.encryptionEpoch,
+      encryptionEpochId: encryptionEpochId ?? this.encryptionEpochId,
+      encryptionSenderDeviceId:
+          encryptionSenderDeviceId ?? this.encryptionSenderDeviceId,
+      encryptionMetadata: encryptionMetadata ?? this.encryptionMetadata,
     );
   }
 
@@ -517,6 +557,12 @@ class ChatMessage {
     this.isForwarded = false,
     this.editedAt,
     this.deletedAt,
+    this.callEvent,
+    this.encryptionState = ChatMessageEncryptionState.legacy,
+    this.encryptionEpoch,
+    this.encryptionEpochId,
+    this.encryptionRevision,
+    this.encryptionError,
   });
 
   final String id;
@@ -537,14 +583,31 @@ class ChatMessage {
   final bool isForwarded;
   final DateTime? editedAt;
   final DateTime? deletedAt;
+  final String? callEvent;
+  final ChatMessageEncryptionState encryptionState;
+  final int? encryptionEpoch;
+  final String? encryptionEpochId;
+  final int? encryptionRevision;
+  final String? encryptionError;
 
   bool get hasMedia => media != null && messageType != ChatMessageType.text;
   bool get isDeleted => deletedAt != null;
   bool get isEdited => editedAt != null && !isDeleted;
+  bool get isEncrypted =>
+      encryptionState == ChatMessageEncryptionState.encrypted;
+  bool get isLocked => encryptionState == ChatMessageEncryptionState.locked;
+  bool get hasInvalidEncryption =>
+      encryptionState == ChatMessageEncryptionState.invalid;
 
   String get actionPreview {
     if (isDeleted) {
       return 'Message deleted';
+    }
+    if (isLocked) {
+      return 'Encrypted message unavailable';
+    }
+    if (hasInvalidEncryption) {
+      return 'Invalid encrypted message';
     }
     final text = body.trim();
     if (text.isNotEmpty) {
@@ -560,6 +623,7 @@ class ChatMessage {
   }
 
   ChatMessage copyWith({
+    String? senderName,
     String? body,
     ChatMessageType? messageType,
     ChatMedia? media,
@@ -568,6 +632,12 @@ class ChatMessage {
     bool? isForwarded,
     DateTime? editedAt,
     DateTime? deletedAt,
+    String? callEvent,
+    ChatMessageEncryptionState? encryptionState,
+    int? encryptionEpoch,
+    String? encryptionEpochId,
+    int? encryptionRevision,
+    String? encryptionError,
     bool clearReply = false,
     bool clearMedia = false,
   }) {
@@ -575,7 +645,7 @@ class ChatMessage {
       id: id,
       threadId: threadId,
       senderId: senderId,
-      senderName: senderName,
+      senderName: senderName ?? this.senderName,
       body: body ?? this.body,
       createdAt: createdAt,
       isMine: isMine,
@@ -590,6 +660,12 @@ class ChatMessage {
       isForwarded: isForwarded ?? this.isForwarded,
       editedAt: editedAt ?? this.editedAt,
       deletedAt: deletedAt ?? this.deletedAt,
+      callEvent: callEvent ?? this.callEvent,
+      encryptionState: encryptionState ?? this.encryptionState,
+      encryptionEpoch: encryptionEpoch ?? this.encryptionEpoch,
+      encryptionEpochId: encryptionEpochId ?? this.encryptionEpochId,
+      encryptionRevision: encryptionRevision ?? this.encryptionRevision,
+      encryptionError: encryptionError ?? this.encryptionError,
     );
   }
 
@@ -605,8 +681,15 @@ class ChatMessage {
     final isRead = isMine && (receipt?.isRead ?? false);
     final isDelivered = isMine && ((receipt?.isDelivered ?? false) || isRead);
     final deletedAt = _readOptionalTimestamp(row['deleted_at']);
+    final e2eeVersion = _readOptionalInt(
+      row['encryption_version'] ?? row['e2ee_version'],
+    );
+    final isE2ee = (e2eeVersion ?? 0) > 0;
     final mediaPath = row['media_path']?.toString();
-    final media = deletedAt != null || mediaPath == null || mediaPath.isEmpty
+    // Do not expose server-side media metadata before its authenticated payload
+    // is opened. A decrypted message replaces this with client-owned metadata.
+    final media =
+        deletedAt != null || isE2ee || mediaPath == null || mediaPath.isEmpty
         ? null
         : ChatMedia.fromSupabase(row);
     final messageType = ChatMessageType.fromValue(
@@ -622,7 +705,7 @@ class ChatMessage {
           '',
       senderId: senderId,
       senderName: row['sender_name']?.toString() ?? 'Unknown',
-      body: deletedAt == null ? row['body']?.toString() ?? '' : '',
+      body: deletedAt == null && !isE2ee ? row['body']?.toString() ?? '' : '',
       createdAt: _readRequiredTimestamp(row['created_at']),
       isMine: isMine,
       isDelivered: isDelivered,
@@ -634,6 +717,15 @@ class ChatMessage {
       isForwarded: row['is_forwarded'] == true,
       editedAt: _readOptionalTimestamp(row['edited_at']),
       deletedAt: deletedAt,
+      callEvent: row['call_event']?.toString(),
+      encryptionState: !isE2ee
+          ? ChatMessageEncryptionState.legacy
+          : ChatMessageEncryptionState.locked,
+      encryptionEpoch: _readOptionalInt(
+        row['e2ee_epoch_number'] ?? row['key_epoch'],
+      ),
+      encryptionEpochId: row['e2ee_epoch_id']?.toString(),
+      encryptionRevision: _readOptionalInt(row['e2ee_revision']),
     );
   }
 }

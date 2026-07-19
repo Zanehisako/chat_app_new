@@ -50,6 +50,11 @@ begin
     raise exception 'Creator was not made group admin';
   end if;
 
+  -- Historical fixtures are created under the pre-cutover state. New-message
+  -- behavior is exercised by the encrypted-message test instead.
+  update public.e2ee_rollout_config
+  set plaintext_cutover_at = null
+  where id = true;
   insert into public.messages (
     id, conversation_id, sender_id, sender_name, body, created_at
   ) values (
@@ -83,6 +88,9 @@ begin
   ) values (
     second_message_id, group_row.id, admin_id, 'Admin', 'After join', now()
   );
+  update public.e2ee_rollout_config
+  set plaintext_cutover_at = now()
+  where id = true;
   if (
     select count(*) from public.message_receipts
     where message_id = second_message_id
@@ -196,6 +204,10 @@ begin
     (direct_id, sender_id, recipient_id, base_time, base_time),
     (empty_direct_id, sender_id, outsider_id, base_time, base_time);
 
+  -- These rows represent messages written before E2EE v1 became mandatory.
+  update public.e2ee_rollout_config
+  set plaintext_cutover_at = null
+  where id = true;
   insert into public.messages (
     id, conversation_id, sender_id, sender_name, body, created_at
   ) values (
@@ -262,22 +274,27 @@ begin
     raise exception 'Direct read summary was incorrect';
   end if;
 
-  perform public.edit_message(direct_message_id, 'Edited direct message');
+  begin
+    perform public.edit_message(direct_message_id, 'Edited direct message');
+    raise exception 'Legacy edit was accepted after E2EE cutover';
+  exception
+    when others then
+      if sqlerrm = 'Legacy edit was accepted after E2EE cutover' then raise; end if;
+  end;
+  begin
+    perform * from public.delete_message(direct_message_id);
+    raise exception 'Legacy delete was accepted after E2EE cutover';
+  exception
+    when others then
+      if sqlerrm = 'Legacy delete was accepted after E2EE cutover' then raise; end if;
+  end;
   select * into summary
   from public.get_conversation_summaries()
   where conversation_id = direct_id;
-  if summary.latest_message_body <> 'Edited direct message' then
-    raise exception 'Edited latest message was not returned';
-  end if;
-
-  perform * from public.delete_message(direct_message_id);
-  select * into summary
-  from public.get_conversation_summaries()
-  where conversation_id = direct_id;
-  if summary.latest_message_deleted_at is null
-    or summary.latest_message_body <> ''
+  if summary.latest_message_deleted_at is not null
+    or summary.latest_message_body <> 'Original direct message'
     or summary.latest_message_type <> 'text' then
-    raise exception 'Deleted latest message was not returned as a tombstone';
+    raise exception 'Rejected legacy actions changed the direct summary';
   end if;
 
   insert into public.conversations (
@@ -326,6 +343,9 @@ begin
     after_join_message_id, group_id, sender_id, 'Sender', 'After join',
     base_time + interval '30 minutes'
   );
+  update public.e2ee_rollout_config
+  set plaintext_cutover_at = now()
+  where id = true;
 
   select * into summary
   from public.get_conversation_summaries()

@@ -14,11 +14,14 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:uuid/uuid.dart';
 
 import 'chat_models.dart';
+import 'e2ee_crypto_service.dart';
+import 'e2ee_draft_protector.dart';
 import 'outbox_message_sender.dart';
 import 'supabase_config.dart';
 
 class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
-  ChatRepository({this.client});
+  ChatRepository({this.client, E2eeCryptoService? crypto})
+    : _crypto = crypto ?? E2eeCryptoService.instance;
 
   static const mediaBucket = 'chat-media';
   static const giphyApiKey = String.fromEnvironment(
@@ -47,6 +50,7 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
   };
 
   final SupabaseClient? client;
+  final E2eeCryptoService _crypto;
   final ImagePicker _imagePicker = ImagePicker();
   final Uuid _uuid = const Uuid();
   RealtimeChannel? _presenceChannel;
@@ -57,6 +61,10 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
   final Set<String> _typingSubscribedConversations = {};
   final Map<String, Future<void>> _typingSubscribeFutures = {};
   final Map<String, bool> _typingValues = {};
+  final Map<String, E2eeDeviceIdentity> _deviceIdentities =
+      <String, E2eeDeviceIdentity>{};
+  Future<E2eeReadyState>? _e2eeLifecycle;
+  String? _e2eeLifecycleUserId;
 
   bool get isConnected => client != null;
 
@@ -107,6 +115,236 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
     }
 
     return 'You';
+  }
+
+  /// Establishes this device's account and device identity without ever
+  /// uploading private material. A newly generated recovery phrase must be
+  /// confirmed before registration or sending is allowed.
+  Future<E2eeReadyState> e2eeReadyState() async {
+    final supabase = client;
+    final user = supabase?.auth.currentUser;
+    if (supabase == null || user == null) {
+      return const E2eeReadyState();
+    }
+
+    final inFlight = _e2eeLifecycle;
+    if (inFlight != null && _e2eeLifecycleUserId == user.id) {
+      return inFlight;
+    }
+
+    final future = _loadE2eeReadyState(supabase, user.id);
+    _e2eeLifecycle = future;
+    _e2eeLifecycleUserId = user.id;
+    try {
+      return await future;
+    } finally {
+      if (identical(_e2eeLifecycle, future)) {
+        _e2eeLifecycle = null;
+        _e2eeLifecycleUserId = null;
+      }
+    }
+  }
+
+  Future<String?> recoveryPhrase() async {
+    final user = _currentUser;
+    if (user == null) return null;
+    return _crypto.getRecoveryPhrase(user.id);
+  }
+
+  Future<void> confirmRecoveryPhrase(String phrase) async {
+    final supabase = client;
+    final user = supabase?.auth.currentUser;
+    if (supabase == null || user == null) {
+      throw const E2eeCryptoException('Sign in before confirming recovery.');
+    }
+    await _crypto.confirmRecoveryPhrase(userId: user.id, phrase: phrase);
+    final state = await e2eeReadyState();
+    if (!state.isReadyForSending) {
+      throw const E2eeCryptoException(
+        'Confirm the recovery phrase before enabling encrypted messages.',
+      );
+    }
+  }
+
+  Future<void> restoreE2eeRecoveryPhrase(String phrase) async {
+    final supabase = client;
+    final user = supabase?.auth.currentUser;
+    if (supabase == null || user == null) {
+      throw const E2eeCryptoException('Sign in before restoring recovery.');
+    }
+    await _crypto.ensureReady(client: supabase, userId: user.id);
+    final restored = await _crypto.restoreFromRecoveryPhrase(
+      userId: user.id,
+      phrase: phrase,
+    );
+    await _registerE2eeState(supabase, restored);
+  }
+
+  Future<E2eeDraftProtector> e2eeDraftProtector() async {
+    await _requireE2eeReady();
+    return CryptoServiceDraftProtector(crypto: _crypto);
+  }
+
+  Future<List<ConversationSafetyIdentity>> conversationSafetyIdentities(
+    String conversationId,
+  ) async {
+    final supabase = client;
+    final user = supabase?.auth.currentUser;
+    if (supabase == null || user == null) {
+      return const <ConversationSafetyIdentity>[];
+    }
+    final rows = _mapRows(
+      await supabase.rpc(
+        'get_conversation_e2ee_key_material',
+        params: <String, dynamic>{'p_conversation_id': conversationId},
+      ),
+    );
+    final identities = <String, ConversationSafetyIdentity>{};
+    for (final row in rows) {
+      final userId = _nullableText(row['recipient_user_id']);
+      final signingPublicKey = _nullableText(row['account_signing_public_key']);
+      if (userId == null || signingPublicKey == null || userId == user.id) {
+        continue;
+      }
+      final trust = await _crypto.trustStateForAccount(
+        userId: userId,
+        signingPublicKey: signingPublicKey,
+      );
+      identities[userId] = ConversationSafetyIdentity(
+        userId: userId,
+        signingPublicKey: signingPublicKey,
+        fingerprint: trust.fingerprint,
+        isVerified: trust.isVerified,
+        hasChanged: trust.hasChanged,
+      );
+    }
+    final values = identities.values.toList()
+      ..sort((left, right) => left.userId.compareTo(right.userId));
+    return List<ConversationSafetyIdentity>.unmodifiable(values);
+  }
+
+  Future<void> markSafetyIdentityVerified(ConversationSafetyIdentity identity) {
+    return _crypto.markAccountIdentityVerified(
+      userId: identity.userId,
+      signingPublicKey: identity.signingPublicKey,
+    );
+  }
+
+  Future<E2eeReadyState> _loadE2eeReadyState(
+    SupabaseClient supabase,
+    String userId,
+  ) async {
+    final state = await _crypto.ensureReady(client: supabase, userId: userId);
+    if (state.isReadyForSending) {
+      return _registerE2eeState(supabase, state);
+    }
+    return state;
+  }
+
+  Future<E2eeReadyState> _registerE2eeState(
+    SupabaseClient supabase,
+    E2eeReadyState state,
+  ) async {
+    final account = state.account;
+    final device = state.device;
+    if (account == null || device == null || !state.isReadyForSending) {
+      throw const E2eeCryptoException(
+        'Confirm or restore the recovery phrase before registering this device.',
+      );
+    }
+    await supabase.rpc(
+      'register_e2ee_account',
+      params: <String, dynamic>{
+        'p_recovery_public_key': account.recoveryPublicKey,
+        'p_signing_public_key': account.signingPublicKey,
+        'p_protocol_version': account.protocolVersion,
+      },
+    );
+    try {
+      await _registerE2eeDevice(supabase, device);
+      return state;
+    } on E2eeCryptoException catch (error) {
+      if (!_isRevokedDeviceRegistrationError(error)) rethrow;
+      final replacement = await _crypto.replaceLocalDevice(
+        userId: account.userId,
+      );
+      final replacementDevice = replacement.device;
+      if (replacementDevice == null) {
+        throw const E2eeCryptoException(
+          'Could not create a replacement encrypted device.',
+        );
+      }
+      await _registerE2eeDevice(supabase, replacementDevice);
+      return replacement;
+    }
+  }
+
+  Future<void> _registerE2eeDevice(
+    SupabaseClient supabase,
+    E2eeDevice device,
+  ) async {
+    try {
+      final response = await supabase.functions.invoke(
+        'e2ee-register-device',
+        body: <String, dynamic>{
+          'device_id': device.id,
+          'encryption_public_key': device.encryptionPublicKey,
+          'signing_public_key': device.signingPublicKey,
+          'certificate': device.certificate,
+          'label': device.label,
+          'protocol_version': device.protocolVersion,
+        },
+      );
+      final data = response.data;
+      if (data is! Map) {
+        throw const E2eeCryptoException(
+          'Encrypted device registration returned an invalid response.',
+        );
+      }
+      final payload = Map<String, dynamic>.from(data);
+      final error = _nullableText(payload['error']);
+      if (error != null) throw E2eeCryptoException(error);
+      if (_nullableText(payload['device_id']) != device.id) {
+        throw const E2eeCryptoException(
+          'Encrypted device registration did not confirm this device.',
+        );
+      }
+    } on E2eeCryptoException {
+      rethrow;
+    } on FunctionException catch (error) {
+      final details = error.details;
+      final message = details is Map
+          ? _nullableText(details['error'])
+          : _nullableText(details);
+      throw E2eeCryptoException(
+        message ?? 'Could not register this encrypted device.',
+        error,
+      );
+    } catch (error) {
+      throw E2eeCryptoException(
+        'Could not register this encrypted device.',
+        error,
+      );
+    }
+  }
+
+  bool _isRevokedDeviceRegistrationError(E2eeCryptoException error) {
+    final message = error.message.toLowerCase();
+    return message.contains('revoked e2ee device') ||
+        message.contains('cannot be reactivated');
+  }
+
+  Future<E2eeReadyState> _requireE2eeReady() async {
+    final state = await e2eeReadyState();
+    if (state.isReadyForSending) return state;
+    if (state.requiresRecoveryPhraseRestore) {
+      throw const E2eeCryptoException(
+        'Restore this account’s recovery phrase before opening encrypted messages.',
+      );
+    }
+    throw const E2eeCryptoException(
+      'Confirm the 24-word recovery phrase before sending encrypted messages.',
+    );
   }
 
   Future<CurrentUserProfile> currentProfile() async {
@@ -1026,9 +1264,27 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
       throw const AuthException('Sign in before sending media.');
     }
 
+    final ready = await _requireE2eeReady();
+    final device = ready.device;
+    if (device == null) {
+      throw const E2eeCryptoException('This device has no encrypted identity.');
+    }
     final resolvedMessageId = messageId ?? _uuid.v4();
-    final objectPath =
-        '$conversationId/${user.id}/$resolvedMessageId${_extensionFor(pickedMedia)}';
+    final epoch = await _currentEpochForSend(
+      conversationId: conversationId,
+      ready: ready,
+    );
+    final encrypted = await _crypto.encryptMedia(
+      userId: user.id,
+      conversationId: conversationId,
+      messageId: resolvedMessageId,
+      epoch: epoch,
+      bytes: pickedMedia.bytes,
+      mediaId: _uuid.v4(),
+      mimeType: pickedMedia.mimeType,
+      fileName: pickedMedia.originalName,
+    );
+    final objectPath = '$conversationId/${user.id}/$resolvedMessageId.bin';
     final storage = supabase.storage.from(mediaBucket);
     final uploadUri = _chatMediaUploadUri(
       storageUrl: storage.url,
@@ -1042,9 +1298,9 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
     await _uploadBytesWithProgress(
       uri: uploadUri,
       headers: uploadHeaders,
-      bytes: pickedMedia.bytes,
-      fileName: pickedMedia.originalName,
-      mimeType: pickedMedia.mimeType,
+      bytes: encrypted.toStorageBytes(),
+      fileName: '$resolvedMessageId.bin',
+      mimeType: 'application/octet-stream',
       onProgress: onProgress,
       upsert: upsert,
     );
@@ -1063,6 +1319,13 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
         duration: pickedMedia.duration,
         waveform: pickedMedia.waveform,
         originalName: pickedMedia.originalName,
+        isEncrypted: true,
+        conversationId: conversationId,
+        messageId: resolvedMessageId,
+        encryptionEpoch: epoch.epochNumber,
+        encryptionEpochId: epoch.serverEpochId,
+        encryptionSenderDeviceId: device.id,
+        encryptionMetadata: encrypted.toJson(),
       ),
     );
   }
@@ -1102,6 +1365,11 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
     final supabase = client;
     if (supabase == null) {
       throw StateError('Local media does not need a signed URL.');
+    }
+    if (media.isEncrypted) {
+      throw StateError(
+        'Encrypted media must be downloaded and decrypted in memory.',
+      );
     }
 
     return supabase.storage
@@ -1168,7 +1436,15 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
       return localBytes;
     }
 
-    final signedUrl = await signedMediaUrl(media);
+    final supabase = client;
+    if (supabase == null) {
+      throw StateError('Encrypted media is unavailable in local preview.');
+    }
+    final signedUrl = media.isEncrypted
+        ? await supabase.storage
+              .from(media.bucket)
+              .createSignedUrl(media.path, const Duration(hours: 1).inSeconds)
+        : await signedMediaUrl(media);
     final response = await http.get(Uri.parse(signedUrl));
     if (response.statusCode < 200 || response.statusCode > 299) {
       throw MediaAttachmentException(
@@ -1178,7 +1454,50 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
             '${_compactLogValue(response.body)}',
       );
     }
-    return response.bodyBytes;
+    if (!media.isEncrypted) {
+      return response.bodyBytes;
+    }
+
+    final conversationId = media.conversationId;
+    final messageId = media.messageId;
+    final epochNumber = media.encryptionEpoch;
+    final senderDeviceId = media.encryptionSenderDeviceId;
+    final metadata = media.encryptionMetadata;
+    if (conversationId == null ||
+        messageId == null ||
+        epochNumber == null ||
+        senderDeviceId == null ||
+        metadata == null) {
+      throw const E2eeCryptoException(
+        'Encrypted media is missing authenticated key context.',
+      );
+    }
+    final epoch = await _epochForRecord(
+      conversationId: conversationId,
+      epochId: media.encryptionEpochId,
+      epochNumber: epochNumber,
+    );
+    if (epoch == null) {
+      throw const E2eeCryptoException(
+        'The key for this encrypted media is unavailable on this device.',
+      );
+    }
+    final sender = await _deviceIdentityFor(
+      conversationId: conversationId,
+      deviceId: senderDeviceId,
+    );
+    final encrypted = E2eeEncryptedMedia.fromJson(
+      Map<String, dynamic>.from(metadata),
+    ).withCiphertextBytes(response.bodyBytes);
+    return _crypto.decryptMedia(
+      conversationId: conversationId,
+      messageId: messageId,
+      encryptedMedia: encrypted,
+      epoch: epoch,
+      senderDevice: sender,
+      mimeType: media.mimeType,
+      fileName: media.originalName ?? '',
+    );
   }
 
   Future<void> deleteStagedMedia(ChatMedia media) async {
@@ -1207,52 +1526,111 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
     final controller = StreamController<List<ChatMessage>>();
     final messagesById = <String, Map<String, dynamic>>{};
     var receiptsByMessageId = <String, List<MessageReceipt>>{};
-    var reactionRows = <Map<String, dynamic>>[];
+    var legacyReactionRows = <Map<String, dynamic>>[];
+    var encryptedReactionRows = <Map<String, dynamic>>[];
     StreamSubscription<List<Map<String, dynamic>>>? messagesSubscription;
     StreamSubscription<List<Map<String, dynamic>>>? receiptsSubscription;
-    StreamSubscription<List<Map<String, dynamic>>>? reactionsSubscription;
+    StreamSubscription<List<Map<String, dynamic>>>? legacyReactionsSubscription;
+    StreamSubscription<List<Map<String, dynamic>>>?
+    encryptedReactionsSubscription;
+    var renderGeneration = 0;
 
     void emitMessages() {
       if (controller.isClosed) {
         return;
       }
-
-      final baseMessages = <String, ChatMessage>{
-        for (final row in messagesById.values)
-          row['id']?.toString() ?? '': ChatMessage.fromSupabase(
-            row,
-            localUserId: user.id,
-            receipt: _aggregateReceipts(
-              receiptsByMessageId[row['id']?.toString()],
+      final generation = ++renderGeneration;
+      final messageRows = messagesById.values
+          .map((row) => Map<String, dynamic>.from(row))
+          .toList(growable: false);
+      final receiptSnapshot = Map<String, List<MessageReceipt>>.from(
+        receiptsByMessageId,
+      );
+      final legacySnapshot = legacyReactionRows
+          .map((row) => Map<String, dynamic>.from(row))
+          .toList(growable: false);
+      final encryptedSnapshot = encryptedReactionRows
+          .map((row) => Map<String, dynamic>.from(row))
+          .toList(growable: false);
+      unawaited(() async {
+        try {
+          final hydrated = await Future.wait(
+            messageRows.map(
+              (row) => _hydrateEncryptedMessage(
+                row,
+                localUserId: user.id,
+                receipt: _aggregateReceipts(
+                  receiptSnapshot[row['id']?.toString()],
+                ),
+              ),
             ),
-          ),
-      };
-      final reactionsByMessageId = <String, List<Map<String, dynamic>>>{};
-      for (final row in reactionRows) {
-        reactionsByMessageId
-            .putIfAbsent(row['message_id']?.toString() ?? '', () => [])
-            .add(row);
-      }
+          );
+          final baseMessages = <String, ChatMessage>{
+            for (final message in hydrated) message.id: message,
+          };
+          final reactionsByMessageId = <String, List<Map<String, dynamic>>>{};
+          for (final row in legacySnapshot) {
+            final messageId = row['message_id']?.toString() ?? '';
+            if (baseMessages[messageId]?.isEncrypted ?? false) continue;
+            reactionsByMessageId.putIfAbsent(messageId, () => []).add(row);
+          }
+          final decryptedReactions = await Future.wait(
+            encryptedSnapshot.map(
+              (row) => _decryptEncryptedReaction(
+                row,
+                conversationId: conversationId,
+                messageId: row['message_id']?.toString() ?? '',
+              ),
+            ),
+          );
+          for (var index = 0; index < decryptedReactions.length; index += 1) {
+            final reaction = decryptedReactions[index];
+            if (reaction == null) continue;
+            final source = encryptedSnapshot[index];
+            final messageId = source['message_id']?.toString() ?? '';
+            if (!(baseMessages[messageId]?.isEncrypted ?? false)) continue;
+            reactionsByMessageId.putIfAbsent(messageId, () => []).add(
+              <String, dynamic>{
+                'emoji': reaction.emoji,
+                'user_id': source['user_id'],
+              },
+            );
+          }
 
-      final messages = messagesById.values.map((row) {
-        final messageId = row['id']?.toString() ?? '';
-        final replyId = row['reply_to_message_id']?.toString();
-        final replyMessage = replyId == null ? null : baseMessages[replyId];
-        return ChatMessage.fromSupabase(
-          row,
-          localUserId: user.id,
-          receipt: _aggregateReceipts(receiptsByMessageId[messageId]),
-          replyTo: replyMessage == null
-              ? null
-              : MessageReplyPreview.fromMessage(replyMessage),
-          reactions: summarizeMessageReactions(
-            reactionsByMessageId[messageId] ?? const [],
-            localUserId: user.id,
-          ),
-        );
-      }).toList()..sort((a, b) => a.createdAt.compareTo(b.createdAt));
-
-      controller.add(messages);
+          final messages = <ChatMessage>[];
+          for (final message in hydrated) {
+            final row = messageRows.firstWhere(
+              (candidate) => candidate['id']?.toString() == message.id,
+            );
+            final replyId =
+                message.encryptionState == ChatMessageEncryptionState.legacy
+                ? _nullableText(row['reply_to_message_id'])
+                : message.replyTo?.messageId;
+            final reply = replyId == null ? null : baseMessages[replyId];
+            messages.add(
+              message.isDeleted
+                  ? message
+                  : message.copyWith(
+                      replyTo: reply == null
+                          ? null
+                          : MessageReplyPreview.fromMessage(reply),
+                      reactions: summarizeMessageReactions(
+                        reactionsByMessageId[message.id] ?? const [],
+                        localUserId: user.id,
+                      ),
+                    ),
+            );
+          }
+          messages.sort((a, b) => a.createdAt.compareTo(b.createdAt));
+          if (!controller.isClosed && generation == renderGeneration) {
+            controller.add(messages);
+          }
+        } catch (error, stackTrace) {
+          if (!controller.isClosed && generation == renderGeneration) {
+            controller.addError(error, stackTrace);
+          }
+        }
+      }());
     }
 
     messagesSubscription = supabase
@@ -1285,19 +1663,29 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
           emitMessages();
         }, onError: controller.addError);
 
-    reactionsSubscription = supabase
+    legacyReactionsSubscription = supabase
         .from('message_reactions')
         .stream(primaryKey: ['message_id', 'user_id', 'emoji'])
         .eq('conversation_id', conversationId)
         .listen((rows) {
-          reactionRows = rows;
+          legacyReactionRows = rows;
+          emitMessages();
+        }, onError: controller.addError);
+
+    encryptedReactionsSubscription = supabase
+        .from('encrypted_message_reactions')
+        .stream(primaryKey: ['id'])
+        .eq('conversation_id', conversationId)
+        .listen((rows) {
+          encryptedReactionRows = rows;
           emitMessages();
         }, onError: controller.addError);
 
     controller.onCancel = () async {
       await messagesSubscription?.cancel();
       await receiptsSubscription?.cancel();
-      await reactionsSubscription?.cancel();
+      await legacyReactionsSubscription?.cancel();
+      await encryptedReactionsSubscription?.cancel();
     };
 
     return controller.stream;
@@ -1320,19 +1708,21 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
             schema: 'public',
             table: 'messages',
             callback: (payload) {
-              try {
-                final message = ChatMessage.fromSupabase(
-                  payload.newRecord,
-                  localUserId: user.id,
-                );
-                if (!message.isMine && !controller.isClosed) {
-                  controller.add(message);
+              unawaited(() async {
+                try {
+                  final message = await _hydrateEncryptedMessage(
+                    Map<String, dynamic>.from(payload.newRecord),
+                    localUserId: user.id,
+                  );
+                  if (!message.isMine && !controller.isClosed) {
+                    controller.add(message);
+                  }
+                } catch (error, stackTrace) {
+                  if (!controller.isClosed) {
+                    controller.addError(error, stackTrace);
+                  }
                 }
-              } catch (error, stackTrace) {
-                if (!controller.isClosed) {
-                  controller.addError(error, stackTrace);
-                }
-              }
+              }());
             },
           );
       channel.subscribe((status, error) {
@@ -1383,19 +1773,44 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
     if (user == null) {
       throw const AuthException('Sign in before sending messages.');
     }
-
-    final row = <String, dynamic>{
-      'conversation_id': conversationId,
-      'sender_id': user.id,
-      'sender_name': localSenderName,
-      'body': trimmed,
-      'reply_to_message_id': replyToMessageId,
-      'is_forwarded': isForwarded,
-    };
-    if (messageId != null) {
-      row['id'] = messageId;
+    final ready = await _requireE2eeReady();
+    final device = ready.device;
+    if (device == null) {
+      throw const E2eeCryptoException('This device has no encrypted identity.');
     }
-    await supabase.from('messages').insert(row);
+    final resolvedMessageId = messageId ?? _uuid.v4();
+    final epoch = await _currentEpochForSend(
+      conversationId: conversationId,
+      ready: ready,
+    );
+    final payload = await _crypto.encryptMessage(
+      userId: user.id,
+      conversationId: conversationId,
+      messageId: resolvedMessageId,
+      epoch: epoch,
+      plaintext: _encodeMessageContent(
+        body: trimmed,
+        messageType: ChatMessageType.text,
+        senderName: localSenderName,
+        replyToMessageId: replyToMessageId,
+        isForwarded: isForwarded,
+      ),
+    );
+    await supabase.rpc(
+      'send_encrypted_message',
+      params: <String, dynamic>{
+        'p_conversation_id': conversationId,
+        'p_sender_device_id': device.id,
+        'p_epoch_id': epoch.serverEpochId,
+        'p_ciphertext': payload.ciphertext,
+        'p_nonce': payload.nonce,
+        'p_signature': payload.signature,
+        'p_message_type': ChatMessageType.text.value,
+        'p_media_bucket': null,
+        'p_media_path': null,
+        'p_message_id': resolvedMessageId,
+      },
+    );
   }
 
   @override
@@ -1416,43 +1831,116 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
     if (user == null) {
       throw const AuthException('Sign in before sending media.');
     }
-
-    await supabase.from('messages').insert({
-      'id': messageId,
-      'conversation_id': conversationId,
-      'sender_id': user.id,
-      'sender_name': localSenderName,
-      'body': body.trim(),
-      'reply_to_message_id': replyToMessageId,
-      'is_forwarded': isForwarded,
-      'message_type': media.isVoice
-          ? ChatMessageType.voice.value
-          : media.isGif
-          ? ChatMessageType.gif.value
-          : ChatMessageType.image.value,
-      'media_bucket': media.bucket,
-      'media_path': media.path,
-      'media_mime_type': media.mimeType,
-      'media_size_bytes': media.sizeBytes,
-      'media_width': media.width,
-      'media_height': media.height,
-      'media_duration_ms': media.duration?.inMilliseconds,
-      'media_waveform': media.waveform.isEmpty ? null : media.waveform,
-      'media_original_name': media.originalName,
-    });
+    if (!media.isEncrypted ||
+        media.encryptionMetadata == null ||
+        media.encryptionEpoch == null) {
+      throw const E2eeCryptoException(
+        'Attach media again so it can be encrypted before sending.',
+      );
+    }
+    final ready = await _requireE2eeReady();
+    final device = ready.device;
+    if (device == null) {
+      throw const E2eeCryptoException('This device has no encrypted identity.');
+    }
+    final epoch = await _currentEpochForSend(
+      conversationId: conversationId,
+      ready: ready,
+    );
+    if (media.encryptionEpoch != epoch.epochNumber ||
+        media.encryptionEpochId != epoch.serverEpochId) {
+      throw const E2eeCryptoException(
+        'Conversation keys changed. Attach the media again before sending.',
+      );
+    }
+    final messageType = _messageTypeForMedia(media);
+    final payload = await _crypto.encryptMessage(
+      userId: user.id,
+      conversationId: conversationId,
+      messageId: messageId,
+      epoch: epoch,
+      plaintext: _encodeMessageContent(
+        body: body.trim(),
+        messageType: messageType,
+        media: media,
+        senderName: localSenderName,
+        replyToMessageId: replyToMessageId,
+        isForwarded: isForwarded,
+      ),
+    );
+    await supabase.rpc(
+      'send_encrypted_message',
+      params: <String, dynamic>{
+        'p_conversation_id': conversationId,
+        'p_sender_device_id': device.id,
+        'p_epoch_id': epoch.serverEpochId,
+        'p_ciphertext': payload.ciphertext,
+        'p_nonce': payload.nonce,
+        'p_signature': payload.signature,
+        'p_message_type': messageType.value,
+        'p_media_bucket': media.bucket,
+        'p_media_path': media.path,
+        'p_message_id': messageId,
+      },
+    );
   }
 
   Future<void> editMessage({
-    required String messageId,
+    required ChatMessage message,
     required String body,
   }) async {
     final supabase = client;
     if (supabase == null) {
       return;
     }
+    if (!message.isEncrypted) {
+      throw const E2eeCryptoException(
+        'Legacy messages are read-only and cannot be edited.',
+      );
+    }
+    if (message.isLocked || message.hasInvalidEncryption) {
+      throw const E2eeCryptoException('This encrypted message is unavailable.');
+    }
+    final user = supabase.auth.currentUser;
+    if (user == null) {
+      throw const AuthException('Sign in before editing messages.');
+    }
+    final ready = await _requireE2eeReady();
+    final device = ready.device;
+    if (device == null) {
+      throw const E2eeCryptoException('This device has no encrypted identity.');
+    }
+    final epoch = await _currentEpochForSend(
+      conversationId: message.threadId,
+      ready: ready,
+    );
+    final revision = (message.encryptionRevision ?? 0) + 1;
+    final payload = await _crypto.encryptMessage(
+      userId: user.id,
+      conversationId: message.threadId,
+      messageId: message.id,
+      epoch: epoch,
+      revision: revision,
+      plaintext: _encodeMessageContent(
+        body: body.trim(),
+        messageType: message.messageType,
+        media: message.media,
+        senderName: message.senderName,
+        replyToMessageId: message.replyTo?.messageId,
+        isForwarded: message.isForwarded,
+      ),
+    );
     await supabase.rpc(
-      'edit_message',
-      params: {'target_message_id': messageId, 'new_body': body},
+      'edit_encrypted_message',
+      params: <String, dynamic>{
+        'p_message_id': message.id,
+        'p_sender_device_id': device.id,
+        'p_epoch_id': epoch.serverEpochId,
+        'p_revision': revision,
+        'p_ciphertext': payload.ciphertext,
+        'p_nonce': payload.nonce,
+        'p_signature': payload.signature,
+      },
     );
   }
 
@@ -1482,16 +1970,72 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
   }
 
   Future<void> toggleMessageReaction({
-    required String messageId,
+    required ChatMessage message,
     required String emoji,
   }) async {
     final supabase = client;
     if (supabase == null) {
       return;
     }
+    if (!message.isEncrypted) {
+      throw const E2eeCryptoException(
+        'Legacy messages are read-only and cannot receive new reactions.',
+      );
+    }
+    if (message.isLocked || message.hasInvalidEncryption) {
+      throw const E2eeCryptoException('This encrypted message is unavailable.');
+    }
+    final user = supabase.auth.currentUser;
+    if (user == null) {
+      throw const AuthException('Sign in before reacting to messages.');
+    }
+    final ready = await _requireE2eeReady();
+    final device = ready.device;
+    if (device == null) {
+      throw const E2eeCryptoException('This device has no encrypted identity.');
+    }
+    final epoch = await _currentEpochForSend(
+      conversationId: message.threadId,
+      ready: ready,
+    );
+    final existing = await _existingEncryptedReaction(
+      conversationId: message.threadId,
+      messageId: message.id,
+      userId: user.id,
+      emoji: emoji,
+    );
+    if (existing != null) {
+      await supabase.rpc(
+        'set_encrypted_reaction',
+        params: <String, dynamic>{
+          'p_message_id': message.id,
+          'p_sender_device_id': device.id,
+          'p_epoch_id': epoch.serverEpochId,
+          'p_reaction_tag': existing.reactionTag,
+          'p_is_active': false,
+        },
+      );
+      return;
+    }
+    final encrypted = await _crypto.encryptReaction(
+      userId: user.id,
+      conversationId: message.threadId,
+      messageId: message.id,
+      epoch: epoch,
+      emoji: emoji,
+    );
     await supabase.rpc(
-      'toggle_message_reaction',
-      params: {'target_message_id': messageId, 'selected_emoji': emoji},
+      'set_encrypted_reaction',
+      params: <String, dynamic>{
+        'p_message_id': message.id,
+        'p_sender_device_id': device.id,
+        'p_epoch_id': epoch.serverEpochId,
+        'p_reaction_tag': encrypted.reactionTag,
+        'p_is_active': true,
+        'p_ciphertext': encrypted.ciphertext,
+        'p_nonce': encrypted.nonce,
+        'p_signature': encrypted.signature,
+      },
     );
   }
 
@@ -1682,6 +2226,687 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
     return TypingState.idle(conversationId);
   }
 
+  Future<E2eeEpoch> _currentEpochForSend({
+    required String conversationId,
+    required E2eeReadyState ready,
+  }) async {
+    final supabase = client;
+    final user = supabase?.auth.currentUser;
+    final device = ready.device;
+    if (supabase == null || user == null || device == null) {
+      throw const E2eeCryptoException(
+        'Encrypted messaging is unavailable until this device is ready.',
+      );
+    }
+    final state = await supabase
+        .from('conversation_crypto_state')
+        .select(
+          'conversation_id, membership_version, active_epoch_number, '
+          'active_epoch_id, rekey_required',
+        )
+        .eq('conversation_id', conversationId)
+        .maybeSingle();
+    if (state == null) {
+      throw const E2eeCryptoException(
+        'Encrypted conversation state is missing.',
+      );
+    }
+    final membershipVersion = _intValue(state['membership_version']) ?? 0;
+    final epochNumber = _intValue(state['active_epoch_number']);
+    final epochId = _nullableText(state['active_epoch_id']);
+    final rekeyRequired = state['rekey_required'] == true;
+
+    if (!rekeyRequired && epochNumber != null && epochId != null) {
+      final cached = await _crypto.cachedEpoch(
+        userId: user.id,
+        conversationId: conversationId,
+        epochNumber: epochNumber,
+      );
+      if (cached != null && cached.serverEpochId == epochId) {
+        return cached;
+      }
+      final opened = await _openEpochFromServer(
+        conversationId: conversationId,
+        epochId: epochId,
+        epochNumber: epochNumber,
+        ready: ready,
+      );
+      if (opened != null) return opened;
+      throw const E2eeCryptoException(
+        'The current conversation key is unavailable on this device.',
+      );
+    }
+
+    return _publishCurrentEpoch(
+      conversationId: conversationId,
+      membershipVersion: membershipVersion,
+      nextEpochNumber: (epochNumber ?? 0) + 1,
+      ready: ready,
+    );
+  }
+
+  Future<E2eeEpoch> _publishCurrentEpoch({
+    required String conversationId,
+    required int membershipVersion,
+    required int nextEpochNumber,
+    required E2eeReadyState ready,
+  }) async {
+    final supabase = client;
+    final user = supabase?.auth.currentUser;
+    final device = ready.device;
+    if (supabase == null || user == null || device == null) {
+      throw const E2eeCryptoException(
+        'Encrypted messaging is unavailable until this device is ready.',
+      );
+    }
+    final materialResult = await supabase.rpc(
+      'get_conversation_e2ee_key_material',
+      params: <String, dynamic>{'p_conversation_id': conversationId},
+    );
+    final material = _mapRows(materialResult);
+    final activeMembers = _mapRows(
+      await supabase
+          .from('conversation_members')
+          .select('user_id')
+          .eq('conversation_id', conversationId)
+          .isFilter('left_at', null),
+    ).map((row) => _nullableText(row['user_id'])).whereType<String>().toSet();
+    final membersWithAccounts = material
+        .where((row) => row['recipient_kind']?.toString() == 'recovery')
+        .map((row) => _nullableText(row['recipient_user_id']))
+        .whereType<String>()
+        .toSet();
+    final membersWithDevices = material
+        .where((row) => row['recipient_kind']?.toString() == 'device')
+        .map((row) => _nullableText(row['recipient_user_id']))
+        .whereType<String>()
+        .toSet();
+    if (activeMembers.isEmpty ||
+        activeMembers.difference(membersWithAccounts).isNotEmpty) {
+      throw const E2eeCryptoException(
+        'Waiting for every conversation member to finish encryption setup.',
+      );
+    }
+    if (activeMembers.difference(membersWithDevices).isNotEmpty) {
+      throw const E2eeCryptoException(
+        'Waiting for every conversation member to register an encryption device.',
+      );
+    }
+    final recipients = <E2eeEpochRecipient>[];
+    for (final row in material) {
+      final recipient = E2eeEpochRecipient.fromBackend(row);
+      if (recipient.userId.isEmpty || recipient.encryptionPublicKey.isEmpty) {
+        throw const E2eeCryptoException(
+          'A conversation member has incomplete E2EE key material.',
+        );
+      }
+      final accountSigningKey =
+          row['account_signing_public_key']?.toString() ?? '';
+      if (accountSigningKey.isEmpty) {
+        throw const E2eeCryptoException(
+          'A conversation member has an invalid E2EE identity.',
+        );
+      }
+      await _observeRemoteAccount(
+        userId: recipient.userId,
+        signingPublicKey: accountSigningKey,
+      );
+      if (recipient.isDevice) {
+        final identity = E2eeDeviceIdentity.fromBackend(row);
+        await _ensureDeviceIdentity(identity);
+      }
+      recipients.add(recipient);
+    }
+    final epoch = await _crypto.createEpoch(
+      userId: user.id,
+      conversationId: conversationId,
+      epochNumber: nextEpochNumber,
+      membershipVersion: membershipVersion,
+      serverEpochId: _uuid.v4(),
+    );
+    final envelopes = await Future.wait(
+      recipients.map(
+        (recipient) =>
+            _crypto.sealEpochForRecipient(epoch: epoch, recipient: recipient),
+      ),
+    );
+    final result = await supabase.rpc(
+      'publish_conversation_epoch',
+      params: <String, dynamic>{
+        'p_conversation_id': conversationId,
+        'p_epoch_id': epoch.serverEpochId,
+        'p_epoch_number': epoch.epochNumber,
+        'p_membership_version': epoch.membershipVersion,
+        'p_creator_device_id': device.id,
+        'p_commitment': epoch.commitment,
+        'p_signature': epoch.signature,
+        'p_envelopes': envelopes.map((envelope) => envelope.toJson()).toList(),
+      },
+    );
+    final returned = _mapRows(result);
+    if (returned.isEmpty) {
+      throw const E2eeCryptoException(
+        'The conversation key was not published.',
+      );
+    }
+    final returnedId = _nullableText(returned.first['epoch_id']);
+    if (returnedId == null || returnedId != epoch.serverEpochId) {
+      throw const E2eeCryptoException(
+        'The published conversation key did not match this device.',
+      );
+    }
+    await _crypto.rememberEpoch(userId: user.id, epoch: epoch);
+    return epoch;
+  }
+
+  Future<E2eeEpoch?> _epochForRecord({
+    required String conversationId,
+    required String? epochId,
+    required int epochNumber,
+  }) async {
+    if (conversationId.isEmpty || epochNumber < 1) return null;
+    final supabase = client;
+    final user = supabase?.auth.currentUser;
+    if (supabase == null || user == null) return null;
+    final cached = await _crypto.cachedEpoch(
+      userId: user.id,
+      conversationId: conversationId,
+      epochNumber: epochNumber,
+    );
+    if (cached != null &&
+        (epochId == null || cached.serverEpochId == epochId)) {
+      return cached;
+    }
+    final ready = await e2eeReadyState();
+    if (!ready.isReadyForSending) return null;
+    return _openEpochFromServer(
+      conversationId: conversationId,
+      epochId: epochId,
+      epochNumber: epochNumber,
+      ready: ready,
+    );
+  }
+
+  Future<E2eeEpoch?> _openEpochFromServer({
+    required String conversationId,
+    required String? epochId,
+    required int epochNumber,
+    required E2eeReadyState ready,
+  }) async {
+    final supabase = client;
+    final user = supabase?.auth.currentUser;
+    final device = ready.device;
+    if (supabase == null || user == null || device == null) return null;
+
+    Future<E2eeEpoch?> openFrom(Object? result, bool useRecoveryKey) async {
+      final matching = _mapRows(result).where((row) {
+        return row['conversation_id']?.toString() == conversationId &&
+            _intValue(row['epoch_number']) == epochNumber &&
+            (epochId == null || row['epoch_id']?.toString() == epochId);
+      }).toList();
+      if (matching.isEmpty) return null;
+      final envelope = E2eeKeyEnvelope.fromBackend(matching.last);
+      await _ensureDeviceIdentity(envelope.creator);
+      return _crypto.openEpochEnvelope(
+        userId: user.id,
+        envelope: envelope,
+        useRecoveryKey: useRecoveryKey,
+      );
+    }
+
+    try {
+      final deviceResult = await supabase.rpc(
+        'get_e2ee_device_envelopes',
+        params: <String, dynamic>{'p_device_id': device.id},
+      );
+      final deviceEpoch = await openFrom(deviceResult, false);
+      if (deviceEpoch != null) return deviceEpoch;
+    } on PostgrestException catch (error) {
+      if (!error.message.toLowerCase().contains('device')) rethrow;
+      // A revoked/replaced local device can still recover this epoch through
+      // the account recovery envelope below.
+    }
+
+    try {
+      final recoveryResult = await supabase.rpc('get_e2ee_recovery_envelopes');
+      return openFrom(recoveryResult, true);
+    } on PostgrestException {
+      return null;
+    }
+  }
+
+  Future<void> _observeRemoteAccount({
+    required String userId,
+    required String signingPublicKey,
+  }) async {
+    if (userId.isEmpty || signingPublicKey.isEmpty) {
+      throw const E2eeCryptoException('An E2EE account identity is invalid.');
+    }
+    if (userId == _currentUser?.id) return;
+    final trust = await _crypto.observeAccountIdentity(
+      userId: userId,
+      signingPublicKey: signingPublicKey,
+    );
+    if (trust.isSendBlocked) {
+      throw const E2eeCryptoException(
+        'A verified safety number changed. Verify the contact before sending.',
+      );
+    }
+  }
+
+  Future<void> _ensureDeviceIdentity(E2eeDeviceIdentity identity) async {
+    if (identity.deviceId.isEmpty ||
+        identity.userId.isEmpty ||
+        identity.signingPublicKey.isEmpty ||
+        identity.certificate.isEmpty ||
+        identity.accountSigningPublicKey.isEmpty) {
+      throw const E2eeCryptoException('An E2EE device identity is invalid.');
+    }
+    await _observeRemoteAccount(
+      userId: identity.userId,
+      signingPublicKey: identity.accountSigningPublicKey,
+    );
+    await _crypto.verifyDeviceIdentity(identity);
+    _deviceIdentities[identity.deviceId] = identity;
+  }
+
+  Future<E2eeDeviceIdentity> _deviceIdentityFor({
+    required String conversationId,
+    required String deviceId,
+  }) async {
+    final cached = _deviceIdentities[deviceId];
+    if (cached != null) return cached;
+    final supabase = client;
+    final user = supabase?.auth.currentUser;
+    if (supabase == null || user == null || deviceId.isEmpty) {
+      throw const E2eeCryptoException('The sender E2EE device is unavailable.');
+    }
+    final ready = await e2eeReadyState();
+    final localDevice = ready.device;
+    final localAccount = ready.account;
+    if (localDevice != null &&
+        localAccount != null &&
+        localDevice.id == deviceId) {
+      final identity = E2eeDeviceIdentity(
+        deviceId: localDevice.id,
+        userId: user.id,
+        encryptionPublicKey: localDevice.encryptionPublicKey,
+        signingPublicKey: localDevice.signingPublicKey,
+        certificate: localDevice.certificate,
+        accountSigningPublicKey: localAccount.signingPublicKey,
+      );
+      await _ensureDeviceIdentity(identity);
+      return identity;
+    }
+    final result = await supabase.rpc(
+      'get_conversation_e2ee_device_identities',
+      params: <String, dynamic>{
+        'p_conversation_id': conversationId,
+        'p_device_ids': <String>[deviceId],
+      },
+    );
+    final rows = _mapRows(result);
+    if (rows.isEmpty) {
+      throw const E2eeCryptoException('The sender E2EE device is unavailable.');
+    }
+    final identity = E2eeDeviceIdentity.fromBackend(rows.first);
+    await _ensureDeviceIdentity(identity);
+    return identity;
+  }
+
+  String _encodeMessageContent({
+    required String body,
+    required ChatMessageType messageType,
+    required String senderName,
+    String? replyToMessageId,
+    ChatMedia? media,
+    bool isForwarded = false,
+  }) {
+    if (messageType == ChatMessageType.call) {
+      throw const E2eeCryptoException(
+        'Call media encryption is not part of encrypted messaging v1.',
+      );
+    }
+    if (messageType == ChatMessageType.text && media != null) {
+      throw const E2eeCryptoException('Text messages cannot include media.');
+    }
+    if (messageType != ChatMessageType.text && media == null) {
+      throw const E2eeCryptoException('Encrypted media metadata is missing.');
+    }
+    return jsonEncode(<String, dynamic>{
+      'version': E2eeCryptoService.protocolVersion,
+      'message_type': messageType.value,
+      'body': body,
+      'sender_name': senderName,
+      'reply_to_message_id': replyToMessageId,
+      'is_forwarded': isForwarded,
+      if (media != null) 'media': _encodeMediaContent(media),
+    });
+  }
+
+  Map<String, dynamic> _encodeMediaContent(ChatMedia media) {
+    final metadata = media.encryptionMetadata;
+    final epochNumber = media.encryptionEpoch;
+    final epochId = media.encryptionEpochId;
+    if (!media.isEncrypted ||
+        metadata == null ||
+        epochNumber == null ||
+        epochId == null ||
+        media.originalName == null ||
+        media.originalName!.isEmpty) {
+      throw const E2eeCryptoException(
+        'Encrypted media is missing authenticated metadata.',
+      );
+    }
+    return <String, dynamic>{
+      'mime_type': media.mimeType,
+      'bucket': media.bucket,
+      'path': media.path,
+      'size_bytes': media.sizeBytes,
+      'width': media.width,
+      'height': media.height,
+      'duration_ms': media.duration?.inMilliseconds,
+      'waveform': media.waveform,
+      'original_name': media.originalName,
+      'epoch_number': epochNumber,
+      'epoch_id': epochId,
+      'encryption': Map<String, dynamic>.from(metadata),
+    };
+  }
+
+  ChatMessageType _messageTypeForMedia(ChatMedia media) {
+    if (media.isVoice) return ChatMessageType.voice;
+    if (media.isGif) return ChatMessageType.gif;
+    return ChatMessageType.image;
+  }
+
+  Future<ChatMessage> _hydrateEncryptedMessage(
+    Map<String, dynamic> row, {
+    required String localUserId,
+    MessageReceipt? receipt,
+  }) async {
+    final base = ChatMessage.fromSupabase(
+      row,
+      localUserId: localUserId,
+      receipt: receipt,
+    );
+    if (!base.isLocked) return base;
+    if (base.isDeleted) {
+      return base.copyWith(
+        encryptionState: ChatMessageEncryptionState.encrypted,
+      );
+    }
+    final epochNumber = base.encryptionEpoch;
+    final senderDeviceId = _nullableText(row['e2ee_sender_device_id']);
+    if (epochNumber == null || senderDeviceId == null) {
+      return base.copyWith(
+        encryptionState: ChatMessageEncryptionState.invalid,
+        encryptionError: 'Encrypted message metadata is invalid.',
+      );
+    }
+    try {
+      final epoch = await _epochForRecord(
+        conversationId: base.threadId,
+        epochId: base.encryptionEpochId,
+        epochNumber: epochNumber,
+      );
+      if (epoch == null) {
+        return base.copyWith(
+          encryptionState: ChatMessageEncryptionState.locked,
+          encryptionError:
+              'The conversation key is unavailable on this device.',
+        );
+      }
+      final sender = await _deviceIdentityFor(
+        conversationId: base.threadId,
+        deviceId: senderDeviceId,
+      );
+      final plaintext = await _crypto.decryptMessage(
+        conversationId: base.threadId,
+        messageId: base.id,
+        envelope: E2eeEncryptedPayload.fromBackend(row),
+        epoch: epoch,
+        senderDevice: sender,
+      );
+      final content = _decodeMessageContent(plaintext);
+      final typeValue = content['message_type']?.toString();
+      if (typeValue != base.messageType.value) {
+        throw const FormatException('Encrypted message type mismatch.');
+      }
+      final media = _decodeEncryptedMedia(
+        row: row,
+        content: content,
+        message: base,
+        senderDeviceId: senderDeviceId,
+      );
+      return base.copyWith(
+        senderName: content['sender_name']!.toString(),
+        body: content['body']?.toString() ?? '',
+        media: media,
+        replyTo: _replyPreviewFromEncryptedContent(
+          content,
+          messageType: base.messageType,
+        ),
+        isForwarded: content['is_forwarded'] == true,
+        encryptionState: ChatMessageEncryptionState.encrypted,
+        encryptionError: null,
+      );
+    } on E2eeCryptoException catch (error) {
+      return base.copyWith(
+        encryptionState: ChatMessageEncryptionState.invalid,
+        encryptionError: error.message,
+      );
+    } catch (_) {
+      return base.copyWith(
+        encryptionState: ChatMessageEncryptionState.invalid,
+        encryptionError: 'Encrypted message content is invalid.',
+      );
+    }
+  }
+
+  Map<String, dynamic> _decodeMessageContent(String plaintext) {
+    final decoded = jsonDecode(plaintext);
+    if (decoded is! Map) {
+      throw const FormatException(
+        'Encrypted message payload is not an object.',
+      );
+    }
+    final content = Map<String, dynamic>.from(decoded);
+    if (_intValue(content['version']) != E2eeCryptoService.protocolVersion ||
+        _nullableText(content['message_type']) == null ||
+        content['body'] is! String ||
+        content['sender_name'] is! String ||
+        (content['reply_to_message_id'] != null &&
+            content['reply_to_message_id'] is! String) ||
+        content['is_forwarded'] is! bool) {
+      throw const FormatException('Encrypted message payload is invalid.');
+    }
+    return content;
+  }
+
+  MessageReplyPreview? _replyPreviewFromEncryptedContent(
+    Map<String, dynamic> content, {
+    required ChatMessageType messageType,
+  }) {
+    final messageId = _nullableText(content['reply_to_message_id']);
+    if (messageId == null) return null;
+    return MessageReplyPreview(
+      messageId: messageId,
+      senderName: '',
+      preview: '',
+      messageType: messageType,
+    );
+  }
+
+  ChatMedia? _decodeEncryptedMedia({
+    required Map<String, dynamic> row,
+    required Map<String, dynamic> content,
+    required ChatMessage message,
+    required String senderDeviceId,
+  }) {
+    if (message.messageType == ChatMessageType.text) {
+      if (content.containsKey('media') ||
+          _nullableText(row['media_bucket']) != null ||
+          _nullableText(row['media_path']) != null) {
+        throw const FormatException('Text message media mismatch.');
+      }
+      return null;
+    }
+    final encoded = content['media'];
+    if (encoded is! Map) {
+      throw const FormatException('Encrypted media descriptor is missing.');
+    }
+    final media = Map<String, dynamic>.from(encoded);
+    final encryption = media['encryption'];
+    final mimeType = _nullableText(media['mime_type']);
+    final originalName = _nullableText(media['original_name']);
+    final authenticatedBucket = _nullableText(media['bucket']);
+    final authenticatedPath = _nullableText(media['path']);
+    final bucket = _nullableText(row['media_bucket']);
+    final path = _nullableText(row['media_path']);
+    final epochNumber = _intValue(media['epoch_number']);
+    final epochId = _nullableText(media['epoch_id']);
+    if (encryption is! Map ||
+        mimeType == null ||
+        originalName == null ||
+        bucket != mediaBucket ||
+        authenticatedBucket != bucket ||
+        authenticatedPath != path ||
+        path == null ||
+        epochNumber == null ||
+        epochNumber < 1 ||
+        epochId == null) {
+      throw const FormatException('Encrypted media descriptor is invalid.');
+    }
+    final normalizedMimeType = mimeType.toLowerCase();
+    final validMimeType = switch (message.messageType) {
+      ChatMessageType.image =>
+        normalizedMimeType.startsWith('image/') &&
+            normalizedMimeType != 'image/gif',
+      ChatMessageType.gif => normalizedMimeType == 'image/gif',
+      ChatMessageType.voice => normalizedMimeType.startsWith('audio/'),
+      _ => false,
+    };
+    if (!validMimeType) {
+      throw const FormatException('Encrypted media type is invalid.');
+    }
+    final encryptedMedia = E2eeEncryptedMedia.fromJson(
+      Map<String, dynamic>.from(encryption),
+    );
+    if (encryptedMedia.mediaId.isEmpty ||
+        encryptedMedia.nonce.isEmpty ||
+        encryptedMedia.signature.isEmpty) {
+      throw const FormatException('Encrypted media authentication is invalid.');
+    }
+    final size = _intValue(media['size_bytes']);
+    if (size == null || size < 0 || size > maxMediaBytes) {
+      throw const FormatException('Encrypted media size is invalid.');
+    }
+    final durationMs = _intValue(media['duration_ms']);
+    if (durationMs != null && (durationMs < 0 || durationMs > 3600000)) {
+      throw const FormatException('Encrypted media duration is invalid.');
+    }
+    return ChatMedia(
+      bucket: bucket ?? mediaBucket,
+      path: path,
+      mimeType: mimeType,
+      sizeBytes: size,
+      width: _intValue(media['width']),
+      height: _intValue(media['height']),
+      duration: durationMs == null ? null : Duration(milliseconds: durationMs),
+      waveform: _waveformFromPayload(media['waveform']),
+      originalName: originalName,
+      isEncrypted: true,
+      conversationId: message.threadId,
+      messageId: message.id,
+      encryptionEpoch: epochNumber,
+      encryptionEpochId: epochId,
+      encryptionSenderDeviceId: senderDeviceId,
+      encryptionMetadata: encryptedMedia.toJson(),
+    );
+  }
+
+  Future<E2eeEncryptedReaction?> _existingEncryptedReaction({
+    required String conversationId,
+    required String messageId,
+    required String userId,
+    required String emoji,
+  }) async {
+    final supabase = client;
+    if (supabase == null) return null;
+    final rows = _mapRows(
+      await supabase
+          .from('encrypted_message_reactions')
+          .select()
+          .eq('message_id', messageId)
+          .eq('user_id', userId),
+    );
+    for (final row in rows) {
+      final decoded = await _decryptEncryptedReaction(
+        row,
+        conversationId: conversationId,
+        messageId: messageId,
+      );
+      if (decoded == null) {
+        throw const E2eeCryptoException(
+          'An existing encrypted reaction is unavailable on this device.',
+        );
+      }
+      if (decoded.emoji == emoji) return decoded.envelope;
+    }
+    return null;
+  }
+
+  Future<_DecryptedReaction?> _decryptEncryptedReaction(
+    Map<String, dynamic> row, {
+    required String conversationId,
+    required String messageId,
+  }) async {
+    final epochId = _nullableText(row['epoch_id']);
+    final senderDeviceId = _nullableText(row['sender_device_id']);
+    if (epochId == null || senderDeviceId == null) return null;
+    final epochRow = await _epochRowForId(epochId, conversationId);
+    if (epochRow == null) return null;
+    final epoch = await _epochForRecord(
+      conversationId: conversationId,
+      epochId: epochId,
+      epochNumber: _intValue(epochRow['epoch_number']) ?? 0,
+    );
+    if (epoch == null) return null;
+    try {
+      final envelope = E2eeEncryptedReaction.fromBackend(row);
+      final sender = await _deviceIdentityFor(
+        conversationId: conversationId,
+        deviceId: senderDeviceId,
+      );
+      final emoji = await _crypto.decryptReaction(
+        conversationId: conversationId,
+        messageId: messageId,
+        encryptedReaction: envelope,
+        epoch: epoch,
+        senderDevice: sender,
+      );
+      return _DecryptedReaction(emoji: emoji, envelope: envelope);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<Map<String, dynamic>?> _epochRowForId(
+    String epochId,
+    String conversationId,
+  ) async {
+    final supabase = client;
+    if (supabase == null) return null;
+    final row = await supabase
+        .from('conversation_key_epochs')
+        .select('id, conversation_id, epoch_number')
+        .eq('id', epochId)
+        .eq('conversation_id', conversationId)
+        .maybeSingle();
+    return row == null ? null : Map<String, dynamic>.from(row);
+  }
+
   Future<Map<String, _ConversationSummary>> _conversationSummaries(
     SupabaseClient supabase,
   ) async {
@@ -1699,10 +2924,31 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
         Map<String, dynamic>.from(row),
       );
       if (summary.conversationId.isNotEmpty) {
-        summaries[summary.conversationId] = summary;
+        summaries[summary.conversationId] = await _hydrateEncryptedSummary(
+          summary,
+          localUserId: supabase.auth.currentUser?.id ?? '',
+        );
       }
     }
     return summaries;
+  }
+
+  Future<_ConversationSummary> _hydrateEncryptedSummary(
+    _ConversationSummary summary, {
+    required String localUserId,
+  }) async {
+    if (!summary.isEncrypted || summary.latestMessageDeletedAt != null) {
+      return summary;
+    }
+    final message = await _hydrateEncryptedMessage(
+      summary.toMessageRow(),
+      localUserId: localUserId,
+    );
+    return summary.copyWith(
+      latestMessageSenderName: message.isEncrypted ? message.senderName : null,
+      latestMessageBody: message.isEncrypted ? message.body : null,
+      encryptedPreviewAvailable: message.isEncrypted,
+    );
   }
 
   Future<ChatThread> _threadFromDirectConversation(
@@ -1905,6 +3151,29 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
   }
 }
 
+class ConversationSafetyIdentity {
+  const ConversationSafetyIdentity({
+    required this.userId,
+    required this.signingPublicKey,
+    required this.fingerprint,
+    required this.isVerified,
+    required this.hasChanged,
+  });
+
+  final String userId;
+  final String signingPublicKey;
+  final String fingerprint;
+  final bool isVerified;
+  final bool hasChanged;
+}
+
+class _DecryptedReaction {
+  const _DecryptedReaction({required this.emoji, required this.envelope});
+
+  final String emoji;
+  final E2eeEncryptedReaction envelope;
+}
+
 class _ConversationSummary {
   const _ConversationSummary({
     required this.conversationId,
@@ -1913,8 +3182,19 @@ class _ConversationSummary {
     required this.latestMessageSenderName,
     required this.latestMessageBody,
     required this.latestMessageType,
+    required this.latestMessageReplyToMessageId,
+    required this.latestMessageCallEvent,
     required this.latestMessageDeletedAt,
     required this.latestMessageAt,
+    required this.latestMessageEncryptionVersion,
+    required this.latestMessageEpochId,
+    required this.latestMessageEpochNumber,
+    required this.latestMessageRevision,
+    required this.latestMessageCiphertext,
+    required this.latestMessageNonce,
+    required this.latestMessageSignature,
+    required this.latestMessageSenderDeviceId,
+    required this.encryptedPreviewAvailable,
     required this.unreadCount,
     required this.status,
     required this.latestOutgoingStatus,
@@ -1928,8 +3208,26 @@ class _ConversationSummary {
       latestMessageSenderName: _summaryText(row['latest_message_sender_name']),
       latestMessageBody: _summaryText(row['latest_message_body']),
       latestMessageType: _summaryText(row['latest_message_type']),
+      latestMessageReplyToMessageId: _summaryText(
+        row['latest_message_reply_to_message_id'],
+      ),
+      latestMessageCallEvent: _summaryText(row['latest_message_call_event']),
       latestMessageDeletedAt: _readTimestamp(row['latest_message_deleted_at']),
       latestMessageAt: _readTimestamp(row['latest_message_at']),
+      latestMessageEncryptionVersion: _summaryInt(
+        row['latest_message_encryption_version'],
+      ),
+      latestMessageEpochId: _summaryText(row['latest_message_epoch_id']),
+      latestMessageEpochNumber: _intValue(row['latest_message_epoch_number']),
+      latestMessageRevision: _intValue(row['latest_message_revision']),
+      latestMessageCiphertext: _summaryText(row['latest_message_ciphertext']),
+      latestMessageNonce: _summaryText(row['latest_message_nonce']),
+      latestMessageSignature: _summaryText(row['latest_message_signature']),
+      latestMessageSenderDeviceId: _summaryText(
+        row['latest_message_sender_device_id'],
+      ),
+      encryptedPreviewAvailable:
+          _summaryInt(row['latest_message_encryption_version']) == 0,
       unreadCount: _summaryInt(row['unread_count']),
       status: _threadStatusFromValue(row['status']),
       latestOutgoingStatus: _threadStatusFromValue(
@@ -1944,13 +3242,81 @@ class _ConversationSummary {
   final String? latestMessageSenderName;
   final String? latestMessageBody;
   final String? latestMessageType;
+  final String? latestMessageReplyToMessageId;
+  final String? latestMessageCallEvent;
   final DateTime? latestMessageDeletedAt;
   final DateTime? latestMessageAt;
+  final int latestMessageEncryptionVersion;
+  final String? latestMessageEpochId;
+  final int? latestMessageEpochNumber;
+  final int? latestMessageRevision;
+  final String? latestMessageCiphertext;
+  final String? latestMessageNonce;
+  final String? latestMessageSignature;
+  final String? latestMessageSenderDeviceId;
+  final bool encryptedPreviewAvailable;
   final int unreadCount;
   final ChatThreadStatus status;
   final ChatThreadStatus latestOutgoingStatus;
 
   bool get hasLatestMessage => latestMessageId != null;
+  bool get isEncrypted => latestMessageEncryptionVersion > 0;
+
+  _ConversationSummary copyWith({
+    String? latestMessageSenderName,
+    String? latestMessageBody,
+    bool? encryptedPreviewAvailable,
+  }) {
+    return _ConversationSummary(
+      conversationId: conversationId,
+      latestMessageId: latestMessageId,
+      latestMessageSenderId: latestMessageSenderId,
+      latestMessageSenderName:
+          latestMessageSenderName ?? this.latestMessageSenderName,
+      latestMessageBody: latestMessageBody ?? this.latestMessageBody,
+      latestMessageType: latestMessageType,
+      latestMessageReplyToMessageId: latestMessageReplyToMessageId,
+      latestMessageCallEvent: latestMessageCallEvent,
+      latestMessageDeletedAt: latestMessageDeletedAt,
+      latestMessageAt: latestMessageAt,
+      latestMessageEncryptionVersion: latestMessageEncryptionVersion,
+      latestMessageEpochId: latestMessageEpochId,
+      latestMessageEpochNumber: latestMessageEpochNumber,
+      latestMessageRevision: latestMessageRevision,
+      latestMessageCiphertext: latestMessageCiphertext,
+      latestMessageNonce: latestMessageNonce,
+      latestMessageSignature: latestMessageSignature,
+      latestMessageSenderDeviceId: latestMessageSenderDeviceId,
+      encryptedPreviewAvailable:
+          encryptedPreviewAvailable ?? this.encryptedPreviewAvailable,
+      unreadCount: unreadCount,
+      status: status,
+      latestOutgoingStatus: latestOutgoingStatus,
+    );
+  }
+
+  Map<String, dynamic> toMessageRow() {
+    return <String, dynamic>{
+      'id': latestMessageId,
+      'conversation_id': conversationId,
+      'sender_id': latestMessageSenderId,
+      'sender_name': latestMessageSenderName,
+      'body': latestMessageBody ?? '',
+      'message_type': latestMessageType,
+      'reply_to_message_id': latestMessageReplyToMessageId,
+      'call_event': latestMessageCallEvent,
+      'deleted_at': latestMessageDeletedAt?.toUtc().toIso8601String(),
+      'created_at': latestMessageAt?.toUtc().toIso8601String(),
+      'encryption_version': latestMessageEncryptionVersion,
+      'e2ee_epoch_id': latestMessageEpochId,
+      'e2ee_epoch_number': latestMessageEpochNumber,
+      'e2ee_revision': latestMessageRevision,
+      'e2ee_ciphertext': latestMessageCiphertext,
+      'e2ee_nonce': latestMessageNonce,
+      'e2ee_signature': latestMessageSignature,
+      'e2ee_sender_device_id': latestMessageSenderDeviceId,
+    };
+  }
 
   ChatThreadStatus get threadStatus {
     if (unreadCount > 0) {
@@ -1964,9 +3330,15 @@ class _ConversationSummary {
       return null;
     }
 
-    final messagePreview = latestMessageDeletedAt == null
-        ? _previewForMessage(latestMessageBody, latestMessageType)
-        : 'Message deleted';
+    final messagePreview = latestMessageDeletedAt != null
+        ? 'Message deleted'
+        : isEncrypted && !encryptedPreviewAvailable
+        ? 'Encrypted message'
+        : _previewForMessage(
+            latestMessageBody,
+            latestMessageType,
+            callEvent: latestMessageCallEvent,
+          );
     if (latestMessageSenderId == localUserId) {
       return 'You: $messagePreview';
     }
@@ -1983,7 +3355,11 @@ bool _matchesUser(ChatUser user, String query) {
       (user.email?.toLowerCase().contains(query) ?? false);
 }
 
-String _previewForMessage(String? body, String? messageType) {
+String _previewForMessage(
+  String? body,
+  String? messageType, {
+  String? callEvent,
+}) {
   final text = body?.trim();
   if (text != null && text.isNotEmpty) {
     return text;
@@ -1993,7 +3369,12 @@ String _previewForMessage(String? body, String? messageType) {
     ChatMessageType.image => 'Photo',
     ChatMessageType.gif => 'GIF',
     ChatMessageType.voice => 'Voice message',
-    ChatMessageType.call => 'Call event',
+    ChatMessageType.call => switch (callEvent) {
+      'started' => 'Call started',
+      'ended' => 'Call ended',
+      'failed' || 'rejected' => 'Call failed',
+      _ => 'Call event',
+    },
     ChatMessageType.text => 'Message',
   };
 }
@@ -2061,12 +3442,41 @@ Future<List<Map<String, dynamic>>> _selectProfiles(
   return List<Map<String, dynamic>>.from(rows);
 }
 
-String? _nullableText(String? value) {
-  final trimmed = value?.trim();
-  if (trimmed == null || trimmed.isEmpty) {
+String? _nullableText(Object? value) {
+  if (value == null) {
     return null;
   }
+  final trimmed = value.toString().trim();
+  if (trimmed.isEmpty) return null;
   return trimmed;
+}
+
+int? _intValue(Object? value) {
+  if (value is num) return value.toInt();
+  return int.tryParse(value?.toString() ?? '');
+}
+
+List<Map<String, dynamic>> _mapRows(Object? value) {
+  if (value is! Iterable) return const <Map<String, dynamic>>[];
+  return value
+      .whereType<Map>()
+      .map((row) => Map<String, dynamic>.from(row))
+      .toList(growable: false);
+}
+
+List<double> _waveformFromPayload(Object? value) {
+  if (value is! Iterable) return const <double>[];
+  final waveform = <double>[];
+  for (final level in value) {
+    final parsed = level is num
+        ? level.toDouble()
+        : double.tryParse(level?.toString() ?? '');
+    if (parsed == null || !parsed.isFinite || parsed < 0 || parsed > 1) {
+      throw const FormatException('Encrypted media waveform is invalid.');
+    }
+    waveform.add(parsed);
+  }
+  return List<double>.unmodifiable(waveform);
 }
 
 bool get _isDesktopPlatform {

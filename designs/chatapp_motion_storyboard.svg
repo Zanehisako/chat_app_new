@@ -1,0 +1,147 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1200" viewBox="0 0 1800 1200" role="img" aria-labelledby="title desc">
+  <title id="title">ChatApp playful motion storyboard</title>
+  <desc id="desc">Six implementation-friendly microinteraction storyboards for composing, filtering, sending, reacting, recording, and joining a call.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#121218"/><stop offset=".52" stop-color="#191822"/><stop offset="1" stop-color="#10191A"/></linearGradient>
+    <linearGradient id="violet" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#A56BFF"/><stop offset="1" stop-color="#6437FF"/></linearGradient>
+    <linearGradient id="lime" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#E4FF75"/><stop offset="1" stop-color="#80EC91"/></linearGradient>
+    <linearGradient id="coral" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#FFB067"/><stop offset="1" stop-color="#FF6487"/></linearGradient>
+    <linearGradient id="blue" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#74E7FF"/><stop offset="1" stop-color="#5074FF"/></linearGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="180%"><feDropShadow dx="0" dy="18" stdDeviation="22" flood-color="#000" flood-opacity=".28"/></filter>
+    <filter id="glow" x="-100%" y="-100%" width="300%" height="300%"><feGaussianBlur stdDeviation="11" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    <style>
+      text { font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .white { fill:#fff; } .muted { fill:#AAA6B7; } .ink { fill:#17171C; }
+      .kicker { font-size:11px; font-weight:760; letter-spacing:1.2px; }
+      .title { font-size:23px; font-weight:790; letter-spacing:-.55px; }
+      .body { font-size:13px; font-weight:560; }
+      .tiny { font-size:10px; font-weight:650; letter-spacing:.2px; }
+      .num { font-size:12px; font-weight:800; }
+      .dash { stroke:#817B94; stroke-width:2; stroke-dasharray:5 8; fill:none; stroke-linecap:round; }
+      .arrow { stroke:#B7B1C6; stroke-width:2; fill:none; stroke-linecap:round; stroke-linejoin:round; }
+    </style>
+  </defs>
+  <rect width="1800" height="1200" fill="url(#bg)"/>
+  <circle cx="80" cy="80" r="260" fill="#713BFF" opacity=".10"/>
+  <circle cx="1760" cy="1130" r="330" fill="#7EF09C" opacity=".08"/>
+  <path d="M1100 0c160 150 310 55 430 133S1740 206 1800 120V0z" fill="#A56BFF" opacity=".08"/>
+
+  <g transform="translate(76 62)"><rect width="205" height="38" rx="19" fill="#F7F4FF"/><circle cx="21" cy="19" r="6" fill="#7B45FF"/><text x="38" y="24" class="kicker ink">CHATAPP MOTION LAB</text></g>
+  <text x="76" y="161" class="white" font-size="54" font-weight="820" letter-spacing="-2.2">Playful, not distracting.</text>
+  <text x="78" y="204" class="muted" font-size="18" font-weight="530">Six composable interactions designed around clear state changes, spring physics and independent layers.</text>
+  <g transform="translate(1480 79)"><rect width="240" height="88" rx="25" fill="#24232D" stroke="#34323F"/><text x="22" y="28" class="kicker muted">CORE CURVE</text><text x="22" y="54" class="title white">Spring 380 / 28</text><text x="22" y="73" class="tiny" fill="#91EFA3">overshoot capped at 1.04×</text></g>
+
+  <!-- CARD 1 -->
+  <g transform="translate(76 260)" filter="url(#shadow)">
+    <rect width="520" height="355" rx="38" fill="#F8F6FC"/>
+    <g transform="translate(25 23)"><rect width="34" height="34" rx="12" fill="#17171C"/><text x="17" y="22" text-anchor="middle" class="num white">01</text><text x="50" y="16" class="kicker" fill="#6C3BFF">COMPOSE BLOOM</text><text x="50" y="39" class="title ink">One button, three clear choices</text></g>
+    <text x="27" y="91" class="body" fill="#777482">Tap scales the orb down, then actions arc outward with a 45 ms stagger.</text>
+    <g transform="translate(35 122)">
+      <g transform="translate(12 80)"><circle cx="44" cy="44" r="44" fill="url(#violet)" filter="url(#glow)"/><path d="M28 44h32M44 28v32" stroke="#FFF" stroke-width="4" stroke-linecap="round"/><text x="44" y="114" text-anchor="middle" class="tiny" fill="#777482">REST</text></g>
+      <path d="M116 124h53" class="arrow"/><path d="M159 118l10 6-10 6" class="arrow"/>
+      <g transform="translate(182 45)">
+        <circle cx="72" cy="80" r="44" fill="url(#violet)"/><path d="M56 80h32M72 64v32" stroke="#FFF" stroke-width="4" stroke-linecap="round" transform="rotate(45 72 80)"/>
+        <path d="M72 72C80 36 105 22 137 20M78 83c28 5 51 24 60 53M65 87c-26 10-40 29-43 56" class="dash"/>
+        <g transform="translate(112 0)"><circle cx="25" cy="25" r="25" fill="#17171C"/><path d="M16 18h18v14H16zM19 18l3-5h6l3 5" stroke="#FFF" stroke-width="2" fill="none" stroke-linejoin="round"/><circle cx="25" cy="25" r="4" fill="none" stroke="#FFF" stroke-width="2"/><text x="25" y="65" text-anchor="middle" class="tiny ink">PHOTO</text></g>
+        <g transform="translate(116 111)"><circle cx="25" cy="25" r="25" fill="url(#coral)"/><path d="M25 14v19M18 27a7 7 0 0 0 14 0M25 35v7M19 42h12" stroke="#FFF" stroke-width="2" fill="none" stroke-linecap="round"/><text x="25" y="65" text-anchor="middle" class="tiny ink">VOICE</text></g>
+        <g transform="translate(-4 119)"><circle cx="25" cy="25" r="25" fill="url(#lime)"/><path d="M15 16h20v18H15zM15 28l6-6 5 5 4-4 5 5" stroke="#17171C" stroke-width="2" fill="none" stroke-linejoin="round"/><text x="25" y="65" text-anchor="middle" class="tiny ink">GIF</text></g>
+      </g>
+    </g>
+    <g transform="translate(27 325)"><rect width="113" height="20" rx="10" fill="#EDE9F6"/><text x="12" y="14" class="tiny" fill="#6C3BFF">220–360 MS</text><text x="363" y="14" class="tiny" fill="#777482">SCALE + ARC + STAGGER</text></g>
+  </g>
+
+  <!-- CARD 2 -->
+  <g transform="translate(640 260)" filter="url(#shadow)">
+    <rect width="520" height="355" rx="38" fill="#F8F6FC"/>
+    <g transform="translate(25 23)"><rect width="34" height="34" rx="12" fill="#17171C"/><text x="17" y="22" text-anchor="middle" class="num white">02</text><text x="50" y="16" class="kicker" fill="#6C3BFF">FILTER GLIDE</text><text x="50" y="39" class="title ink">Selection travels, content follows</text></g>
+    <text x="27" y="91" class="body" fill="#777482">A shared pill stretches between labels while the list crossfades and slides 8 px.</text>
+    <g transform="translate(26 127)">
+      <rect width="468" height="70" rx="26" fill="#EFECF5"/>
+      <rect x="10" y="10" width="86" height="50" rx="21" fill="#17171C"/>
+      <text x="53" y="41" text-anchor="middle" class="tiny white">ALL</text><text x="150" y="41" text-anchor="middle" class="tiny" fill="#777482">UNREAD</text><text x="252" y="41" text-anchor="middle" class="tiny" fill="#777482">SENT</text><text x="361" y="41" text-anchor="middle" class="tiny" fill="#777482">READ</text>
+      <path d="M106 35h35" class="dash"/><path d="M132 29l10 6-10 6" class="arrow"/>
+    </g>
+    <g transform="translate(26 218)">
+      <rect width="468" height="70" rx="26" fill="#EFECF5"/>
+      <rect x="101" y="10" width="100" height="50" rx="21" fill="url(#violet)"/>
+      <text x="53" y="41" text-anchor="middle" class="tiny" fill="#777482">ALL</text><text x="151" y="41" text-anchor="middle" class="tiny white">UNREAD</text><text x="252" y="41" text-anchor="middle" class="tiny" fill="#777482">SENT</text><text x="361" y="41" text-anchor="middle" class="tiny" fill="#777482">READ</text>
+    </g>
+    <g transform="translate(27 325)"><rect width="113" height="20" rx="10" fill="#EDE9F6"/><text x="12" y="14" class="tiny" fill="#6C3BFF">280–420 MS</text><text x="333" y="14" class="tiny" fill="#777482">SHARED GEOMETRY</text></g>
+  </g>
+
+  <!-- CARD 3 -->
+  <g transform="translate(1204 260)" filter="url(#shadow)">
+    <rect width="520" height="355" rx="38" fill="#16161D" stroke="#2B2A34"/>
+    <g transform="translate(25 23)"><rect width="34" height="34" rx="12" fill="#F8F6FC"/><text x="17" y="22" text-anchor="middle" class="num ink">03</text><text x="50" y="16" class="kicker" fill="#B594FF">MESSAGE SPRING</text><text x="50" y="39" class="title white">Send with momentum and certainty</text></g>
+    <text x="27" y="91" class="body muted">The bubble grows from the composer, overshoots once, then reveals delivery.</text>
+    <g transform="translate(30 128)">
+      <rect y="120" width="460" height="67" rx="28" fill="#2B2A33"/><text x="24" y="161" class="body muted">Message…</text><circle cx="426" cy="153" r="24" fill="url(#violet)"/><path d="M417 153h17M428 146l7 7-7 7" stroke="#FFF" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+      <g opacity=".18" transform="translate(255 90) scale(.72)"><rect width="185" height="58" rx="23" fill="#A56BFF"/></g>
+      <g opacity=".38" transform="translate(244 52) scale(.87)"><rect width="203" height="64" rx="24" fill="#8A55FF"/></g>
+      <g transform="translate(225 0)"><rect width="224" height="70" rx="25" fill="url(#violet)"/><text x="18" y="31" class="body white">See you at eight ✨</text><text x="164" y="54" class="tiny" fill="#E3D8FF">NOW  ✓✓</text></g>
+      <path d="M411 127C389 102 373 90 351 74" class="dash"/><path d="M345 83l6-10 10 4" class="arrow"/>
+    </g>
+    <g transform="translate(27 325)"><rect width="113" height="20" rx="10" fill="#292733"/><text x="12" y="14" class="tiny" fill="#B594FF">260–380 MS</text><text x="337" y="14" class="tiny muted">ORIGIN TRANSFORM</text></g>
+  </g>
+
+  <!-- CARD 4 -->
+  <g transform="translate(76 655)" filter="url(#shadow)">
+    <rect width="520" height="355" rx="38" fill="#16161D" stroke="#2B2A34"/>
+    <g transform="translate(25 23)"><rect width="34" height="34" rx="12" fill="#F8F6FC"/><text x="17" y="22" text-anchor="middle" class="num ink">04</text><text x="50" y="16" class="kicker" fill="#B594FF">REACTION BURST</text><text x="50" y="39" class="title white">Long-press turns emotion loose</text></g>
+    <text x="27" y="91" class="body muted">The message lifts 4 px; emojis pop in from the touch point with tiny rotations.</text>
+    <g transform="translate(29 131)">
+      <circle cx="19" cy="17" r="17" fill="url(#blue)"/><text x="19" y="22" text-anchor="middle" class="tiny white">T</text>
+      <rect x="47" width="246" height="70" rx="24" fill="#FFFFFF"/><text x="65" y="31" class="body ink">That animation is perfect.</text><text x="65" y="53" class="tiny" fill="#777482">19:04</text>
+      <circle cx="230" cy="65" r="5" fill="#A56BFF" opacity=".28"/><circle cx="230" cy="65" r="16" fill="none" stroke="#A56BFF" stroke-width="2" opacity=".24"/><circle cx="230" cy="65" r="29" fill="none" stroke="#A56BFF" stroke-width="2" opacity=".12"/>
+      <g transform="translate(64 91)"><rect width="350" height="62" rx="27" fill="#F8F6FC"/><g font-size="24"><text x="20" y="40">💜</text><text x="73" y="40" transform="rotate(-6 73 40)">🔥</text><text x="126" y="40" transform="rotate(5 126 40)">😂</text><text x="179" y="40" transform="rotate(-5 179 40)">👏</text><text x="232" y="40" transform="rotate(6 232 40)">😮</text><text x="285" y="40">✨</text></g></g>
+      <path d="M229 83c12 6 19 10 28 18" class="dash"/><path d="M248 93l10 8-11 3" class="arrow"/>
+    </g>
+    <g transform="translate(27 325)"><rect width="113" height="20" rx="10" fill="#292733"/><text x="12" y="14" class="tiny" fill="#B594FF">180–320 MS</text><text x="324" y="14" class="tiny muted">LIFT + POP STAGGER</text></g>
+  </g>
+
+  <!-- CARD 5 -->
+  <g transform="translate(640 655)" filter="url(#shadow)">
+    <rect width="520" height="355" rx="38" fill="#F8F6FC"/>
+    <g transform="translate(25 23)"><rect width="34" height="34" rx="12" fill="#17171C"/><text x="17" y="22" text-anchor="middle" class="num white">05</text><text x="50" y="16" class="kicker" fill="#6C3BFF">VOICE RECORD</text><text x="50" y="39" class="title ink">Sound feels alive before it sends</text></g>
+    <text x="27" y="91" class="body" fill="#777482">Hold expands the mic; waveform bars react independently and cancel follows drag.</text>
+    <g transform="translate(27 132)">
+      <rect y="89" width="466" height="70" rx="29" fill="#EEEAF5"/>
+      <text x="24" y="131" class="body" fill="#777482">Slide left to cancel</text>
+      <path d="M199 124h-38" class="arrow"/><path d="M171 118l-10 6 10 6" class="arrow"/>
+      <g transform="translate(196 105)" fill="#7C48FF">
+        <rect width="4" height="30" y="-15" rx="2"/><rect x="9" width="4" height="18" y="-9" rx="2"/><rect x="18" width="4" height="40" y="-20" rx="2"/><rect x="27" width="4" height="24" y="-12" rx="2"/><rect x="36" width="4" height="35" y="-17.5" rx="2"/><rect x="45" width="4" height="17" y="-8.5" rx="2"/><rect x="54" width="4" height="43" y="-21.5" rx="2"/><rect x="63" width="4" height="26" y="-13" rx="2"/><rect x="72" width="4" height="34" y="-17" rx="2"/><rect x="81" width="4" height="20" y="-10" rx="2"/><rect x="90" width="4" height="38" y="-19" rx="2"/>
+      </g>
+      <text x="311" y="130" class="tiny" fill="#777482">0:12</text>
+      <circle cx="420" cy="124" r="27" fill="#FF6685" opacity=".12"/><circle cx="420" cy="124" r="38" fill="none" stroke="#FF6685" stroke-width="2" opacity=".18"/><circle cx="420" cy="124" r="49" fill="none" stroke="#FF6685" stroke-width="2" opacity=".10"/>
+      <circle cx="420" cy="124" r="28" fill="url(#coral)"/><path d="M420 111v19M412 124a8 8 0 0 0 16 0M420 133v7M413 140h14" stroke="#FFF" stroke-width="2" fill="none" stroke-linecap="round"/>
+      <g transform="translate(345 3)"><rect width="102" height="38" rx="19" fill="#17171C"/><circle cx="21" cy="19" r="5" fill="#FF6685"/><text x="35" y="24" class="tiny white">RECORDING</text></g>
+    </g>
+    <g transform="translate(27 325)"><rect width="113" height="20" rx="10" fill="#EDE9F6"/><text x="12" y="14" class="tiny" fill="#6C3BFF">LIVE RESPONSE</text><text x="320" y="14" class="tiny" fill="#777482">GESTURE-DRIVEN</text></g>
+  </g>
+
+  <!-- CARD 6 -->
+  <g transform="translate(1204 655)" filter="url(#shadow)">
+    <rect width="520" height="355" rx="38" fill="#F8F6FC"/>
+    <g transform="translate(25 23)"><rect width="34" height="34" rx="12" fill="#17171C"/><text x="17" y="22" text-anchor="middle" class="num white">06</text><text x="50" y="16" class="kicker" fill="#6C3BFF">CALL JOIN</text><text x="50" y="39" class="title ink">People arrive as a celebration</text></g>
+    <text x="27" y="91" class="body" fill="#777482">Tiles scale from the active banner; connected avatars ripple once, never loop.</text>
+    <g transform="translate(27 122)">
+      <g opacity=".35" transform="translate(0 47) scale(.88)"><rect width="205" height="136" rx="28" fill="#D9D4E8"/></g>
+      <g transform="translate(5 18)"><rect width="205" height="136" rx="28" fill="url(#blue)"/><circle cx="102" cy="59" r="31" fill="#FFF" opacity=".17"/><text x="102" y="69" text-anchor="middle" fill="#FFF" font-size="27" font-weight="760">T</text><rect x="16" y="99" width="66" height="23" rx="11.5" fill="#17171C" opacity=".7"/><text x="29" y="115" class="tiny white">Theo</text></g>
+      <g opacity=".16" transform="translate(286 61) scale(.68)"><rect width="205" height="136" rx="28" fill="#A56BFF"/></g>
+      <g opacity=".37" transform="translate(260 38) scale(.82)"><rect width="205" height="136" rx="28" fill="#965FFF"/></g>
+      <g transform="translate(230 0)"><rect width="230" height="153" rx="30" fill="url(#violet)"/><circle cx="115" cy="66" r="35" fill="#FFF" opacity=".17"/><text x="115" y="77" text-anchor="middle" fill="#FFF" font-size="30" font-weight="760">M</text><rect x="17" y="111" width="91" height="25" rx="12.5" fill="#17171C" opacity=".72"/><text x="30" y="128" class="tiny white">Maya · host</text><circle cx="201" cy="124" r="8" fill="#91F0A5" filter="url(#glow)"/></g>
+      <path d="M220 75h-22" class="dash"/><path d="M205 69l-9 6 9 6" class="arrow"/>
+      <g transform="translate(140 176)"><rect width="196" height="49" rx="24.5" fill="#17171C"/><circle cx="26" cy="24.5" r="7" fill="#91F0A5"/><text x="44" y="30" class="tiny white">4 CONNECTED · +1 JOINING</text></g>
+    </g>
+    <g transform="translate(27 325)"><rect width="113" height="20" rx="10" fill="#EDE9F6"/><text x="12" y="14" class="tiny" fill="#6C3BFF">320–480 MS</text><text x="321" y="14" class="tiny" fill="#777482">SCALE + SINGLE RIPPLE</text></g>
+  </g>
+
+  <g transform="translate(76 1060)">
+    <rect width="1648" height="74" rx="28" fill="#22212A" stroke="#32303C"/>
+    <text x="26" y="29" class="kicker" fill="#B594FF">IMPLEMENTATION TOKENS</text>
+    <text x="26" y="52" class="body white">Spring 380/28</text><circle cx="165" cy="47" r="3" fill="#706B7E"/><text x="180" y="52" class="body white">Stagger 45 ms</text><circle cx="298" cy="47" r="3" fill="#706B7E"/><text x="313" y="52" class="body white">Press scale 0.96×</text><circle cx="468" cy="47" r="3" fill="#706B7E"/><text x="483" y="52" class="body white">Enter scale 0.92→1.00</text><circle cx="672" cy="47" r="3" fill="#706B7E"/><text x="687" y="52" class="body white">Max overshoot 1.04×</text><circle cx="892" cy="47" r="3" fill="#706B7E"/><text x="907" y="52" class="body white">Respect reduced motion</text>
+    <rect x="1395" y="17" width="228" height="40" rx="20" fill="url(#lime)"/><text x="1509" y="42" text-anchor="middle" class="tiny ink">FLUTTER-READY LAYERS</text>
+  </g>
+  <text x="76" y="1172" class="tiny muted">Original UI direction · Animation notes are guidelines, not baked into the artwork.</text>
+  <text x="1568" y="1172" class="tiny muted">1800 × 1200 · EDITABLE SVG</text>
+</svg>

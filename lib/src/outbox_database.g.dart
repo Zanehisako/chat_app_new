@@ -322,6 +322,41 @@ class $OutboxEntriesTable extends OutboxEntries
     ),
     defaultValue: const Constant(false),
   );
+  static const VerificationMeta _draftEncryptionVersionMeta =
+      const VerificationMeta('draftEncryptionVersion');
+  @override
+  late final GeneratedColumn<int> draftEncryptionVersion = GeneratedColumn<int>(
+    'draft_encryption_version',
+    aliasedName,
+    false,
+    type: DriftSqlType.int,
+    requiredDuringInsert: false,
+    defaultValue: const Constant(0),
+  );
+  static const VerificationMeta _draftEncryptionStateMeta =
+      const VerificationMeta('draftEncryptionState');
+  @override
+  late final GeneratedColumn<String> draftEncryptionState =
+      GeneratedColumn<String>(
+        'draft_encryption_state',
+        aliasedName,
+        false,
+        type: DriftSqlType.string,
+        requiredDuringInsert: false,
+        defaultValue: const Constant('legacy'),
+      );
+  static const VerificationMeta _encryptedDraftMeta = const VerificationMeta(
+    'encryptedDraft',
+  );
+  @override
+  late final GeneratedColumn<Uint8List> encryptedDraft =
+      GeneratedColumn<Uint8List>(
+        'encrypted_draft',
+        aliasedName,
+        true,
+        type: DriftSqlType.blob,
+        requiredDuringInsert: false,
+      );
   static const VerificationMeta _updatedAtMeta = const VerificationMeta(
     'updatedAt',
   );
@@ -363,6 +398,9 @@ class $OutboxEntriesTable extends OutboxEntries
     replyMessageType,
     replyIsDeleted,
     isForwarded,
+    draftEncryptionVersion,
+    draftEncryptionState,
+    encryptedDraft,
     updatedAt,
   ];
   @override
@@ -619,6 +657,33 @@ class $OutboxEntriesTable extends OutboxEntries
         ),
       );
     }
+    if (data.containsKey('draft_encryption_version')) {
+      context.handle(
+        _draftEncryptionVersionMeta,
+        draftEncryptionVersion.isAcceptableOrUnknown(
+          data['draft_encryption_version']!,
+          _draftEncryptionVersionMeta,
+        ),
+      );
+    }
+    if (data.containsKey('draft_encryption_state')) {
+      context.handle(
+        _draftEncryptionStateMeta,
+        draftEncryptionState.isAcceptableOrUnknown(
+          data['draft_encryption_state']!,
+          _draftEncryptionStateMeta,
+        ),
+      );
+    }
+    if (data.containsKey('encrypted_draft')) {
+      context.handle(
+        _encryptedDraftMeta,
+        encryptedDraft.isAcceptableOrUnknown(
+          data['encrypted_draft']!,
+          _encryptedDraftMeta,
+        ),
+      );
+    }
     if (data.containsKey('updated_at')) {
       context.handle(
         _updatedAtMeta,
@@ -748,6 +813,18 @@ class $OutboxEntriesTable extends OutboxEntries
         DriftSqlType.bool,
         data['${effectivePrefix}is_forwarded'],
       )!,
+      draftEncryptionVersion: attachedDatabase.typeMapping.read(
+        DriftSqlType.int,
+        data['${effectivePrefix}draft_encryption_version'],
+      )!,
+      draftEncryptionState: attachedDatabase.typeMapping.read(
+        DriftSqlType.string,
+        data['${effectivePrefix}draft_encryption_state'],
+      )!,
+      encryptedDraft: attachedDatabase.typeMapping.read(
+        DriftSqlType.blob,
+        data['${effectivePrefix}encrypted_draft'],
+      ),
       updatedAt: attachedDatabase.typeMapping.read(
         DriftSqlType.dateTime,
         data['${effectivePrefix}updated_at'],
@@ -790,6 +867,9 @@ class OutboxEntry extends DataClass implements Insertable<OutboxEntry> {
   final String? replyMessageType;
   final bool replyIsDeleted;
   final bool isForwarded;
+  final int draftEncryptionVersion;
+  final String draftEncryptionState;
+  final Uint8List? encryptedDraft;
   final DateTime updatedAt;
   const OutboxEntry({
     required this.id,
@@ -820,6 +900,9 @@ class OutboxEntry extends DataClass implements Insertable<OutboxEntry> {
     this.replyMessageType,
     required this.replyIsDeleted,
     required this.isForwarded,
+    required this.draftEncryptionVersion,
+    required this.draftEncryptionState,
+    this.encryptedDraft,
     required this.updatedAt,
   });
   @override
@@ -885,6 +968,11 @@ class OutboxEntry extends DataClass implements Insertable<OutboxEntry> {
     }
     map['reply_is_deleted'] = Variable<bool>(replyIsDeleted);
     map['is_forwarded'] = Variable<bool>(isForwarded);
+    map['draft_encryption_version'] = Variable<int>(draftEncryptionVersion);
+    map['draft_encryption_state'] = Variable<String>(draftEncryptionState);
+    if (!nullToAbsent || encryptedDraft != null) {
+      map['encrypted_draft'] = Variable<Uint8List>(encryptedDraft);
+    }
     map['updated_at'] = Variable<DateTime>(updatedAt);
     return map;
   }
@@ -951,6 +1039,11 @@ class OutboxEntry extends DataClass implements Insertable<OutboxEntry> {
           : Value(replyMessageType),
       replyIsDeleted: Value(replyIsDeleted),
       isForwarded: Value(isForwarded),
+      draftEncryptionVersion: Value(draftEncryptionVersion),
+      draftEncryptionState: Value(draftEncryptionState),
+      encryptedDraft: encryptedDraft == null && nullToAbsent
+          ? const Value.absent()
+          : Value(encryptedDraft),
       updatedAt: Value(updatedAt),
     );
   }
@@ -991,6 +1084,13 @@ class OutboxEntry extends DataClass implements Insertable<OutboxEntry> {
       replyMessageType: serializer.fromJson<String?>(json['replyMessageType']),
       replyIsDeleted: serializer.fromJson<bool>(json['replyIsDeleted']),
       isForwarded: serializer.fromJson<bool>(json['isForwarded']),
+      draftEncryptionVersion: serializer.fromJson<int>(
+        json['draftEncryptionVersion'],
+      ),
+      draftEncryptionState: serializer.fromJson<String>(
+        json['draftEncryptionState'],
+      ),
+      encryptedDraft: serializer.fromJson<Uint8List?>(json['encryptedDraft']),
       updatedAt: serializer.fromJson<DateTime>(json['updatedAt']),
     );
   }
@@ -1026,6 +1126,9 @@ class OutboxEntry extends DataClass implements Insertable<OutboxEntry> {
       'replyMessageType': serializer.toJson<String?>(replyMessageType),
       'replyIsDeleted': serializer.toJson<bool>(replyIsDeleted),
       'isForwarded': serializer.toJson<bool>(isForwarded),
+      'draftEncryptionVersion': serializer.toJson<int>(draftEncryptionVersion),
+      'draftEncryptionState': serializer.toJson<String>(draftEncryptionState),
+      'encryptedDraft': serializer.toJson<Uint8List?>(encryptedDraft),
       'updatedAt': serializer.toJson<DateTime>(updatedAt),
     };
   }
@@ -1059,6 +1162,9 @@ class OutboxEntry extends DataClass implements Insertable<OutboxEntry> {
     Value<String?> replyMessageType = const Value.absent(),
     bool? replyIsDeleted,
     bool? isForwarded,
+    int? draftEncryptionVersion,
+    String? draftEncryptionState,
+    Value<Uint8List?> encryptedDraft = const Value.absent(),
     DateTime? updatedAt,
   }) => OutboxEntry(
     id: id ?? this.id,
@@ -1109,6 +1215,12 @@ class OutboxEntry extends DataClass implements Insertable<OutboxEntry> {
         : this.replyMessageType,
     replyIsDeleted: replyIsDeleted ?? this.replyIsDeleted,
     isForwarded: isForwarded ?? this.isForwarded,
+    draftEncryptionVersion:
+        draftEncryptionVersion ?? this.draftEncryptionVersion,
+    draftEncryptionState: draftEncryptionState ?? this.draftEncryptionState,
+    encryptedDraft: encryptedDraft.present
+        ? encryptedDraft.value
+        : this.encryptedDraft,
     updatedAt: updatedAt ?? this.updatedAt,
   );
   OutboxEntry copyWithCompanion(OutboxEntriesCompanion data) {
@@ -1185,6 +1297,15 @@ class OutboxEntry extends DataClass implements Insertable<OutboxEntry> {
       isForwarded: data.isForwarded.present
           ? data.isForwarded.value
           : this.isForwarded,
+      draftEncryptionVersion: data.draftEncryptionVersion.present
+          ? data.draftEncryptionVersion.value
+          : this.draftEncryptionVersion,
+      draftEncryptionState: data.draftEncryptionState.present
+          ? data.draftEncryptionState.value
+          : this.draftEncryptionState,
+      encryptedDraft: data.encryptedDraft.present
+          ? data.encryptedDraft.value
+          : this.encryptedDraft,
       updatedAt: data.updatedAt.present ? data.updatedAt.value : this.updatedAt,
     );
   }
@@ -1220,6 +1341,9 @@ class OutboxEntry extends DataClass implements Insertable<OutboxEntry> {
           ..write('replyMessageType: $replyMessageType, ')
           ..write('replyIsDeleted: $replyIsDeleted, ')
           ..write('isForwarded: $isForwarded, ')
+          ..write('draftEncryptionVersion: $draftEncryptionVersion, ')
+          ..write('draftEncryptionState: $draftEncryptionState, ')
+          ..write('encryptedDraft: $encryptedDraft, ')
           ..write('updatedAt: $updatedAt')
           ..write(')'))
         .toString();
@@ -1255,6 +1379,9 @@ class OutboxEntry extends DataClass implements Insertable<OutboxEntry> {
     replyMessageType,
     replyIsDeleted,
     isForwarded,
+    draftEncryptionVersion,
+    draftEncryptionState,
+    $driftBlobEquality.hash(encryptedDraft),
     updatedAt,
   ]);
   @override
@@ -1292,6 +1419,12 @@ class OutboxEntry extends DataClass implements Insertable<OutboxEntry> {
           other.replyMessageType == this.replyMessageType &&
           other.replyIsDeleted == this.replyIsDeleted &&
           other.isForwarded == this.isForwarded &&
+          other.draftEncryptionVersion == this.draftEncryptionVersion &&
+          other.draftEncryptionState == this.draftEncryptionState &&
+          $driftBlobEquality.equals(
+            other.encryptedDraft,
+            this.encryptedDraft,
+          ) &&
           other.updatedAt == this.updatedAt);
 }
 
@@ -1324,6 +1457,9 @@ class OutboxEntriesCompanion extends UpdateCompanion<OutboxEntry> {
   final Value<String?> replyMessageType;
   final Value<bool> replyIsDeleted;
   final Value<bool> isForwarded;
+  final Value<int> draftEncryptionVersion;
+  final Value<String> draftEncryptionState;
+  final Value<Uint8List?> encryptedDraft;
   final Value<DateTime> updatedAt;
   final Value<int> rowid;
   const OutboxEntriesCompanion({
@@ -1355,6 +1491,9 @@ class OutboxEntriesCompanion extends UpdateCompanion<OutboxEntry> {
     this.replyMessageType = const Value.absent(),
     this.replyIsDeleted = const Value.absent(),
     this.isForwarded = const Value.absent(),
+    this.draftEncryptionVersion = const Value.absent(),
+    this.draftEncryptionState = const Value.absent(),
+    this.encryptedDraft = const Value.absent(),
     this.updatedAt = const Value.absent(),
     this.rowid = const Value.absent(),
   });
@@ -1387,6 +1526,9 @@ class OutboxEntriesCompanion extends UpdateCompanion<OutboxEntry> {
     this.replyMessageType = const Value.absent(),
     this.replyIsDeleted = const Value.absent(),
     this.isForwarded = const Value.absent(),
+    this.draftEncryptionVersion = const Value.absent(),
+    this.draftEncryptionState = const Value.absent(),
+    this.encryptedDraft = const Value.absent(),
     required DateTime updatedAt,
     this.rowid = const Value.absent(),
   }) : id = Value(id),
@@ -1429,6 +1571,9 @@ class OutboxEntriesCompanion extends UpdateCompanion<OutboxEntry> {
     Expression<String>? replyMessageType,
     Expression<bool>? replyIsDeleted,
     Expression<bool>? isForwarded,
+    Expression<int>? draftEncryptionVersion,
+    Expression<String>? draftEncryptionState,
+    Expression<Uint8List>? encryptedDraft,
     Expression<DateTime>? updatedAt,
     Expression<int>? rowid,
   }) {
@@ -1461,6 +1606,11 @@ class OutboxEntriesCompanion extends UpdateCompanion<OutboxEntry> {
       if (replyMessageType != null) 'reply_message_type': replyMessageType,
       if (replyIsDeleted != null) 'reply_is_deleted': replyIsDeleted,
       if (isForwarded != null) 'is_forwarded': isForwarded,
+      if (draftEncryptionVersion != null)
+        'draft_encryption_version': draftEncryptionVersion,
+      if (draftEncryptionState != null)
+        'draft_encryption_state': draftEncryptionState,
+      if (encryptedDraft != null) 'encrypted_draft': encryptedDraft,
       if (updatedAt != null) 'updated_at': updatedAt,
       if (rowid != null) 'rowid': rowid,
     });
@@ -1495,6 +1645,9 @@ class OutboxEntriesCompanion extends UpdateCompanion<OutboxEntry> {
     Value<String?>? replyMessageType,
     Value<bool>? replyIsDeleted,
     Value<bool>? isForwarded,
+    Value<int>? draftEncryptionVersion,
+    Value<String>? draftEncryptionState,
+    Value<Uint8List?>? encryptedDraft,
     Value<DateTime>? updatedAt,
     Value<int>? rowid,
   }) {
@@ -1527,6 +1680,10 @@ class OutboxEntriesCompanion extends UpdateCompanion<OutboxEntry> {
       replyMessageType: replyMessageType ?? this.replyMessageType,
       replyIsDeleted: replyIsDeleted ?? this.replyIsDeleted,
       isForwarded: isForwarded ?? this.isForwarded,
+      draftEncryptionVersion:
+          draftEncryptionVersion ?? this.draftEncryptionVersion,
+      draftEncryptionState: draftEncryptionState ?? this.draftEncryptionState,
+      encryptedDraft: encryptedDraft ?? this.encryptedDraft,
       updatedAt: updatedAt ?? this.updatedAt,
       rowid: rowid ?? this.rowid,
     );
@@ -1619,6 +1776,19 @@ class OutboxEntriesCompanion extends UpdateCompanion<OutboxEntry> {
     if (isForwarded.present) {
       map['is_forwarded'] = Variable<bool>(isForwarded.value);
     }
+    if (draftEncryptionVersion.present) {
+      map['draft_encryption_version'] = Variable<int>(
+        draftEncryptionVersion.value,
+      );
+    }
+    if (draftEncryptionState.present) {
+      map['draft_encryption_state'] = Variable<String>(
+        draftEncryptionState.value,
+      );
+    }
+    if (encryptedDraft.present) {
+      map['encrypted_draft'] = Variable<Uint8List>(encryptedDraft.value);
+    }
     if (updatedAt.present) {
       map['updated_at'] = Variable<DateTime>(updatedAt.value);
     }
@@ -1659,6 +1829,9 @@ class OutboxEntriesCompanion extends UpdateCompanion<OutboxEntry> {
           ..write('replyMessageType: $replyMessageType, ')
           ..write('replyIsDeleted: $replyIsDeleted, ')
           ..write('isForwarded: $isForwarded, ')
+          ..write('draftEncryptionVersion: $draftEncryptionVersion, ')
+          ..write('draftEncryptionState: $draftEncryptionState, ')
+          ..write('encryptedDraft: $encryptedDraft, ')
           ..write('updatedAt: $updatedAt, ')
           ..write('rowid: $rowid')
           ..write(')'))
@@ -1707,6 +1880,9 @@ typedef $$OutboxEntriesTableCreateCompanionBuilder =
       Value<String?> replyMessageType,
       Value<bool> replyIsDeleted,
       Value<bool> isForwarded,
+      Value<int> draftEncryptionVersion,
+      Value<String> draftEncryptionState,
+      Value<Uint8List?> encryptedDraft,
       required DateTime updatedAt,
       Value<int> rowid,
     });
@@ -1740,6 +1916,9 @@ typedef $$OutboxEntriesTableUpdateCompanionBuilder =
       Value<String?> replyMessageType,
       Value<bool> replyIsDeleted,
       Value<bool> isForwarded,
+      Value<int> draftEncryptionVersion,
+      Value<String> draftEncryptionState,
+      Value<Uint8List?> encryptedDraft,
       Value<DateTime> updatedAt,
       Value<int> rowid,
     });
@@ -1890,6 +2069,21 @@ class $$OutboxEntriesTableFilterComposer
 
   ColumnFilters<bool> get isForwarded => $composableBuilder(
     column: $table.isForwarded,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<int> get draftEncryptionVersion => $composableBuilder(
+    column: $table.draftEncryptionVersion,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get draftEncryptionState => $composableBuilder(
+    column: $table.draftEncryptionState,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<Uint8List> get encryptedDraft => $composableBuilder(
+    column: $table.encryptedDraft,
     builder: (column) => ColumnFilters(column),
   );
 
@@ -2048,6 +2242,21 @@ class $$OutboxEntriesTableOrderingComposer
     builder: (column) => ColumnOrderings(column),
   );
 
+  ColumnOrderings<int> get draftEncryptionVersion => $composableBuilder(
+    column: $table.draftEncryptionVersion,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<String> get draftEncryptionState => $composableBuilder(
+    column: $table.draftEncryptionState,
+    builder: (column) => ColumnOrderings(column),
+  );
+
+  ColumnOrderings<Uint8List> get encryptedDraft => $composableBuilder(
+    column: $table.encryptedDraft,
+    builder: (column) => ColumnOrderings(column),
+  );
+
   ColumnOrderings<DateTime> get updatedAt => $composableBuilder(
     column: $table.updatedAt,
     builder: (column) => ColumnOrderings(column),
@@ -2191,6 +2400,21 @@ class $$OutboxEntriesTableAnnotationComposer
     builder: (column) => column,
   );
 
+  GeneratedColumn<int> get draftEncryptionVersion => $composableBuilder(
+    column: $table.draftEncryptionVersion,
+    builder: (column) => column,
+  );
+
+  GeneratedColumn<String> get draftEncryptionState => $composableBuilder(
+    column: $table.draftEncryptionState,
+    builder: (column) => column,
+  );
+
+  GeneratedColumn<Uint8List> get encryptedDraft => $composableBuilder(
+    column: $table.encryptedDraft,
+    builder: (column) => column,
+  );
+
   GeneratedColumn<DateTime> get updatedAt =>
       $composableBuilder(column: $table.updatedAt, builder: (column) => column);
 }
@@ -2256,6 +2480,9 @@ class $$OutboxEntriesTableTableManager
                 Value<String?> replyMessageType = const Value.absent(),
                 Value<bool> replyIsDeleted = const Value.absent(),
                 Value<bool> isForwarded = const Value.absent(),
+                Value<int> draftEncryptionVersion = const Value.absent(),
+                Value<String> draftEncryptionState = const Value.absent(),
+                Value<Uint8List?> encryptedDraft = const Value.absent(),
                 Value<DateTime> updatedAt = const Value.absent(),
                 Value<int> rowid = const Value.absent(),
               }) => OutboxEntriesCompanion(
@@ -2287,6 +2514,9 @@ class $$OutboxEntriesTableTableManager
                 replyMessageType: replyMessageType,
                 replyIsDeleted: replyIsDeleted,
                 isForwarded: isForwarded,
+                draftEncryptionVersion: draftEncryptionVersion,
+                draftEncryptionState: draftEncryptionState,
+                encryptedDraft: encryptedDraft,
                 updatedAt: updatedAt,
                 rowid: rowid,
               ),
@@ -2320,6 +2550,9 @@ class $$OutboxEntriesTableTableManager
                 Value<String?> replyMessageType = const Value.absent(),
                 Value<bool> replyIsDeleted = const Value.absent(),
                 Value<bool> isForwarded = const Value.absent(),
+                Value<int> draftEncryptionVersion = const Value.absent(),
+                Value<String> draftEncryptionState = const Value.absent(),
+                Value<Uint8List?> encryptedDraft = const Value.absent(),
                 required DateTime updatedAt,
                 Value<int> rowid = const Value.absent(),
               }) => OutboxEntriesCompanion.insert(
@@ -2351,6 +2584,9 @@ class $$OutboxEntriesTableTableManager
                 replyMessageType: replyMessageType,
                 replyIsDeleted: replyIsDeleted,
                 isForwarded: isForwarded,
+                draftEncryptionVersion: draftEncryptionVersion,
+                draftEncryptionState: draftEncryptionState,
+                encryptedDraft: encryptedDraft,
                 updatedAt: updatedAt,
                 rowid: rowid,
               ),

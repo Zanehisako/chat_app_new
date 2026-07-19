@@ -56,6 +56,9 @@ dependencies:
   path_provider: ^2.1.6
   shared_preferences: ^2.5.5
   crypto: ^3.0.7
+  sodium: ^4.0.2+1
+  flutter_secure_storage: ^10.3.1
+  bip39_mnemonic: ^4.0.1
   drift: ^2.34.1
   drift_flutter: ^0.3.0
   web: ^1.1.1

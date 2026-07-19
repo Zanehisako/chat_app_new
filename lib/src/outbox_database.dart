@@ -34,6 +34,11 @@ class OutboxEntries extends Table {
   BoolColumn get replyIsDeleted =>
       boolean().withDefault(const Constant(false))();
   BoolColumn get isForwarded => boolean().withDefault(const Constant(false))();
+  IntColumn get draftEncryptionVersion =>
+      integer().withDefault(const Constant(0))();
+  TextColumn get draftEncryptionState =>
+      text().withDefault(const Constant('legacy'))();
+  BlobColumn get encryptedDraft => blob().nullable()();
   DateTimeColumn get updatedAt => dateTime()();
 
   @override
@@ -48,7 +53,7 @@ class OutboxDatabase extends _$OutboxDatabase {
   OutboxDatabase.forTesting(super.executor);
 
   @override
-  int get schemaVersion => 3;
+  int get schemaVersion => 4;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -85,13 +90,35 @@ class OutboxDatabase extends _$OutboxDatabase {
         ''');
         await customStatement('DROP TABLE outbox_entries_v1');
         await _createIndexes();
-      } else if (from < 3) {
-        await migrator.addColumn(outboxEntries, outboxEntries.replyToMessageId);
-        await migrator.addColumn(outboxEntries, outboxEntries.replySenderName);
-        await migrator.addColumn(outboxEntries, outboxEntries.replyPreview);
-        await migrator.addColumn(outboxEntries, outboxEntries.replyMessageType);
-        await migrator.addColumn(outboxEntries, outboxEntries.replyIsDeleted);
-        await migrator.addColumn(outboxEntries, outboxEntries.isForwarded);
+      } else {
+        if (from < 3) {
+          await migrator.addColumn(
+            outboxEntries,
+            outboxEntries.replyToMessageId,
+          );
+          await migrator.addColumn(
+            outboxEntries,
+            outboxEntries.replySenderName,
+          );
+          await migrator.addColumn(outboxEntries, outboxEntries.replyPreview);
+          await migrator.addColumn(
+            outboxEntries,
+            outboxEntries.replyMessageType,
+          );
+          await migrator.addColumn(outboxEntries, outboxEntries.replyIsDeleted);
+          await migrator.addColumn(outboxEntries, outboxEntries.isForwarded);
+        }
+        if (from < 4) {
+          await migrator.addColumn(
+            outboxEntries,
+            outboxEntries.draftEncryptionVersion,
+          );
+          await migrator.addColumn(
+            outboxEntries,
+            outboxEntries.draftEncryptionState,
+          );
+          await migrator.addColumn(outboxEntries, outboxEntries.encryptedDraft);
+        }
       }
     },
   );

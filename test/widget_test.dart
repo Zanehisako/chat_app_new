@@ -9,6 +9,7 @@ import 'package:chat_app/src/auth_service.dart';
 import 'package:chat_app/src/chat_home_page.dart';
 import 'package:chat_app/src/chat_models.dart';
 import 'package:chat_app/src/chat_repository.dart';
+import 'package:chat_app/src/e2ee_draft_protector.dart';
 import 'package:chat_app/src/offline_outbox_media_store.dart';
 import 'package:chat_app/src/outbox_message_sender.dart';
 import 'package:chat_app/src/outbox_database.dart';
@@ -149,15 +150,18 @@ void main() {
       backendOrigin: 'https://project-a.supabase.co',
       userId: 'account-b',
     );
+    final draftProtector = _TestE2eeDraftProtector();
     final firstOutbox = OfflineOutboxService(
       database: database,
       scope: firstScope,
       mediaStore: _TestOutboxMediaStore(),
+      draftProtector: draftProtector,
     );
     final secondOutbox = OfflineOutboxService(
       database: database,
       scope: secondScope,
       mediaStore: _TestOutboxMediaStore(),
+      draftProtector: draftProtector,
     );
 
     await firstOutbox.enqueue(
@@ -175,7 +179,7 @@ void main() {
   });
 
   test(
-    'outbox persists uploaded media before retrying the message insert',
+    'outbox re-uploads the protected source before retrying the message insert',
     () async {
       SharedPreferences.setMockInitialValues({});
       final database = _testOutboxDatabase();
@@ -203,7 +207,7 @@ void main() {
 
       sender.failMediaSendAfterUpload = false;
       await outbox.flush(sender, ignoreBackoff: true);
-      expect(sender.uploadedMessageIds, [item.id]);
+      expect(sender.uploadedMessageIds, [item.id, item.id]);
       expect(outbox.items, isEmpty);
       await outbox.dispose();
       await database.close();
@@ -503,7 +507,7 @@ void main() {
       'Hello Supabase',
     );
     await tester.tap(find.byIcon(Icons.send));
-    await tester.pump();
+    await tester.pumpAndSettle();
 
     expect(find.text('Hello Supabase'), findsOneWidget);
     expect(find.byKey(const Key('message-status-sent')), findsOneWidget);
@@ -709,7 +713,7 @@ void main() {
 
     await tester.tap(find.text('Product Team'));
     await tester.pumpAndSettle();
-    await tester.tap(find.byTooltip('Call'));
+    await tester.tap(find.byTooltip('Call (media E2EE is phase 2)'));
     await tester.pump();
 
     expect(find.text('Calls require a signed-in direct chat.'), findsOneWidget);
@@ -748,11 +752,19 @@ void main() {
 
     expect(find.text('Launch Team'), findsWidgets);
     expect(find.byTooltip('Group info'), findsOneWidget);
-    expect(find.byTooltip('Start voice group call'), findsOneWidget);
-    expect(find.byTooltip('Start video group call'), findsOneWidget);
+    expect(
+      find.byTooltip('Start voice group call (media E2EE is phase 2)'),
+      findsOneWidget,
+    );
+    expect(
+      find.byTooltip('Start video group call (media E2EE is phase 2)'),
+      findsOneWidget,
+    );
     expect(find.text('3 members'), findsOneWidget);
 
-    await tester.tap(find.byTooltip('Start voice group call'));
+    await tester.tap(
+      find.byTooltip('Start voice group call (media E2EE is phase 2)'),
+    );
     await tester.pump();
     expect(find.text('Group calls require a signed-in group.'), findsOneWidget);
 
@@ -882,7 +894,10 @@ void main() {
     await tester.tap(find.text('Old Peer'));
     await tester.pumpAndSettle();
 
-    await tester.tap(find.byKey(const Key('media-download-media-1')));
+    final bubbleDownload = find.byKey(const Key('media-download-media-1'));
+    await tester.ensureVisible(bubbleDownload);
+    await tester.pumpAndSettle();
+    await tester.tap(bubbleDownload);
     await tester.pumpAndSettle();
 
     expect(repository.saveCount, 1);
@@ -907,24 +922,26 @@ void main() {
         threadId: 'conversation-1',
         senderId: 'peer-1',
         senderName: 'Zane',
-        body: 'Zane started a video call',
+        body: '',
         createdAt: DateTime(2026, 7, 7, 9, 13),
         isMine: false,
         isDelivered: false,
         isRead: false,
         messageType: ChatMessageType.call,
+        callEvent: 'started',
       ),
       ChatMessage(
         id: 'call-2',
         threadId: 'conversation-1',
         senderId: ChatSeed.localUserId,
         senderName: 'You',
-        body: 'You ended the call',
+        body: '',
         createdAt: DateTime(2026, 7, 7, 9, 15),
         isMine: true,
         isDelivered: false,
         isRead: false,
         messageType: ChatMessageType.call,
+        callEvent: 'ended',
       ),
     ]);
 
@@ -936,8 +953,8 @@ void main() {
     await tester.tap(find.text('Old Peer'));
     await tester.pumpAndSettle();
 
-    expect(find.textContaining('Zane started a video call'), findsOneWidget);
-    expect(find.textContaining('You ended the call'), findsOneWidget);
+    expect(find.textContaining('Call started'), findsOneWidget);
+    expect(find.textContaining('Call ended'), findsOneWidget);
   });
 
   testWidgets('renders voice message waveform and downloads audio', (
@@ -1762,6 +1779,24 @@ class _TestOutboxMediaStore implements OutboxMediaStore {
   @override
   Future<void> deleteMedia(String storageRef) async {
     _mediaByRef.remove(storageRef);
+  }
+}
+
+class _TestE2eeDraftProtector implements E2eeDraftProtector {
+  @override
+  Future<Uint8List> protectDraft({
+    required E2eeDraftProtectionContext context,
+    required Uint8List plaintext,
+  }) async {
+    return Uint8List.fromList([for (final byte in plaintext) byte ^ 0xA5]);
+  }
+
+  @override
+  Future<Uint8List> unprotectDraft({
+    required E2eeDraftProtectionContext context,
+    required Uint8List protectedDraft,
+  }) async {
+    return Uint8List.fromList([for (final byte in protectedDraft) byte ^ 0xA5]);
   }
 }
 

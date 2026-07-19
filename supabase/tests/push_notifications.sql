@@ -138,12 +138,19 @@ begin
   insert into public.conversations (id, user_one_id, user_two_id)
   values (conversation_id, first_user, second_user);
 
+  -- Preserve notification-trigger coverage with a historical legacy fixture.
+  update public.e2ee_rollout_config
+  set plaintext_cutover_at = null
+  where id = true;
   insert into public.messages (
     id, conversation_id, sender_id, sender_name, body
   )
   values (
     message_id, conversation_id, first_user, 'Push First', 'Trigger test'
   );
+  update public.e2ee_rollout_config
+  set plaintext_cutover_at = now()
+  where id = true;
 
   if not exists (
     select 1

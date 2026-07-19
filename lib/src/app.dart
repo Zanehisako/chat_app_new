@@ -4,6 +4,8 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'auth_gate.dart';
 import 'chat_home_page.dart';
 import 'chat_repository.dart';
+import 'motion/chat_motion.dart';
+import 'motion/chat_motion_routes.dart';
 
 class ChatApp extends StatelessWidget {
   const ChatApp({super.key, this.supabaseClient});
@@ -19,6 +21,7 @@ class ChatApp extends StatelessWidget {
       title: 'Chat App',
       theme: _buildTheme(Brightness.light),
       darkTheme: _buildTheme(Brightness.dark),
+      navigatorObservers: [chatRouteObserver],
       home: client == null
           ? ChatHomePage(repository: ChatRepository())
           : AuthGate(client: client),
@@ -37,6 +40,17 @@ ThemeData _buildTheme(Brightness brightness) {
     useMaterial3: true,
     brightness: brightness,
     colorScheme: colorScheme,
+    extensions: const [ChatMotionTheme.standard],
+    pageTransitionsTheme: const PageTransitionsTheme(
+      builders: {
+        TargetPlatform.android: ChatPageTransitionsBuilder(),
+        TargetPlatform.fuchsia: ChatPageTransitionsBuilder(),
+        TargetPlatform.iOS: ChatPageTransitionsBuilder(),
+        TargetPlatform.linux: ChatPageTransitionsBuilder(),
+        TargetPlatform.macOS: ChatPageTransitionsBuilder(),
+        TargetPlatform.windows: ChatPageTransitionsBuilder(),
+      },
+    ),
     scaffoldBackgroundColor: isDark
         ? const Color(0xFF101315)
         : const Color(0xFFF7F8FA),

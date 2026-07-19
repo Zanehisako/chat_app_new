@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'auth_service.dart';
+import 'motion/chat_motion.dart';
+import 'motion/chat_motion_widgets.dart';
 
 enum AuthMode {
   signIn,
@@ -120,23 +122,35 @@ class _AuthPageState extends State<AuthPage> {
           child: Form(
             key: _formKey,
             child: AnimatedSize(
-              duration: const Duration(milliseconds: 180),
+              duration: context.chatMotion.duration(
+                context.chatMotion.theme.standardDuration,
+              ),
+              curve: Curves.easeOutCubic,
               alignment: Alignment.topCenter,
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  Text(
-                    _title,
-                    style: theme.textTheme.headlineSmall?.copyWith(
-                      fontWeight: FontWeight.w800,
+                  ChatStateSwitcher(
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      _title,
+                      key: ValueKey<String>('auth-title-${_mode.name}'),
+                      style: theme.textTheme.headlineSmall?.copyWith(
+                        fontWeight: FontWeight.w800,
+                      ),
                     ),
                   ),
                   const SizedBox(height: 6),
-                  Text(
-                    _subtitle,
-                    style: theme.textTheme.bodyMedium?.copyWith(
-                      color: theme.colorScheme.onSurfaceVariant,
+                  ChatStateSwitcher(
+                    alignment: Alignment.centerLeft,
+                    offset: const Offset(0, 4),
+                    child: Text(
+                      _subtitle,
+                      key: ValueKey<String>('auth-subtitle-${_mode.name}'),
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
                     ),
                   ),
                   const SizedBox(height: 18),
@@ -144,8 +158,8 @@ class _AuthPageState extends State<AuthPage> {
                     message: _error ?? widget.bannerMessage ?? _message,
                     isError: _error != null || widget.bannerMessage != null,
                   ),
-                  AnimatedSwitcher(
-                    duration: const Duration(milliseconds: 180),
+                  ChatStateSwitcher(
+                    alignment: Alignment.topCenter,
                     child: KeyedSubtree(
                       key: ValueKey(_mode),
                       child: _buildModeFields(),
@@ -871,39 +885,47 @@ class _AuthNotice extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final text = message;
-    if (text == null || text.isEmpty) {
-      return const SizedBox.shrink();
-    }
-
     final theme = Theme.of(context);
     final color = isError ? theme.colorScheme.error : const Color(0xFF127A74);
 
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 14),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-        decoration: BoxDecoration(
-          color: color.withValues(alpha: 0.1),
-          borderRadius: BorderRadius.circular(8),
-        ),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Icon(
-              isError ? Icons.error_outline : Icons.check_circle_outline,
-              size: 18,
-              color: color,
-            ),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Text(
-                text,
-                style: theme.textTheme.bodyMedium?.copyWith(color: color),
+    return ChatSizeFade(
+      child: text == null || text.isEmpty
+          ? null
+          : Padding(
+              key: ValueKey<String>('auth-notice-$isError-$text'),
+              padding: const EdgeInsets.only(bottom: 14),
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 10,
+                ),
+                decoration: BoxDecoration(
+                  color: color.withValues(alpha: 0.1),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Icon(
+                      isError
+                          ? Icons.error_outline
+                          : Icons.check_circle_outline,
+                      size: 18,
+                      color: color,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        text,
+                        style: theme.textTheme.bodyMedium?.copyWith(
+                          color: color,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
-          ],
-        ),
-      ),
     );
   }
 }
@@ -963,7 +985,12 @@ class _PasswordField extends StatelessWidget {
         suffixIcon: IconButton(
           tooltip: obscureText ? 'Show password' : 'Hide password',
           onPressed: onToggleVisibility,
-          icon: Icon(obscureText ? Icons.visibility : Icons.visibility_off),
+          icon: ChatStateSwitcher(
+            child: Icon(
+              obscureText ? Icons.visibility : Icons.visibility_off,
+              key: ValueKey<bool>(obscureText),
+            ),
+          ),
         ),
       ),
     );
@@ -985,17 +1012,23 @@ class _PrimaryAuthButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return FilledButton.icon(
-      onPressed: isLoading ? null : onPressed,
-      icon: isLoading
-          ? const SizedBox(
-              width: 18,
-              height: 18,
-              child: CircularProgressIndicator(strokeWidth: 2),
-            )
-          : Icon(icon),
-      label: Text(label),
-      style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(48)),
+    return ChatPressScale(
+      enabled: !isLoading,
+      child: FilledButton.icon(
+        onPressed: isLoading ? null : onPressed,
+        icon: ChatStateSwitcher(
+          child: isLoading
+              ? const SizedBox(
+                  key: ValueKey<String>('auth-button-loading'),
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : Icon(icon, key: const ValueKey<String>('auth-button-icon')),
+        ),
+        label: Text(label),
+        style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(48)),
+      ),
     );
   }
 }
@@ -1008,11 +1041,14 @@ class _GoogleButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return OutlinedButton.icon(
-      onPressed: isLoading ? null : onPressed,
-      icon: const Icon(Icons.g_mobiledata, size: 28),
-      label: const Text('Continue with Google'),
-      style: OutlinedButton.styleFrom(minimumSize: const Size.fromHeight(48)),
+    return ChatPressScale(
+      enabled: !isLoading,
+      child: OutlinedButton.icon(
+        onPressed: isLoading ? null : onPressed,
+        icon: const Icon(Icons.g_mobiledata, size: 28),
+        label: const Text('Continue with Google'),
+        style: OutlinedButton.styleFrom(minimumSize: const Size.fromHeight(48)),
+      ),
     );
   }
 }

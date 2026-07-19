@@ -18,6 +18,7 @@ Without Supabase environment values, the app runs against local seed messages.
 npx supabase login
 npx supabase link --project-ref your-project-ref
 npx supabase db push
+npx supabase functions deploy e2ee-register-device
 ```
 
 The migration files in `supabase/migrations/` create profiles, direct and named
@@ -25,6 +26,8 @@ group conversations, membership/admin controls, realtime messages,
 per-recipient receipts, RLS policies, auth triggers, and existing-message
 receipt backfills. New group members only receive message history from their
 join time. `supabase/schema.sql` is the full schema snapshot for reference.
+The E2EE registration function verifies each device certificate against the
+account signing key before its public device keys can enter the database.
 
 2. In Supabase Auth, enable Email, Phone, and Google providers.
 3. Enable email confirmation if you want signups to require confirm-email.
@@ -239,6 +242,7 @@ flutter analyze
 flutter test
 flutter build web
 npx -y deno@latest test --allow-env supabase/functions/notification-dispatch
+npx -y deno@latest test --allow-env supabase/functions/e2ee-register-device
 npx supabase db push --dry-run
 ```
 

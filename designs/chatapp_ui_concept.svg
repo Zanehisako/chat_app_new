@@ -1,0 +1,293 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1200" viewBox="0 0 1800 1200" role="img" aria-labelledby="title desc">
+  <title id="title">ChatApp animation-friendly mobile UI concept</title>
+  <desc id="desc">Four mobile screen designs for inbox, direct messaging, group calling, and end-to-end encryption onboarding.</desc>
+  <defs>
+    <linearGradient id="pageBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#F8F7FC"/>
+      <stop offset="0.48" stop-color="#EFECF8"/>
+      <stop offset="1" stop-color="#E8F6EF"/>
+    </linearGradient>
+    <linearGradient id="violet" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#9B5CFF"/>
+      <stop offset="1" stop-color="#6C3BFF"/>
+    </linearGradient>
+    <linearGradient id="lime" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#D8FF5F"/>
+      <stop offset="1" stop-color="#89F08E"/>
+    </linearGradient>
+    <linearGradient id="coral" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFB26B"/>
+      <stop offset="1" stop-color="#FF6E8A"/>
+    </linearGradient>
+    <linearGradient id="blue" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#79E8FF"/>
+      <stop offset="1" stop-color="#5685FF"/>
+    </linearGradient>
+    <linearGradient id="night" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1B1B22"/>
+      <stop offset="1" stop-color="#0F1014"/>
+    </linearGradient>
+    <filter id="phoneShadow" x="-30%" y="-20%" width="160%" height="170%">
+      <feDropShadow dx="0" dy="24" stdDeviation="25" flood-color="#322B53" flood-opacity="0.18"/>
+    </filter>
+    <filter id="softShadow" x="-40%" y="-40%" width="180%" height="180%">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#4A416A" flood-opacity="0.13"/>
+    </filter>
+    <filter id="glow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="12" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <clipPath id="screenClip"><rect x="12" y="12" width="336" height="806" rx="42"/></clipPath>
+    <style>
+      text { font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .ink { fill: #17171C; }
+      .muted { fill: #777482; }
+      .tiny { font-size: 10px; font-weight: 650; letter-spacing: .2px; }
+      .caption { font-size: 12px; font-weight: 550; }
+      .body { font-size: 14px; font-weight: 560; }
+      .label { font-size: 13px; font-weight: 720; }
+      .h2 { font-size: 22px; font-weight: 780; letter-spacing: -.5px; }
+      .white { fill: #FFFFFF; }
+      .whiteMuted { fill: #B6B3C1; }
+      .line { stroke: #DFDCE8; stroke-width: 1; }
+      .icon { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+    </style>
+  </defs>
+
+  <rect width="1800" height="1200" fill="url(#pageBg)"/>
+  <circle cx="150" cy="140" r="245" fill="#FFFFFF" opacity=".44"/>
+  <circle cx="1645" cy="1050" r="330" fill="#C8F7D6" opacity=".25"/>
+  <path d="M1070 0 C1260 170 1340 65 1510 150 S1760 235 1800 85 L1800 0Z" fill="#CFC5FF" opacity=".22"/>
+
+  <g transform="translate(84 68)">
+    <rect width="176" height="36" rx="18" fill="#17171C"/>
+    <circle cx="20" cy="18" r="6" fill="#A575FF"/>
+    <text x="36" y="23" class="caption white" font-weight="750">CHATAPP CONCEPT</text>
+  </g>
+  <text x="84" y="158" class="ink" font-size="54" font-weight="820" letter-spacing="-2.4">Conversation, with a little bounce.</text>
+  <text x="86" y="202" class="muted" font-size="18" font-weight="530">An original motion-first interface inspired by rounded surfaces, bold contrast and floating actions.</text>
+  <g transform="translate(1472 94)">
+    <rect width="244" height="70" rx="24" fill="#FFFFFF" opacity=".8"/>
+    <text x="24" y="29" class="tiny muted">MOTION SYSTEM</text>
+    <text x="24" y="51" class="label ink">Springy · Layered · Clear</text>
+  </g>
+
+  <!-- Screen labels -->
+  <g transform="translate(90 238)"><rect width="156" height="34" rx="17" fill="#FFFFFF"/><text x="18" y="22" class="tiny ink">01  SMART INBOX</text></g>
+  <g transform="translate(510 238)"><rect width="182" height="34" rx="17" fill="#17171C"/><text x="18" y="22" class="tiny white">02  CONVERSATION</text></g>
+  <g transform="translate(930 238)"><rect width="168" height="34" rx="17" fill="#17171C"/><text x="18" y="22" class="tiny white">03  GROUP CALL</text></g>
+  <g transform="translate(1350 238)"><rect width="196" height="34" rx="17" fill="#FFFFFF"/><text x="18" y="22" class="tiny ink">04  SECURE DEVICE</text></g>
+
+  <!-- PHONE 1: INBOX -->
+  <g transform="translate(78 286)" filter="url(#phoneShadow)">
+    <rect width="360" height="830" rx="56" fill="#16161B"/>
+    <g clip-path="url(#screenClip)">
+      <rect x="12" y="12" width="336" height="806" rx="42" fill="#FCFBFE"/>
+      <text x="38" y="49" class="tiny ink">9:41</text>
+      <g transform="translate(274 39)" stroke="#17171C" fill="none" stroke-width="1.7">
+        <path d="M0 8h3V5h3V2h3"/>
+        <path d="M15 4c4-4 10-4 14 0M18 7c2.5-2.5 5.5-2.5 8 0M21 10l2 0"/>
+        <rect x="34" y="1" width="17" height="9" rx="2"/><rect x="51" y="4" width="2" height="3" rx="1" fill="#17171C"/>
+      </g>
+      <circle cx="55" cy="93" r="20" fill="url(#coral)"/>
+      <text x="55" y="98" text-anchor="middle" class="label white">Z</text>
+      <text x="84" y="88" class="tiny muted">GOOD MORNING</text>
+      <text x="84" y="108" class="h2 ink">Messages</text>
+      <g transform="translate(295 82)">
+        <circle cx="14" cy="14" r="14" fill="#EEEAF6"/>
+        <path d="M9 14h10M14 9v10" stroke="#17171C" stroke-width="2" stroke-linecap="round"/>
+      </g>
+      <g transform="translate(30 132)">
+        <rect width="300" height="44" rx="22" fill="#F0EEF5"/>
+        <circle cx="22" cy="21" r="7" fill="none" stroke="#777482" stroke-width="1.8"/>
+        <path d="M27 27l5 5" stroke="#777482" stroke-width="1.8" stroke-linecap="round"/>
+        <text x="43" y="27" class="caption muted">Search conversations</text>
+        <rect x="258" y="9" width="33" height="26" rx="13" fill="#FFFFFF"/>
+        <path d="M269 17h10M266 22h16M271 27h6" stroke="#17171C" stroke-width="1.6" stroke-linecap="round"/>
+      </g>
+      <text x="30" y="205" class="label ink">Active now</text>
+      <text x="276" y="205" class="tiny" fill="#6C3BFF">SEE ALL</text>
+      <g transform="translate(30 217)">
+        <g><circle cx="25" cy="25" r="25" fill="url(#violet)"/><text x="25" y="30" text-anchor="middle" class="label white">M</text><circle cx="43" cy="43" r="6" fill="#58D981" stroke="#FCFBFE" stroke-width="3"/><text x="25" y="66" text-anchor="middle" class="tiny ink">Maya</text></g>
+        <g transform="translate(67)"><circle cx="25" cy="25" r="25" fill="url(#blue)"/><text x="25" y="30" text-anchor="middle" class="label white">T</text><circle cx="43" cy="43" r="6" fill="#58D981" stroke="#FCFBFE" stroke-width="3"/><text x="25" y="66" text-anchor="middle" class="tiny ink">Theo</text></g>
+        <g transform="translate(134)"><circle cx="25" cy="25" r="25" fill="url(#lime)"/><text x="25" y="30" text-anchor="middle" class="label ink">K</text><circle cx="43" cy="43" r="6" fill="#58D981" stroke="#FCFBFE" stroke-width="3"/><text x="25" y="66" text-anchor="middle" class="tiny ink">Kai</text></g>
+        <g transform="translate(201)"><circle cx="25" cy="25" r="25" fill="url(#coral)"/><text x="25" y="30" text-anchor="middle" class="label white">L</text><circle cx="43" cy="43" r="6" fill="#58D981" stroke="#FCFBFE" stroke-width="3"/><text x="25" y="66" text-anchor="middle" class="tiny ink">Lina</text></g>
+        <g transform="translate(268)"><circle cx="25" cy="25" r="25" fill="#ECE9F2"/><text x="25" y="30" text-anchor="middle" class="label ink">+8</text><text x="25" y="66" text-anchor="middle" class="tiny ink">More</text></g>
+      </g>
+      <g transform="translate(30 307)">
+        <rect width="54" height="30" rx="15" fill="#17171C"/><text x="27" y="20" text-anchor="middle" class="tiny white">ALL</text>
+        <rect x="62" width="72" height="30" rx="15" fill="#F0EEF5"/><text x="98" y="20" text-anchor="middle" class="tiny muted">UNREAD</text>
+        <rect x="142" width="54" height="30" rx="15" fill="#F0EEF5"/><text x="169" y="20" text-anchor="middle" class="tiny muted">READ</text>
+      </g>
+      <g transform="translate(24 356)">
+        <rect width="312" height="82" rx="26" fill="#FFFFFF" filter="url(#softShadow)"/>
+        <circle cx="44" cy="41" r="25" fill="url(#violet)"/><text x="44" y="46" text-anchor="middle" class="label white">M</text>
+        <text x="82" y="29" class="label ink">Maya Chen</text><text x="262" y="29" class="tiny muted">2m</text>
+        <text x="82" y="51" class="caption" fill="#6C3BFF">typing a message…</text>
+        <rect x="268" y="49" width="24" height="24" rx="12" fill="#D8FF5F"/><text x="280" y="65" text-anchor="middle" class="tiny ink">3</text>
+      </g>
+      <g transform="translate(24 450)">
+        <rect width="312" height="76" rx="24" fill="#F5F3F8"/>
+        <circle cx="44" cy="38" r="24" fill="url(#lime)"/><text x="44" y="43" text-anchor="middle" class="label ink">W</text>
+        <text x="82" y="29" class="label ink">Weekend crew</text><text x="262" y="29" class="tiny muted">18m</text>
+        <text x="82" y="51" class="caption muted">Theo: Photo · Lake day?</text>
+      </g>
+      <g transform="translate(24 538)">
+        <rect width="312" height="76" rx="24" fill="#F5F3F8"/>
+        <circle cx="44" cy="38" r="24" fill="url(#blue)"/><text x="44" y="43" text-anchor="middle" class="label white">A</text>
+        <text x="82" y="29" class="label ink">Alex Rivera</text><text x="255" y="29" class="tiny muted">1h</text>
+        <text x="82" y="51" class="caption muted">✓✓ Voice message · 0:18</text>
+      </g>
+      <g transform="translate(24 626)">
+        <rect width="312" height="76" rx="24" fill="#F5F3F8"/>
+        <circle cx="44" cy="38" r="24" fill="url(#coral)"/><text x="44" y="43" text-anchor="middle" class="label white">S</text>
+        <text x="82" y="29" class="label ink">Studio team</text><text x="255" y="29" class="tiny muted">3h</text>
+        <text x="82" y="51" class="caption muted">You: Sent the final mockups</text>
+      </g>
+      <g transform="translate(24 728)">
+        <rect width="312" height="66" rx="27" fill="#17171C"/>
+        <path d="M31 26h14M38 19v14" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round"/>
+        <text x="58" y="39" class="label white">New chat</text>
+        <g transform="translate(234 11)"><circle cx="22" cy="22" r="22" fill="url(#violet)"/><path d="M15 22h14M22 15v14" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round"/></g>
+      </g>
+    </g>
+  </g>
+
+  <!-- PHONE 2: CONVERSATION -->
+  <g transform="translate(498 286)" filter="url(#phoneShadow)">
+    <rect width="360" height="830" rx="56" fill="#0B0C0F"/>
+    <g clip-path="url(#screenClip)">
+      <rect x="12" y="12" width="336" height="806" rx="42" fill="url(#night)"/>
+      <text x="38" y="49" class="tiny white">9:41</text>
+      <g transform="translate(274 39)" stroke="#FFFFFF" fill="none" stroke-width="1.7" opacity=".9"><path d="M0 8h3V5h3V2h3"/><path d="M15 4c4-4 10-4 14 0M18 7c2.5-2.5 5.5-2.5 8 0M21 10l2 0"/><rect x="34" y="1" width="17" height="9" rx="2"/><rect x="51" y="4" width="2" height="3" rx="1" fill="#FFF"/></g>
+      <path d="M35 97l-8 8 8 8" stroke="#FFFFFF" stroke-width="2.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="70" cy="104" r="22" fill="url(#violet)"/><text x="70" y="109" text-anchor="middle" class="label white">M</text>
+      <text x="101" y="99" class="label white">Maya Chen</text><text x="101" y="117" class="tiny" fill="#91F0A5">typing…</text>
+      <g transform="translate(258 89)" stroke="#FFFFFF" fill="none" stroke-width="1.8"><rect x="0" y="5" width="17" height="13" rx="4"/><path d="M17 9l6-4v13l-6-4"/><path d="M44 5c2 5 6 9 11 11l4-4 6 3c-1 7-5 10-11 8-10-4-17-12-19-22-1-6 3-9 8-10l3 7-4 3z" transform="scale(.7) translate(11 10)"/></g>
+      <rect x="31" y="146" width="122" height="27" rx="13.5" fill="#292932"/><text x="92" y="164" text-anchor="middle" class="tiny whiteMuted">TODAY · ENCRYPTED</text>
+      <g transform="translate(29 199)">
+        <circle cx="18" cy="17" r="17" fill="url(#violet)"/><text x="18" y="22" text-anchor="middle" class="tiny white">M</text>
+        <rect x="45" width="214" height="67" rx="23" fill="#FFFFFF"/>
+        <text x="62" y="27" class="body ink">Are we still on for tonight?</text><text x="62" y="49" class="tiny muted">18:42</text>
+      </g>
+      <g transform="translate(91 286)">
+        <rect width="228" height="102" rx="25" fill="url(#violet)"/>
+        <rect x="14" y="13" width="198" height="34" rx="11" fill="#FFFFFF" opacity=".15"/>
+        <rect x="14" y="13" width="3" height="34" rx="1.5" fill="#D8FF5F"/>
+        <text x="26" y="29" class="tiny white">MAYA</text><text x="26" y="42" class="tiny" fill="#E4D9FF">still on for tonight?</text>
+        <text x="16" y="72" class="body white">Absolutely — 8 works ✨</text>
+        <text x="170" y="91" class="tiny" fill="#E4D9FF">18:43  ✓✓</text>
+        <g transform="translate(159 83)"><rect width="61" height="30" rx="15" fill="#FFFFFF"/><text x="14" y="20" font-size="15">💜</text><text x="39" y="20" class="tiny ink">2</text></g>
+      </g>
+      <g transform="translate(29 421)">
+        <circle cx="18" cy="17" r="17" fill="url(#violet)"/><text x="18" y="22" text-anchor="middle" class="tiny white">M</text>
+        <rect x="45" width="240" height="72" rx="24" fill="#FFFFFF"/>
+        <circle cx="72" cy="36" r="17" fill="#17171C"/><path d="M68 28l12 8-12 8z" fill="#FFFFFF"/>
+        <g transform="translate(101 20)" fill="#7F52FF"><rect width="3" height="22" rx="1.5"/><rect x="7" y="6" width="3" height="10" rx="1.5"/><rect x="14" y="2" width="3" height="18" rx="1.5"/><rect x="21" y="8" width="3" height="7" rx="1.5"/><rect x="28" y="4" width="3" height="14" rx="1.5"/><rect x="35" y="0" width="3" height="22" rx="1.5"/><rect x="42" y="5" width="3" height="12" rx="1.5"/><rect x="49" y="8" width="3" height="7" rx="1.5"/><rect x="56" y="3" width="3" height="17" rx="1.5"/><rect x="63" y="7" width="3" height="9" rx="1.5"/><rect x="70" y="1" width="3" height="20" rx="1.5"/><rect x="77" y="5" width="3" height="12" rx="1.5"/></g>
+        <text x="246" y="42" class="tiny muted">0:18</text>
+      </g>
+      <g transform="translate(132 527)">
+        <rect width="187" height="71" rx="24" fill="#D8FF5F"/>
+        <text x="17" y="29" class="body ink">Meet by the north gate.</text><text x="126" y="53" class="tiny muted">18:45  ✓✓</text>
+      </g>
+      <g transform="translate(29 627)">
+        <circle cx="18" cy="17" r="17" fill="url(#violet)"/><text x="18" y="22" text-anchor="middle" class="tiny white">M</text>
+        <rect x="45" width="177" height="54" rx="22" fill="#FFFFFF"/><text x="62" y="33" class="body ink">Perfect. See you! 👋</text>
+      </g>
+      <g transform="translate(25 722)">
+        <rect width="310" height="70" rx="29" fill="#2A2A31"/>
+        <circle cx="31" cy="35" r="18" fill="#3A3943"/><path d="M25 35h12M31 29v12" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round"/>
+        <text x="59" y="41" class="body whiteMuted">Message…</text>
+        <text x="228" y="42" font-size="20">☺</text>
+        <circle cx="278" cy="35" r="23" fill="url(#violet)" filter="url(#glow)"/><path d="M270 35l6 6 11-14" stroke="#FFFFFF" stroke-width="2.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+      </g>
+    </g>
+  </g>
+
+  <!-- PHONE 3: GROUP CALL -->
+  <g transform="translate(918 286)" filter="url(#phoneShadow)">
+    <rect width="360" height="830" rx="56" fill="#0B0C0F"/>
+    <g clip-path="url(#screenClip)">
+      <rect x="12" y="12" width="336" height="806" rx="42" fill="#101116"/>
+      <text x="38" y="49" class="tiny white">9:41</text>
+      <path d="M36 95l-8 8 8 8" stroke="#FFFFFF" stroke-width="2.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="60" y="101" class="label white">Weekend crew</text><text x="60" y="120" class="tiny" fill="#91F0A5">4 connected</text>
+      <circle cx="307" cy="102" r="18" fill="#292A31"/><circle cx="300" cy="102" r="2" fill="#FFFFFF"/><circle cx="307" cy="102" r="2" fill="#FFFFFF"/><circle cx="314" cy="102" r="2" fill="#FFFFFF"/>
+      <g transform="translate(26 148)">
+        <g><rect width="147" height="190" rx="29" fill="url(#violet)"/><circle cx="73.5" cy="77" r="38" fill="#FFFFFF" opacity=".17"/><text x="73.5" y="87" text-anchor="middle" fill="#FFFFFF" font-size="31" font-weight="760">M</text><rect x="15" y="150" width="79" height="26" rx="13" fill="#17171C" opacity=".75"/><text x="29" y="167" class="tiny white">Maya · host</text><circle cx="124" cy="163" r="13" fill="#FFFFFF" opacity=".18"/><path d="M124 156v9M120 162a4 4 0 0 0 8 0M124 166v4M120 170h8" stroke="#FFFFFF" stroke-width="1.5" fill="none" stroke-linecap="round"/></g>
+        <g transform="translate(157)"><rect width="147" height="190" rx="29" fill="url(#blue)"/><circle cx="73.5" cy="77" r="38" fill="#FFFFFF" opacity=".17"/><text x="73.5" y="87" text-anchor="middle" fill="#FFFFFF" font-size="31" font-weight="760">T</text><rect x="15" y="150" width="58" height="26" rx="13" fill="#17171C" opacity=".75"/><text x="29" y="167" class="tiny white">Theo</text><circle cx="124" cy="163" r="13" fill="#17171C" opacity=".42"/><path d="M118 157l12 12M124 156v8M120 162a4 4 0 0 0 5 4M124 168v2M120 170h8" stroke="#FFFFFF" stroke-width="1.5" fill="none" stroke-linecap="round"/></g>
+        <g transform="translate(0 200)"><rect width="147" height="190" rx="29" fill="url(#lime)"/><circle cx="73.5" cy="77" r="38" fill="#17171C" opacity=".10"/><text x="73.5" y="87" text-anchor="middle" fill="#17171C" font-size="31" font-weight="760">K</text><rect x="15" y="150" width="48" height="26" rx="13" fill="#17171C" opacity=".78"/><text x="29" y="167" class="tiny white">Kai</text><circle cx="124" cy="163" r="13" fill="#17171C" opacity=".15"/><path d="M124 156v9M120 162a4 4 0 0 0 8 0M124 166v4M120 170h8" stroke="#17171C" stroke-width="1.5" fill="none" stroke-linecap="round"/></g>
+        <g transform="translate(157 200)"><rect width="147" height="190" rx="29" fill="url(#coral)"/><circle cx="73.5" cy="77" r="38" fill="#FFFFFF" opacity=".18"/><text x="73.5" y="87" text-anchor="middle" fill="#FFFFFF" font-size="31" font-weight="760">L</text><rect x="15" y="150" width="52" height="26" rx="13" fill="#17171C" opacity=".75"/><text x="29" y="167" class="tiny white">Lina</text><circle cx="124" cy="163" r="13" fill="#FFFFFF" opacity=".18"/><path d="M124 156v9M120 162a4 4 0 0 0 8 0M124 166v4M120 170h8" stroke="#FFFFFF" stroke-width="1.5" fill="none" stroke-linecap="round"/></g>
+      </g>
+      <g transform="translate(36 572)">
+        <rect width="288" height="47" rx="23.5" fill="#1D1E24"/>
+        <circle cx="25" cy="23.5" r="6" fill="#91F0A5" filter="url(#glow)"/><text x="43" y="29" class="caption white">Alex is joining the call…</text><text x="250" y="29" class="tiny" fill="#91F0A5">+1</text>
+      </g>
+      <g transform="translate(28 651)">
+        <circle cx="33" cy="33" r="31" fill="#2A2B32"/><path d="M33 22v14M26 32a7 7 0 0 0 14 0M33 39v7M27 46h12" stroke="#FFFFFF" stroke-width="2" fill="none" stroke-linecap="round"/>
+        <circle cx="111" cy="33" r="31" fill="#2A2B32"/><rect x="98" y="24" width="18" height="17" rx="5" fill="none" stroke="#FFFFFF" stroke-width="2"/><path d="M116 29l8-5v17l-8-5" stroke="#FFFFFF" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="189" cy="33" r="31" fill="#2A2B32"/><path d="M181 24h16v18h-16zM181 30l-7-5v16l7-5" stroke="#FFFFFF" stroke-width="2" fill="none" stroke-linejoin="round"/>
+        <circle cx="267" cy="33" r="31" fill="#FF5678"/><path d="M255 31c8 5 16 5 24 0M258 28l-5 8M276 28l5 8" stroke="#FFFFFF" stroke-width="2.4" fill="none" stroke-linecap="round"/>
+      </g>
+      <text x="61" y="730" text-anchor="middle" class="tiny whiteMuted">Mute</text><text x="139" y="730" text-anchor="middle" class="tiny whiteMuted">Camera</text><text x="217" y="730" text-anchor="middle" class="tiny whiteMuted">Flip</text><text x="295" y="730" text-anchor="middle" class="tiny" fill="#FF8CA1">Leave</text>
+      <g transform="translate(52 757)"><rect width="256" height="37" rx="18.5" fill="#1D1E24"/><circle cx="24" cy="18.5" r="9" fill="url(#violet)"/><circle cx="35" cy="18.5" r="9" fill="url(#blue)"/><circle cx="46" cy="18.5" r="9" fill="url(#lime)"/><text x="65" y="23" class="tiny whiteMuted">4 of 8 members connected</text></g>
+    </g>
+  </g>
+
+  <!-- PHONE 4: E2EE -->
+  <g transform="translate(1338 286)" filter="url(#phoneShadow)">
+    <rect width="360" height="830" rx="56" fill="#16161B"/>
+    <g clip-path="url(#screenClip)">
+      <rect x="12" y="12" width="336" height="806" rx="42" fill="#FCFBFE"/>
+      <text x="38" y="49" class="tiny ink">9:41</text>
+      <text x="30" y="102" class="tiny" fill="#6C3BFF">END-TO-END ENCRYPTION</text>
+      <text x="30" y="133" class="h2 ink">Secure this device</text>
+      <text x="30" y="157" class="caption muted">Save your recovery phrase before chatting.</text>
+      <g transform="translate(72 188)">
+        <circle cx="108" cy="91" r="75" fill="#EDE8FF"/>
+        <circle cx="108" cy="91" r="58" fill="#DFD5FF"/>
+        <path d="M108 43c19 11 38 13 38 13v31c0 28-16 46-38 57-22-11-38-29-38-57V56s19-2 38-13z" fill="url(#violet)"/>
+        <rect x="91" y="83" width="34" height="30" rx="9" fill="#FFFFFF"/>
+        <path d="M99 83v-9a9 9 0 0 1 18 0v9" stroke="#FFFFFF" stroke-width="6" fill="none"/>
+        <circle cx="108" cy="96" r="4" fill="#6C3BFF"/><path d="M108 100v6" stroke="#6C3BFF" stroke-width="3" stroke-linecap="round"/>
+        <circle cx="31" cy="52" r="14" fill="#D8FF5F"/><text x="31" y="56" text-anchor="middle" class="tiny ink">01</text>
+        <circle cx="186" cy="61" r="14" fill="#FFFFFF"/><text x="186" y="65" text-anchor="middle" class="tiny ink">12</text>
+        <circle cx="44" cy="143" r="14" fill="#FFFFFF"/><text x="44" y="147" text-anchor="middle" class="tiny ink">18</text>
+        <circle cx="179" cy="144" r="14" fill="#FF9DAE"/><text x="179" y="148" text-anchor="middle" class="tiny ink">24</text>
+        <path d="M42 51C65 4 153 1 180 57M46 144c35 36 95 43 132 1" stroke="#9B5CFF" stroke-width="2" stroke-dasharray="5 7" fill="none" opacity=".55"/>
+      </g>
+      <g transform="translate(28 388)">
+        <rect width="304" height="184" rx="29" fill="#F1EEF8"/>
+        <text x="20" y="29" class="tiny muted">YOUR 24-WORD RECOVERY PHRASE</text>
+        <g transform="translate(18 44)">
+          <g><rect width="81" height="30" rx="15" fill="#FFFFFF"/><text x="12" y="20" class="tiny muted">01</text><text x="34" y="20" class="tiny ink">violet</text></g>
+          <g transform="translate(91)"><rect width="81" height="30" rx="15" fill="#FFFFFF"/><text x="12" y="20" class="tiny muted">02</text><text x="34" y="20" class="tiny ink">orbit</text></g>
+          <g transform="translate(182)"><rect width="85" height="30" rx="15" fill="#FFFFFF"/><text x="12" y="20" class="tiny muted">03</text><text x="34" y="20" class="tiny ink">garden</text></g>
+          <g transform="translate(0 40)"><rect width="81" height="30" rx="15" fill="#FFFFFF"/><text x="12" y="20" class="tiny muted">04</text><text x="34" y="20" class="tiny ink">paper</text></g>
+          <g transform="translate(91 40)"><rect width="81" height="30" rx="15" fill="#FFFFFF"/><text x="12" y="20" class="tiny muted">05</text><text x="34" y="20" class="tiny ink">bloom</text></g>
+          <g transform="translate(182 40)"><rect width="85" height="30" rx="15" fill="#FFFFFF"/><text x="12" y="20" class="tiny muted">06</text><text x="34" y="20" class="tiny ink">cobalt</text></g>
+          <g transform="translate(0 80)"><rect width="81" height="30" rx="15" fill="#FFFFFF"/><text x="12" y="20" class="tiny muted">07</text><text x="34" y="20" class="tiny ink">echo</text></g>
+          <g transform="translate(91 80)"><rect width="81" height="30" rx="15" fill="#FFFFFF"/><text x="12" y="20" class="tiny muted">08</text><text x="34" y="20" class="tiny ink">marble</text></g>
+          <g transform="translate(182 80)"><rect width="85" height="30" rx="15" fill="#FFFFFF"/><text x="12" y="20" class="tiny muted">••</text><text x="34" y="20" class="tiny ink">+16</text></g>
+        </g>
+        <g transform="translate(20 155)"><path d="M0 0h264" stroke="#DDD8E8"/><text x="0" y="22" class="tiny" fill="#6C3BFF">HOLD TO REVEAL</text><path d="M240 13c7-8 14-8 21 0-7 8-14 8-21 0z" fill="none" stroke="#6C3BFF" stroke-width="1.5"/><circle cx="250.5" cy="13" r="3" fill="#6C3BFF"/></g>
+      </g>
+      <g transform="translate(30 596)">
+        <rect width="300" height="61" rx="20" fill="#FFFFFF" filter="url(#softShadow)"/>
+        <rect x="15" y="18" width="24" height="24" rx="8" fill="#17171C"/><path d="M21 30l5 5 8-10" stroke="#D8FF5F" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+        <text x="53" y="28" class="label ink">I saved it safely</text><text x="53" y="46" class="tiny muted">You’ll need it on a new device.</text>
+      </g>
+      <g transform="translate(30 681)">
+        <rect width="300" height="62" rx="25" fill="url(#violet)"/>
+        <text x="122" y="38" text-anchor="middle" class="label white">Continue securely</text>
+        <circle cx="266" cy="31" r="21" fill="#FFFFFF" opacity=".18"/><path d="M258 31h14M267 25l6 6-6 6" stroke="#FFFFFF" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+      </g>
+      <text x="180" y="776" text-anchor="middle" class="tiny muted">Your phrase never leaves this device.</text>
+    </g>
+  </g>
+
+  <g transform="translate(82 1147)">
+    <circle cx="6" cy="6" r="6" fill="#6C3BFF"/><text x="22" y="10" class="tiny muted">Each surface is a separate layer: cards, avatars, chips, bubbles and controls can animate independently.</text>
+    <text x="1470" y="10" class="tiny muted">1800 × 1200 · EDITABLE SVG</text>
+  </g>
+</svg>

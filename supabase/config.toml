@@ -8,3 +8,6 @@ verify_jwt = false
 
 [functions.group-call-control]
 verify_jwt = false
+
+[functions.e2ee-register-device]
+verify_jwt = true

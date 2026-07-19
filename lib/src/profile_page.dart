@@ -8,6 +8,7 @@ import 'chat_models.dart';
 import 'chat_repository.dart';
 import 'notification_registration.dart';
 import 'notification_service.dart';
+import 'motion/chat_motion_widgets.dart';
 
 class ProfilePage extends StatefulWidget {
   const ProfilePage({super.key, required this.repository});
@@ -70,27 +71,38 @@ class _ProfilePageState extends State<ProfilePage> {
               _fillForm(profile);
             }
 
+            late final Widget content;
             if (snapshot.connectionState == ConnectionState.waiting &&
                 profile == null) {
-              return const Center(child: CircularProgressIndicator());
+              content = const Center(
+                key: ValueKey<String>('profile-loading'),
+                child: CircularProgressIndicator(),
+              );
+            } else if (snapshot.hasError && profile == null) {
+              content = _ProfileError(
+                key: const ValueKey<String>('profile-error'),
+                onRetry: _retryLoad,
+              );
+            } else {
+              content = ChatEntrance(
+                key: const ValueKey<String>('profile-form'),
+                beginOffset: const Offset(0, 8),
+                child: _ProfileForm(
+                  formKey: _formKey,
+                  profile: profile!,
+                  displayNameController: _displayNameController,
+                  emailController: _emailController,
+                  phoneController: _phoneController,
+                  isSaving: _isSaving,
+                  notificationStatus: _notificationStatus,
+                  notificationsAvailable: widget.repository.client != null,
+                  onNotificationsChanged: _setNotificationsEnabled,
+                  onSave: _saveProfile,
+                ),
+              );
             }
 
-            if (snapshot.hasError && profile == null) {
-              return _ProfileError(onRetry: _retryLoad);
-            }
-
-            return _ProfileForm(
-              formKey: _formKey,
-              profile: profile!,
-              displayNameController: _displayNameController,
-              emailController: _emailController,
-              phoneController: _phoneController,
-              isSaving: _isSaving,
-              notificationStatus: _notificationStatus,
-              notificationsAvailable: widget.repository.client != null,
-              onNotificationsChanged: _setNotificationsEnabled,
-              onSave: _saveProfile,
-            );
+            return ChatStateSwitcher(child: content);
           },
         ),
       ),
@@ -367,7 +379,15 @@ class _ProfileForm extends StatelessWidget {
                   contentPadding: const EdgeInsets.symmetric(horizontal: 4),
                   secondary: const Icon(Icons.notifications_outlined),
                   title: const Text('Notifications'),
-                  subtitle: Text(_notificationStatusLabel(notificationStatus)),
+                  subtitle: ChatStateSwitcher(
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      _notificationStatusLabel(notificationStatus),
+                      key: ValueKey<NotificationRegistrationState>(
+                        notificationStatus.state,
+                      ),
+                    ),
+                  ),
                   value: notificationStatus.isEnabled,
                   onChanged:
                       !notificationsAvailable ||
@@ -378,17 +398,31 @@ class _ProfileForm extends StatelessWidget {
                       : onNotificationsChanged,
                 ),
                 const SizedBox(height: 22),
-                FilledButton.icon(
-                  key: const Key('profile-save'),
-                  onPressed: isSaving ? null : onSave,
-                  icon: isSaving
-                      ? const SizedBox(
-                          width: 18,
-                          height: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.save_outlined),
-                  label: Text(isSaving ? 'Saving' : 'Save changes'),
+                ChatPressScale(
+                  enabled: !isSaving,
+                  child: FilledButton.icon(
+                    key: const Key('profile-save'),
+                    onPressed: isSaving ? null : onSave,
+                    icon: ChatStateSwitcher(
+                      child: isSaving
+                          ? const SizedBox(
+                              key: ValueKey<String>('profile-saving'),
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(
+                              Icons.save_outlined,
+                              key: ValueKey<String>('profile-save-icon'),
+                            ),
+                    ),
+                    label: ChatStateSwitcher(
+                      child: Text(
+                        isSaving ? 'Saving' : 'Save changes',
+                        key: ValueKey<bool>(isSaving),
+                      ),
+                    ),
+                  ),
                 ),
               ],
             ),
@@ -440,7 +474,7 @@ class _ProfileAvatar extends StatelessWidget {
 }
 
 class _ProfileError extends StatelessWidget {
-  const _ProfileError({required this.onRetry});
+  const _ProfileError({super.key, required this.onRetry});
 
   final VoidCallback onRetry;
 

@@ -1,5 +1,13 @@
 import 'chat_models.dart';
 
+/// Marks a delivery error that will not succeed through automatic retries.
+///
+/// The queued message remains available for an explicit retry after the user
+/// fixes the underlying account, device, or encryption state.
+abstract interface class NonRetryableOutboxSendError implements Exception {
+  String get message;
+}
+
 abstract interface class OutboxMessageSender {
   bool get isOutboxReady;
 
