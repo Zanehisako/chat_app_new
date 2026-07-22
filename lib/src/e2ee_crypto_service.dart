@@ -172,7 +172,11 @@ class E2eeDeviceIdentity {
           value['recipient_user_id']?.toString() ??
           value['created_by_user_id']?.toString() ??
           '',
-      encryptionPublicKey: value['encryption_public_key']?.toString() ?? '',
+      encryptionPublicKey:
+          value['encryption_public_key']?.toString() ??
+          value['creator_device_encryption_public_key']?.toString() ??
+          value['creator_encryption_public_key']?.toString() ??
+          '',
       signingPublicKey:
           value['signing_public_key']?.toString() ??
           value['creator_device_signing_public_key']?.toString() ??
@@ -278,6 +282,21 @@ class E2eeKeyEnvelope {
           value['ciphertext']?.toString() ??
           '',
       creator: E2eeDeviceIdentity.fromBackend(value),
+    );
+  }
+
+  E2eeKeyEnvelope copyWith({E2eeDeviceIdentity? creator}) {
+    return E2eeKeyEnvelope(
+      conversationId: conversationId,
+      epochId: epochId,
+      epochNumber: epochNumber,
+      membershipVersion: membershipVersion,
+      commitment: commitment,
+      epochSignature: epochSignature,
+      createdByUserId: createdByUserId,
+      createdByDeviceId: createdByDeviceId,
+      ciphertext: ciphertext,
+      creator: creator ?? this.creator,
     );
   }
 }

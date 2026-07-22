@@ -1599,6 +1599,7 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
 
           final messages = <ChatMessage>[];
           for (final message in hydrated) {
+            if (!message.isEncrypted) continue;
             final row = messageRows.firstWhere(
               (candidate) => candidate['id']?.toString() == message.id,
             );
@@ -2353,7 +2354,7 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
       );
       if (recipient.isDevice) {
         final identity = E2eeDeviceIdentity.fromBackend(row);
-        await _ensureDeviceIdentity(identity);
+        await _ensureDeviceIdentity(identity, conversationId: conversationId);
       }
       recipients.add(recipient);
     }
@@ -2445,8 +2446,17 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
             (epochId == null || row['epoch_id']?.toString() == epochId);
       }).toList();
       if (matching.isEmpty) return null;
-      final envelope = E2eeKeyEnvelope.fromBackend(matching.last);
-      await _ensureDeviceIdentity(envelope.creator);
+      var envelope = E2eeKeyEnvelope.fromBackend(matching.last);
+      var creator = envelope.creator;
+      if (creator.encryptionPublicKey.isEmpty) {
+        creator = await _deviceIdentityFor(
+          conversationId: conversationId,
+          deviceId: creator.deviceId,
+        );
+        envelope = envelope.copyWith(creator: creator);
+      } else {
+        await _ensureDeviceIdentity(creator, conversationId: conversationId);
+      }
       return _crypto.openEpochEnvelope(
         userId: user.id,
         envelope: envelope,
@@ -2494,13 +2504,24 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
     }
   }
 
-  Future<void> _ensureDeviceIdentity(E2eeDeviceIdentity identity) async {
+  Future<void> _ensureDeviceIdentity(
+    E2eeDeviceIdentity identity, {
+    String? conversationId,
+  }) async {
     if (identity.deviceId.isEmpty ||
         identity.userId.isEmpty ||
         identity.signingPublicKey.isEmpty ||
         identity.certificate.isEmpty ||
         identity.accountSigningPublicKey.isEmpty) {
       throw const E2eeCryptoException('An E2EE device identity is invalid.');
+    }
+    if (identity.encryptionPublicKey.isEmpty &&
+        conversationId != null &&
+        conversationId.isNotEmpty) {
+      identity = await _deviceIdentityFor(
+        conversationId: conversationId,
+        deviceId: identity.deviceId,
+      );
     }
     await _observeRemoteAccount(
       userId: identity.userId,
@@ -2535,7 +2556,7 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
         certificate: localDevice.certificate,
         accountSigningPublicKey: localAccount.signingPublicKey,
       );
-      await _ensureDeviceIdentity(identity);
+      await _ensureDeviceIdentity(identity, conversationId: conversationId);
       return identity;
     }
     final result = await supabase.rpc(
@@ -2550,7 +2571,7 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
       throw const E2eeCryptoException('The sender E2EE device is unavailable.');
     }
     final identity = E2eeDeviceIdentity.fromBackend(rows.first);
-    await _ensureDeviceIdentity(identity);
+    await _ensureDeviceIdentity(identity, conversationId: conversationId);
     return identity;
   }
 
@@ -2923,7 +2944,7 @@ class ChatRepository implements OutboxMessageSender, OutboxScopeProvider {
       final summary = _ConversationSummary.fromSupabase(
         Map<String, dynamic>.from(row),
       );
-      if (summary.conversationId.isNotEmpty) {
+      if (summary.conversationId.isNotEmpty && summary.isEncrypted) {
         summaries[summary.conversationId] = await _hydrateEncryptedSummary(
           summary,
           localUserId: supabase.auth.currentUser?.id ?? '',

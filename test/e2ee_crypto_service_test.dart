@@ -269,6 +269,31 @@ void main() {
       throwsA(isA<E2eeCryptoException>()),
     );
   });
+
+  test('parses device identity from backend envelope format and verifies identity', () async {
+    final fixture = await _readyFixture(sodium);
+    final backendMap = <String, dynamic>{
+      'created_by_user_id': fixture.deviceIdentity.userId,
+      'created_by_device_id': fixture.deviceIdentity.deviceId,
+      'creator_device_encryption_public_key': fixture.deviceIdentity.encryptionPublicKey,
+      'creator_device_signing_public_key': fixture.deviceIdentity.signingPublicKey,
+      'creator_device_certificate': fixture.deviceIdentity.certificate,
+      'creator_account_signing_public_key': fixture.deviceIdentity.accountSigningPublicKey,
+    };
+
+    final identity = E2eeDeviceIdentity.fromBackend(backendMap);
+    expect(identity.userId, fixture.deviceIdentity.userId);
+    expect(identity.deviceId, fixture.deviceIdentity.deviceId);
+    expect(identity.encryptionPublicKey, fixture.deviceIdentity.encryptionPublicKey);
+    expect(identity.signingPublicKey, fixture.deviceIdentity.signingPublicKey);
+    expect(identity.certificate, fixture.deviceIdentity.certificate);
+    expect(identity.accountSigningPublicKey, fixture.deviceIdentity.accountSigningPublicKey);
+
+    await expectLater(
+      fixture.service.verifyDeviceIdentity(identity),
+      completes,
+    );
+  });
 }
 
 Future<_Fixture> _newFixture(Sodium sodium) async {
