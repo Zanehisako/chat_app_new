@@ -35,7 +35,7 @@ class ChatMessageOverlayRoute extends RawDialogRoute<ChatMessageOverlayResult> {
     bool barrierDismissible = true,
   }) : super(
           barrierDismissible: barrierDismissible,
-          barrierColor: Colors.black.withValues(alpha: 0.54),
+          barrierColor: Colors.transparent,
           barrierLabel:
               MaterialLocalizations.of(context).modalBarrierDismissLabel,
           transitionDuration: context.chatMotion.theme.standardDuration,
@@ -49,24 +49,40 @@ class ChatMessageOverlayRoute extends RawDialogRoute<ChatMessageOverlayResult> {
           },
           transitionBuilder: (context, animation, secondaryAnimation, child) {
             final policy = context.chatMotion;
-            if (policy.reduceMotion) return child;
             final curved = CurvedAnimation(
               parent: animation,
               curve: ChatMotionTheme.emphasizedDecelerate,
               reverseCurve: Curves.easeInCubic,
             );
-            return BackdropFilter(
-              filter: ImageFilter.blur(
-                sigmaX: 6 * curved.value,
-                sigmaY: 6 * curved.value,
-              ),
-              child: FadeTransition(
-                opacity: curved,
-                child: ScaleTransition(
-                  scale: Tween<double>(begin: 0.96, end: 1.0).animate(curved),
-                  child: child,
-                ),
-              ),
+            if (policy.reduceMotion) return child;
+            return AnimatedBuilder(
+              animation: curved,
+              child: child,
+              builder: (context, child) {
+                final progress = curved.value;
+                return Stack(
+                  children: [
+                    Positioned.fill(
+                      child: BackdropFilter(
+                        filter: ImageFilter.blur(
+                          sigmaX: 8 * progress,
+                          sigmaY: 8 * progress,
+                        ),
+                        child: Container(
+                          color: Colors.black.withValues(alpha: 0.54 * progress),
+                        ),
+                      ),
+                    ),
+                    FadeTransition(
+                      opacity: curved,
+                      child: ScaleTransition(
+                        scale: Tween<double>(begin: 0.96, end: 1.0).animate(curved),
+                        child: child,
+                      ),
+                    ),
+                  ],
+                );
+              },
             );
           },
         );
@@ -751,11 +767,15 @@ class _PlayfulAnimatedEmojiState extends State<PlayfulAnimatedEmoji>
             angle: rotation,
             child: Transform.scale(
               scale: scale,
-              child: Text(
-                widget.emoji,
-                style: TextStyle(
-                  fontSize: widget.baseFontSize,
-                  height: 1.0,
+              child: Opacity(
+                opacity: 1.0,
+                child: Text(
+                  widget.emoji,
+                  style: TextStyle(
+                    fontSize: widget.baseFontSize,
+                    height: 1.0,
+                    color: const Color(0xFF000000),
+                  ),
                 ),
               ),
             ),
