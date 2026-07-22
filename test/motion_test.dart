@@ -1,3 +1,4 @@
+import 'package:chat_app/src/motion/chat_message_overlay.dart';
 import 'package:chat_app/src/motion/chat_motion.dart';
 import 'package:chat_app/src/motion/chat_motion_widgets.dart';
 import 'package:flutter/foundation.dart';
@@ -176,6 +177,65 @@ void main() {
     await ChatHaptics.lightImpact();
 
     expect(received, [ChatHapticKind.selection, ChatHapticKind.lightImpact]);
+  });
+
+  testWidgets('animated reaction pill dispatches emoji selection', (
+    tester,
+  ) async {
+    String? selectedEmoji;
+    var moreClicked = false;
+
+    await tester.pumpWidget(
+      _MotionHarness(
+        builder: (context) => AnimatedReactionPill(
+          emojis: const ['❤️', '😂', '👍'],
+          onSelectEmoji: (emoji) => selectedEmoji = emoji,
+          onMoreReactions: () => moreClicked = true,
+        ),
+      ),
+    );
+
+    expect(find.text('❤️'), findsOneWidget);
+    expect(find.text('😂'), findsOneWidget);
+    expect(find.text('👍'), findsOneWidget);
+
+    await tester.tap(find.text('❤️'));
+    await tester.pump();
+
+    expect(selectedEmoji, '❤️');
+
+    await tester.tap(find.byIcon(Icons.add_rounded));
+    await tester.pump();
+
+    expect(moreClicked, isTrue);
+  });
+
+  testWidgets('floating action menu card dispatches selected action', (
+    tester,
+  ) async {
+    ChatOverlayActionKind? dispatchedAction;
+
+    await tester.pumpWidget(
+      _MotionHarness(
+        builder: (context) => FloatingActionMenuCard(
+          sent: true,
+          hasText: true,
+          isMine: true,
+          theme: ThemeData.light(),
+          onAction: (action) => dispatchedAction = action,
+        ),
+      ),
+    );
+
+    expect(find.text('Reply'), findsOneWidget);
+    expect(find.text('Copy'), findsOneWidget);
+    expect(find.text('Edit'), findsOneWidget);
+    expect(find.text('Delete'), findsOneWidget);
+
+    await tester.tap(find.text('Reply'));
+    await tester.pump();
+
+    expect(dispatchedAction, ChatOverlayActionKind.reply);
   });
 }
 

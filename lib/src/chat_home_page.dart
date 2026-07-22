@@ -27,6 +27,7 @@ import 'profile_page.dart';
 import 'motion/chat_motion.dart';
 import 'motion/chat_motion_routes.dart';
 import 'motion/chat_motion_widgets.dart';
+import 'motion/chat_message_overlay.dart';
 import 'voice_recording_file.dart';
 
 class ChatHomePage extends StatefulWidget {
@@ -6834,54 +6835,30 @@ class _MessageBubbleState extends State<_MessageBubble> {
     if (message.isLocked || message.hasInvalidEncryption) {
       return;
     }
-    final sent = message.sendState == ChatMessageSendState.sent;
+
+    final renderBox = context.findRenderObject() as RenderBox?;
+    final messageRect = renderBox != null
+        ? renderBox.localToGlobal(Offset.zero) & renderBox.size
+        : Rect.fromLTWH(
+            0,
+            MediaQuery.sizeOf(context).height / 2,
+            MediaQuery.sizeOf(context).width,
+            80,
+          );
+
     setState(() {
       _actionsOpen = true;
     });
-    _MessageAction? action;
+
+    ChatMessageOverlayResult? result;
     try {
-      action = await showChatModalBottomSheet<_MessageAction>(
-        context: context,
-        builder: (context) => SafeArea(
-          child: Wrap(
-            children: [
-              if (sent) ...[
-                _MessageActionTile(
-                  icon: Icons.reply,
-                  label: 'Reply',
-                  action: _MessageAction.reply,
-                ),
-                _MessageActionTile(
-                  icon: Icons.add_reaction_outlined,
-                  label: 'React',
-                  action: _MessageAction.react,
-                ),
-                _MessageActionTile(
-                  icon: Icons.forward,
-                  label: 'Forward',
-                  action: _MessageAction.forward,
-                ),
-              ],
-              if (message.body.trim().isNotEmpty)
-                _MessageActionTile(
-                  icon: Icons.copy_outlined,
-                  label: 'Copy',
-                  action: _MessageAction.copy,
-                ),
-              if (message.isMine && sent) ...[
-                _MessageActionTile(
-                  icon: Icons.edit_outlined,
-                  label: 'Edit',
-                  action: _MessageAction.edit,
-                ),
-                _MessageActionTile(
-                  icon: Icons.delete_outline,
-                  label: 'Delete',
-                  action: _MessageAction.delete,
-                ),
-              ],
-            ],
-          ),
+      result = await Navigator.of(context).push<ChatMessageOverlayResult>(
+        ChatMessageOverlayRoute(
+          context: context,
+          message: message,
+          messageRect: messageRect,
+          isMine: message.isMine,
+          messageWidgetBuilder: (ctx) => _buildBubbleContent(ctx),
         ),
       );
     } finally {
@@ -6891,27 +6868,143 @@ class _MessageBubbleState extends State<_MessageBubble> {
         });
       }
     }
-    if (action == null) return;
-    switch (action) {
-      case _MessageAction.reply:
+
+    if (result == null) return;
+
+    if (result.reactionEmoji case final emoji?) {
+      await onToggleReaction(message, emoji);
+      return;
+    }
+
+    switch (result.action) {
+      case ChatOverlayActionKind.reply:
         onReply(message);
         return;
-      case _MessageAction.react:
+      case ChatOverlayActionKind.react:
         await onReact(message);
         return;
-      case _MessageAction.edit:
+      case ChatOverlayActionKind.edit:
         onEdit(message);
         return;
-      case _MessageAction.delete:
+      case ChatOverlayActionKind.delete:
         await onDelete(message);
         return;
-      case _MessageAction.forward:
+      case ChatOverlayActionKind.forward:
         await onForward(message);
         return;
-      case _MessageAction.copy:
+      case ChatOverlayActionKind.copy:
         await onCopy(message);
         return;
+      case null:
+        return;
     }
+  }
+
+  Widget _buildBubbleContent(BuildContext context) {
+    final theme = Theme.of(context);
+    final isMine = message.isMine;
+    final media = message.media;
+    final encryptionUnavailable =
+        message.isLocked || message.hasInvalidEncryption;
+    final hasText = message.body.trim().isNotEmpty;
+    final bubbleColor = isMine
+        ? theme.colorScheme.primary
+        : theme.colorScheme.surfaceContainerHighest;
+    final textColor = isMine
+        ? theme.colorScheme.onPrimary
+        : theme.colorScheme.onSurface;
+
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: bubbleColor,
+        borderRadius: BorderRadius.only(
+          topLeft: const Radius.circular(8),
+          topRight: const Radius.circular(8),
+          bottomLeft: Radius.circular(isMine ? 8 : 2),
+          bottomRight: Radius.circular(isMine ? 2 : 8),
+        ),
+      ),
+      child: Padding(
+        padding: EdgeInsets.fromLTRB(
+          media == null ? 14 : 6,
+          media == null ? 10 : 6,
+          media == null ? 14 : 6,
+          8,
+        ),
+        child: Column(
+          crossAxisAlignment: isMine
+              ? CrossAxisAlignment.end
+              : CrossAxisAlignment.start,
+          children: [
+            if (!isMine) ...[
+              Text(
+                message.senderName,
+                style: theme.textTheme.labelMedium?.copyWith(
+                  color: textColor.withValues(alpha: 0.74),
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 4),
+            ],
+            if (message.replyTo case final reply?) ...[
+              _ReplyPreviewCard(reply: reply, color: textColor),
+              const SizedBox(height: 8),
+            ],
+            if (message.isDeleted)
+              Text(
+                'Message deleted',
+                style: theme.textTheme.bodyLarge?.copyWith(
+                  color: textColor.withValues(alpha: 0.72),
+                  fontStyle: FontStyle.italic,
+                ),
+              )
+            else if (encryptionUnavailable)
+              _EncryptedMessageUnavailable(
+                isInvalid: message.hasInvalidEncryption,
+                color: textColor,
+              )
+            else ...[
+              if (media != null) ...[
+                _MessageMediaPreview(
+                  message: message,
+                  media: media,
+                  repository: repository,
+                ),
+                if (hasText) const SizedBox(height: 8),
+              ],
+              if (hasText)
+                Padding(
+                  padding: EdgeInsets.symmetric(
+                    horizontal: media == null ? 0 : 8,
+                  ),
+                  child: Text(
+                    message.body,
+                    style: theme.textTheme.bodyLarge?.copyWith(
+                      color: textColor,
+                      height: 1.25,
+                    ),
+                  ),
+                ),
+            ],
+            const SizedBox(height: 6),
+            Padding(
+              padding: EdgeInsets.symmetric(horizontal: media == null ? 0 : 8),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    _formatTime(message.createdAt),
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      color: textColor.withValues(alpha: 0.72),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }
 

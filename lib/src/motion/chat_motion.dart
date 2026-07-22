@@ -64,6 +64,9 @@ class ChatMotionTheme extends ThemeExtension<ChatMotionTheme> {
     damping: springDamping,
   );
 
+  static const Curve emphasizedDecelerate = Cubic(0.05, 0.7, 0.1, 1.0);
+  static const Curve emphasizedEase = Cubic(0.2, 0.0, 0.0, 1.0);
+
   @override
   ChatMotionTheme copyWith({
     Duration? microDuration,

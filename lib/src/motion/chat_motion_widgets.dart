@@ -13,11 +13,13 @@ class ChatPressScale extends StatefulWidget {
     required this.child,
     this.enabled = true,
     this.row = false,
+    this.triggerHaptic = false,
   });
 
   final Widget child;
   final bool enabled;
   final bool row;
+  final bool triggerHaptic;
 
   @override
   State<ChatPressScale> createState() => _ChatPressScaleState();
@@ -64,6 +66,9 @@ class _ChatPressScaleState extends State<ChatPressScale>
     if (!widget.enabled) return;
     final policy = context.chatMotion;
     _settleTimer?.cancel();
+    if (widget.triggerHaptic) {
+      unawaited(ChatHaptics.lightImpact());
+    }
     if (policy.reduceMotion) {
       _controller.value = 1;
       return;
